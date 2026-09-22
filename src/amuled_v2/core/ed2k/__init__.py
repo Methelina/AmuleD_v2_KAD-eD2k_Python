@@ -1,12 +1,12 @@
 """ED2K client-protocol package.
 
 src/amuled_v2/core/ed2k/__init__.py
-Version:     0.3.0
+Version:     0.5.0
 Author:      Soror L.'.L.'.
 Updated:     2026-09-22
 
-Patch Notes v0.3.0 (Soror L.'.L'.):
-  [+] Added asyncio ED2K server TCP session and server response exports.
+Patch Notes v0.5.0 (Soror L.'.L'.):
+  [+] Added ED2K file-link parsing, global search, and source response exports.
 
 Patch Notes v0.2.0 (Soror L.'.L'.):
   [+] Added client-to-server constants and OP_LOGINREQUEST builder exports.
@@ -27,14 +27,28 @@ from .constants import (
     build_login_packet,
     build_login_payload,
 )
+from .links import (
+    Ed2kFileLink,
+    Ed2kLinkError,
+    build_ed2k_file_link,
+    parse_ed2k_file_link,
+)
 from .server_client import (
     Ed2kServerClient,
+    FoundSource,
+    FoundSources,
     LoginResult,
+    SearchResult,
+    SearchResultResponse,
     ServerIdChange,
     ServerIdentity,
     ServerMessage,
     ServerSessionError,
     ServerStatus,
+    build_get_sources_payload,
+    build_global_search_payload,
+    parse_found_sources,
+    parse_search_results,
 )
 from .server_met import (
     SERVER_MET_VERSION,
@@ -52,18 +66,29 @@ __all__ = [
     "C2STCP",
     "ClientCapability",
     "EDONKEY_PROTOCOL_VERSION",
+    "Ed2kFileLink",
+    "Ed2kLinkError",
     "LoginRequest",
     "ProtocolError",
     "SoftwareId",
     "build_login_packet",
     "build_login_payload",
+    "build_ed2k_file_link",
+    "parse_ed2k_file_link",
     "Ed2kServerClient",
+    "FoundSource",
+    "FoundSources",
     "LoginResult",
+    "SearchResult",
     "ServerIdentity",
     "ServerIdChange",
     "ServerMessage",
     "ServerSessionError",
     "ServerStatus",
+    "build_get_sources_payload",
+    "build_global_search_payload",
+    "parse_found_sources",
+    "parse_search_results",
     "SERVER_MET_VERSION",
     "ServerMetError",
     "ServerRecord",

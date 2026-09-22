@@ -5,9 +5,13 @@ and packed-payload behavior.  All tests are local, deterministic, and do not use
 the network.
 
 tests/test_codec.py
-Version:     0.2.1
+Version:     0.2.2
 Author:      Soror L.'.L.'.
 Updated:     2026-09-22
+
+Patch Notes v0.2.2 (Soror L.'.L'.):
+  [*] Updated packed-packet expectations to the live-validated protocol
+      restoration: PACKED restores EDONKEY, not EMULE.
 
 Patch Notes v0.2.1 (Soror L.'.L'.):
   [*] Updated packet tests to the corrected wire order: protocol, length,
@@ -230,7 +234,7 @@ def test_packed_packet_compresses_payload_only() -> None:
     decoded, remainder = unpack_packet(packed_raw)
     assert remainder == b""
     assert decoded.opcode == 0x33
-    assert decoded.protocol == EMULE
+    assert decoded.protocol == EDONKEY
     assert decoded.payload == original.payload
 
 

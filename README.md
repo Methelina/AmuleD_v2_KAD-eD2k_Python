@@ -1,4 +1,4 @@
-# AmuleD v0.4.3
+# AmuleD v0.5.1
 
 AmuleD is a portable, console-first ED2K/Kademlia client written in Python 3.12. It is an independent clean-room implementation of the public ED2K and Kademlia protocols, not a binary wrapper around aMule/eMule and not a GPL source port.
 
@@ -91,6 +91,36 @@ Useful variants:
 
 `share remove dir` removes the registered directory and its scanned file rows by default. Add `--keep-files` to remove only the directory row. A file can be removed by its 32-hex ED2K hash.
 
+### Search channels
+
+Search commands mirror eMule's explicit channels. The implemented channel is `server`:
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause search server `
+  --server 176.123.5.89:4725 `
+  --query "video" `
+  --duration 30 `
+  --json
+```
+
+The `server` channel logs in over TCP, sends `OP_SEARCHREQUEST`, and accumulates result batches for `--duration` seconds. ED2K search is asynchronous: zero early batches do not necessarily mean an invalid request.
+
+AUTO uses the eMule channel-selection rules. With only ED2K connected it resolves to `server`:
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause search auto --server 176.123.5.89:4725 --query "video" --json
+```
+
+Other eMule channels are explicit and currently report structured `not_implemented` status instead of silently falling back:
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause search global --json
+.\AmuleD_Run.ps1 -NoPause search kad --json
+.\AmuleD_Run.ps1 -NoPause search web-edonkey --json
+```
+
+`global` requires the UDP server-list search layer. `kad` requires the Kademlia keyword-search engine. `web-edonkey` requires an external web-service adapter.
+
 ### Import bundled network resources
 
 The repository bundles public network resources under `assets\v1`. Import them into the project-local DuckDB state:
@@ -129,7 +159,7 @@ The JSONL form contains stable fields for timestamp, level, tag, logger, and mes
 The public name and version are:
 
 ```text
-AmuleD v0.4.3
+AmuleD v0.5.1
 ```
 
 The stable technical names are intentionally separate:
@@ -137,7 +167,7 @@ The stable technical names are intentionally separate:
 | Item | Value |
 |---|---|
 | Public client name | `AmuleD` |
-| Public version string | `AmuleD v0.4.3` |
+| Public version string | `AmuleD v0.5.1` |
 | Python package | `amuled_v2` |
 | CLI executable | `amuled` |
 | Project directory | `AmuleD_v2` |
@@ -169,8 +199,12 @@ Core policy documents:
 | Server-list persistence | Implemented | `src/amuled_v2/core/ed2k/server_met.py` |
 | Shared metadata import/hashing | Implemented | `src/amuled_v2/core/sharing/shared_files.py` |
 | ED2K TCP login | Live-validated | `src/amuled_v2/core/ed2k/server_client.py` |
-| ED2K search / `OP_GETSOURCES` | Planned | `docs/roadmap.md`, milestone M4 |
-| Kademlia | Planned | `docs/roadmap.md`, milestone M5 |
+| Search channel model | Implemented | `src/amuled_v2/core/search_channels.py` |
+| ED2K SERVER search | Live-validated | `src/amuled_v2/core/ed2k/server_client.py` |
+| ED2K GLOBAL search | Planned | UDP server-list search layer |
+| KAD search | Planned | `docs/roadmap.md`, milestone M5 |
+| `OP_GETSOURCES` | Live-validated | `src/amuled_v2/core/ed2k/server_client.py` |
+| Kademlia transport | Planned | `docs/roadmap.md`, milestone M5 |
 | Download engine | Planned | `docs/roadmap.md`, milestone M8 |
 | Upload engine | Planned | `docs/roadmap.md`, milestone M9+ |
 | Obfuscation / secure identification | Planned | `docs/roadmap.md`, milestone M11 |
@@ -274,10 +308,10 @@ Shared-file metadata, shared-directory lists, generated configuration, DuckDB st
 
 The active protocol path is:
 
-1. ED2K server search and `OP_GETSOURCES`.
-2. Source persistence and source lifecycle.
-3. Kademlia bootstrap and routing.
-4. Unified ED2K/KAD search.
+1. ED2K GLOBAL UDP search across the server list.
+2. Source persistence lifecycle.
+3. Kademlia bootstrap, routing, and KAD keyword search.
+4. Unified search-result model across SERVER, GLOBAL, and KAD.
 5. Download queue, part files, block assembly, and resume.
 6. Peer transfer, upload slots, and queues.
 7. Security, obfuscation, IP filter, GeoIP, UPnP/NAT-PMP.

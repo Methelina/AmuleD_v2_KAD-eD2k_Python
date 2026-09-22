@@ -14,8 +14,8 @@ Patch Notes v0.2.1 (Soror L.'.L'.):
   [*] Corrected ED2K wire header to protocol, UInt32 packet_length, opcode;
       packet_length includes the opcode byte (`payload_size + 1`).
   [*] Decode now validates length >= 1 and derives payload from packet_length.
-  [*] Corrected packed-packet semantics: compression applies to the payload
-      only; the original opcode remains in the packet header.
+  [*] Unpacked ED2K packets restore the base EDONKEY protocol, matching the
+      reference server path; KAD-packed restores KAD.
   [+] Added KAD packed protocol selection and bounded decompression.
   [+] Added strict trailing-byte and header-size validation.
 
@@ -122,7 +122,7 @@ def _packed_protocol(protocol: int) -> int:
 def _unpacked_protocol(packed_protocol: int) -> int:
     if packed_protocol == C.KADEMLIAPACKED:
         return C.KAD
-    return C.EMULE
+    return C.EDONKEY
 
 
 def pack_packet(packet: Packet, compression_level: int = 9) -> bytes:

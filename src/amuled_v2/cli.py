@@ -8,15 +8,27 @@ Commands:
   - ``init``                — ensure runtime dirs and default config exist.
   - ``import servers/shared`` — import compatible v1 resources into state.
   - ``share add/scan/list/remove`` — hash files and maintain DuckDB state.
+  - ``search server/auto`` — ED2K server search with explicit channel model.
+  - ``search global/kad/web-edonkey`` — planned channels with explicit status.
+  - ``sources ed2k/list`` — request and list ED2K file sources.
   - ``daemon start/stop``   — M2 stubs returning not_implemented.
 
 Dependencies (duckdb, rich) are optional at runtime; ``--help`` works without
 them installed.  Network protocol sessions are not started by share commands.
 
 src/amuled_v2/cli.py
-Version:     0.4.3
+Version:     0.5.1
 Author:      Soror L.'.L.'.
 Updated:     2026-09-23
+
+Patch Notes v0.5.1 (Soror L.'.L'.):
+  [+] Added explicit eMule-compatible search channel model.
+  [+] Split SERVER, AUTO, GLOBAL, KAD, and WEB-EDONKEY CLI channels.
+  [*] Replaced generic `search ed2k` semantics with a compatibility alias.
+
+Patch Notes v0.5.0 (Soror L.'.L'.):
+  [+] Added `search ed2k` and `sources ed2k/list` commands.
+  [+] Added optional persistence for ED2K sources returned by servers.
 
 Patch Notes v0.4.3 (Soror L.'.L'.):
   [+] Added `share add`, `share scan`, `share list`, and `share remove`.
@@ -42,6 +54,7 @@ Patch Notes v0.1.0 (Soror L.'.L'.):
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import re
 import sys
@@ -52,6 +65,12 @@ from amuled_v2 import __app_name__, __version__, __version_string__
 from amuled_v2.config import config_set, config_show, load_config
 from amuled_v2.daemon import start_daemon, stop_daemon
 from amuled_v2.logging_setup import LogTags, configure_logging, get_tagged_logger
+from amuled_v2.core.search_channels import (
+    ChannelStatus,
+    SearchChannel,
+    parse_search_channel,
+    resolve_auto_search_channel,
+)
 
 log = get_tagged_logger(LogTags.CLI, "cli")
 from amuled_v2.state import get_state
@@ -415,6 +434,244 @@ def _cmd_share_remove(args: argparse.Namespace) -> int:
 
 
 # ------------------------------------------------------------------
+# ED2K search and source command handlers
+# ------------------------------------------------------------------
+
+def _parse_server_endpoint(value: str) -> tuple[str, int]:
+    host, separator, port_text = value.rpartition(":")
+    if not separator or not host or not port_text:
+        raise ValueError(f"invalid server endpoint, expected host:port: {value!r}")
+    try:
+        port = int(port_text)
+    except ValueError as exc:
+        raise ValueError(f"invalid server port in endpoint: {value!r}") from exc
+    if not 0 <= port <= 0xFFFF:
+        raise ValueError(f"server port out of range in endpoint: {value!r}")
+    return host, port
+
+
+def _ed2k_login_request() -> "LoginRequest":
+    from amuled_v2.core.ed2k import LoginRequest
+
+    cfg = load_config(save_if_missing=True)
+    return LoginRequest.create(
+        nickname=cfg.get("app", {}).get("name", "AmuleD"),
+        client_id=0,
+        client_port=int(cfg.get("network", {}).get("client_tcp_port", 8089)),
+        enable_security=True,
+    )
+
+
+def _print_search_results(result: dict, json_output: bool) -> None:
+    if json_output:
+        _print_json(result)
+        return
+    lines = [
+        f"status     : {result['status']}",
+        f"channel    : {result['channel']}",
+        f"server     : {result['server']}",
+        f"query      : {result['query']}",
+        f"results    : {len(result['results'])}",
+    ]
+    for item in result["results"]:
+        lines.append(
+            f"  {item['hash']} {item['size']} src={item['sources']} {item['name']}"
+        )
+    _print_text("ED2K search", lines)
+
+
+async def _run_ed2k_search(args: argparse.Namespace) -> dict:
+    from amuled_v2.core.ed2k import Ed2kServerClient
+
+    host, port = _parse_server_endpoint(args.server)
+    login = _ed2k_login_request()
+    client = Ed2kServerClient(
+        host,
+        port,
+        login,
+        connect_timeout=args.timeout,
+        response_timeout=args.timeout,
+    )
+    try:
+        await client.connect()
+        await client.login()
+        results = await client.search(args.query, duration=args.duration)
+    finally:
+        await client.close()
+    return {
+        "status": "ok",
+        "channel": getattr(args, "channel", SearchChannel.SERVER.value),
+        "server": args.server,
+        "query": args.query,
+        "results": [item.to_dict() for item in results],
+        "result_count": len(results),
+    }
+
+
+def _cmd_search_ed2k(args: argparse.Namespace) -> int:
+    log.debug(
+        f"Command started: name=search-server, server={args.server}, "
+        f"query={args.query!r}, timeout={args.timeout}, duration={args.duration}"
+    )
+    result = asyncio.run(_run_ed2k_search(args))
+    _print_search_results(result, args.json)
+    log.info(f"ED2K server search CLI completed: results={result['result_count']}")
+    return 0
+
+
+def _cmd_search_auto(args: argparse.Namespace) -> int:
+    resolved = resolve_auto_search_channel(
+        ed2k_connected=True,
+        kad_connected=False,
+        server_users=getattr(args, "server_users", 0),
+        server_files=getattr(args, "server_files", 0),
+        server_count=getattr(args, "server_count", 0),
+    )
+    if resolved.channel != SearchChannel.SERVER or resolved.status != ChannelStatus.IMPLEMENTED:
+        result = {
+            "status": "not_implemented",
+            "channel": resolved.channel.value,
+            "implementation_status": resolved.status.value,
+            "reason": resolved.reason,
+        }
+        if args.json:
+            _print_json(result)
+        else:
+            _print_text("Search channel unavailable", [
+                f"status  : {result['status']}",
+                f"channel : {result['channel']}",
+                f"reason  : {result['reason']}",
+            ])
+        return 2
+    args.channel = resolved.channel.value
+    return _cmd_search_ed2k(args)
+
+
+def _cmd_search_not_implemented(args: argparse.Namespace) -> int:
+    channel = parse_search_channel(args.channel_name)
+    result = {
+        "status": "not_implemented",
+        "channel": channel.value,
+        "implementation_status": (
+            ChannelStatus.PLANNED.value
+            if channel in (SearchChannel.GLOBAL, SearchChannel.KAD)
+            else ChannelStatus.NOT_IMPLEMENTED.value
+        ),
+        "reason": {
+            SearchChannel.GLOBAL.value: "GLOBAL requires the ED2K server-list UDP search layer",
+            SearchChannel.KAD.value: "KAD requires the Kademlia keyword search engine",
+            SearchChannel.WEB_EDONKEY.value: "WEB-EDONKEY requires an external web-service adapter",
+        }[channel.value],
+    }
+    if args.json:
+        _print_json(result)
+    else:
+        _print_text("Search channel unavailable", [
+            f"status  : {result['status']}",
+            f"channel : {result['channel']}",
+            f"state   : {result['implementation_status']}",
+            f"reason  : {result['reason']}",
+        ])
+    return 2
+
+
+async def _run_ed2k_sources(args: argparse.Namespace) -> dict:
+    from amuled_v2.core.ed2k import Ed2kServerClient
+
+    host, port = _parse_server_endpoint(args.server)
+    file_hash = bytes.fromhex(args.hash)
+    login = _ed2k_login_request()
+    client = Ed2kServerClient(
+        host,
+        port,
+        login,
+        connect_timeout=args.timeout,
+        response_timeout=args.timeout,
+    )
+    saved_sources = 0
+    try:
+        await client.connect()
+        await client.login()
+        found = await client.get_sources(file_hash, args.size)
+        if args.save:
+            state = get_state()
+            state.connect()
+            saved_sources = state.save_found_sources(
+                found,
+                server_ip=client.host,
+                server_port=client.port,
+            )
+    finally:
+        await client.close()
+    result = found.to_dict()
+    result.update(
+        {
+            "status": "ok",
+            "server": args.server,
+            "saved_sources": saved_sources,
+        }
+    )
+    return result
+
+
+def _cmd_sources_ed2k(args: argparse.Namespace) -> int:
+    log.debug(
+        f"Command started: name=sources-ed2k, server={args.server}, "
+        f"hash={args.hash}, size={args.size}, save={args.save}"
+    )
+    result = asyncio.run(_run_ed2k_sources(args))
+    if args.json:
+        _print_json(result)
+    else:
+        lines = [
+            f"status      : {result['status']}",
+            f"server      : {result['server']}",
+            f"hash        : {result['hash']}",
+            f"sources     : {result['source_count']}",
+            f"saved       : {result['saved_sources']}",
+        ]
+        for source in result["sources"]:
+            address = source["address"] or "lowid"
+            lines.append(
+                f"  {address}:{source['client_port']} id={source['client_id']}"
+            )
+        _print_text("ED2K sources", lines)
+    log.info(
+        f"ED2K sources CLI completed: hash={result['hash']}, "
+        f"sources={result['source_count']}, saved={result['saved_sources']}"
+    )
+    return 0
+
+
+def _cmd_sources_list(args: argparse.Namespace) -> int:
+    state = get_state()
+    state.connect()
+    rows = state.list_file_sources(args.hash, limit=args.limit)
+    result = {
+        "status": "ok",
+        "file_hash": args.hash.lower() if args.hash else None,
+        "sources": rows,
+        "source_count": len(rows),
+        "limit": args.limit,
+    }
+    if args.json:
+        _print_json(result)
+    else:
+        lines = [
+            "status  : ok",
+            f"sources : {len(rows)}",
+        ]
+        for row in rows:
+            lines.append(
+                f"  {row['hash']} {row['client_id']}:{row['client_port']} "
+                f"via {row['server_ip']}:{row['server_port']} [{row['source_type']}]"
+            )
+        _print_text("File sources", lines)
+    log.info(f"File source list completed: count={len(rows)}")
+    return 0
+
+
+# ------------------------------------------------------------------
 # Import command handlers
 # ------------------------------------------------------------------
 
@@ -723,6 +980,172 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep the directory's file rows in state.",
     )
     p_remove_dir.set_defaults(func=_cmd_share_remove)
+
+    # --- search ---
+    p_search = sub.add_parser(
+        "search",
+        help="Run searches through explicit eMule-compatible channels.",
+        parents=parents,
+    )
+    search_sub = p_search.add_subparsers(dest="search_command", metavar="<channel>")
+
+    def add_server_search_parser(name: str, help_text: str):
+        parser = search_sub.add_parser(name, help=help_text, parents=parents)
+        parser.add_argument(
+            "--server",
+            required=True,
+            help="ED2K server endpoint as host:port.",
+        )
+        parser.add_argument(
+            "--query",
+            required=True,
+            help="Search query.",
+        )
+        parser.add_argument(
+            "--timeout",
+            type=float,
+            default=20.0,
+            help="Connect timeout in seconds.",
+        )
+        parser.add_argument(
+            "--duration",
+            type=float,
+            default=30.0,
+            help="Search result accumulation window in seconds.",
+        )
+        return parser
+
+    p_search_server = add_server_search_parser(
+        "server",
+        "Search the connected ED2K server over TCP.",
+    )
+    p_search_server.set_defaults(
+        channel=SearchChannel.SERVER.value,
+        func=_cmd_search_ed2k,
+    )
+
+    p_search_auto = add_server_search_parser(
+        "auto",
+        "Resolve AUTO using eMule rules and search through the available channel.",
+    )
+    p_search_auto.add_argument(
+        "--server-users",
+        type=int,
+        default=0,
+        help="Connected server user count used by AUTO resolution.",
+    )
+    p_search_auto.add_argument(
+        "--server-files",
+        type=int,
+        default=0,
+        help="Connected server file count used by AUTO resolution.",
+    )
+    p_search_auto.add_argument(
+        "--server-count",
+        type=int,
+        default=0,
+        help="Known server count used by AUTO resolution.",
+    )
+    p_search_auto.set_defaults(func=_cmd_search_auto)
+
+    p_search_global = search_sub.add_parser(
+        "global",
+        help="GLOBAL channel (planned UDP server-list search).",
+        parents=parents,
+    )
+    p_search_global.set_defaults(
+        channel_name=SearchChannel.GLOBAL.value,
+        func=_cmd_search_not_implemented,
+    )
+
+    p_search_kad = search_sub.add_parser(
+        "kad",
+        help="Kademlia channel (planned keyword search engine).",
+        parents=parents,
+    )
+    p_search_kad.set_defaults(
+        channel_name=SearchChannel.KAD.value,
+        func=_cmd_search_not_implemented,
+    )
+
+    p_search_web = search_sub.add_parser(
+        "web-edonkey",
+        help="External web-eDonkey channel (not implemented).",
+        parents=parents,
+    )
+    p_search_web.set_defaults(
+        channel_name=SearchChannel.WEB_EDONKEY.value,
+        func=_cmd_search_not_implemented,
+    )
+
+    # Deprecated compatibility alias for the former generic network command.
+    p_search_ed2k = add_server_search_parser(
+        "ed2k",
+        "Compatibility alias for the SERVER channel.",
+    )
+    p_search_ed2k.set_defaults(
+        channel=SearchChannel.SERVER.value,
+        func=_cmd_search_ed2k,
+    )
+
+    # --- sources ---
+    p_sources = sub.add_parser(
+        "sources",
+        help="Request or list ED2K file sources.",
+        parents=parents,
+    )
+    sources_sub = p_sources.add_subparsers(dest="sources_command", metavar="<action>")
+
+    p_sources_ed2k = sources_sub.add_parser(
+        "ed2k",
+        help="Request sources for one ED2K file from a server.",
+        parents=parents,
+    )
+    p_sources_ed2k.add_argument(
+        "--server",
+        required=True,
+        help="ED2K server endpoint as host:port.",
+    )
+    p_sources_ed2k.add_argument(
+        "--hash",
+        required=True,
+        help="ED2K file hash, 32 hexadecimal digits.",
+    )
+    p_sources_ed2k.add_argument(
+        "--size",
+        required=True,
+        type=int,
+        help="Complete file size in bytes.",
+    )
+    p_sources_ed2k.add_argument(
+        "--save",
+        action="store_true",
+        help="Persist returned sources to DuckDB.",
+    )
+    p_sources_ed2k.add_argument(
+        "--timeout",
+        type=float,
+        default=20.0,
+        help="Connect and response timeout in seconds.",
+    )
+    p_sources_ed2k.set_defaults(func=_cmd_sources_ed2k)
+
+    p_sources_list = sources_sub.add_parser(
+        "list",
+        help="List persisted ED2K file sources.",
+        parents=parents,
+    )
+    p_sources_list.add_argument(
+        "--hash",
+        help="Optional ED2K file hash filter.",
+    )
+    p_sources_list.add_argument(
+        "--limit",
+        type=int,
+        default=1000,
+        help="Maximum rows to return.",
+    )
+    p_sources_list.set_defaults(func=_cmd_sources_list)
 
     # --- daemon ---
     p_daemon = sub.add_parser("daemon", help="Daemon lifecycle (M2 stub).", parents=parents)

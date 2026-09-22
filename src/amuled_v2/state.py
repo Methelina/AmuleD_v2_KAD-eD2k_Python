@@ -7,9 +7,13 @@ The shared repository supports direct scanning transactions so removed or
 missing files do not leave stale rows behind.
 
 src/amuled_v2/state.py
-Version:     0.4.3
+Version:     0.5.0
 Author:      Soror L.'.L.'.
 Updated:     2026-09-23
+
+Patch Notes v0.5.0 (Soror L.'.L'.):
+  [+] Added schema migration 3 and persistence for ED2K file sources.
+  [+] Added source listing with optional file-hash filtering.
 
 Patch Notes v0.4.3 (Soror L.'.L'.):
   [+] Added transactional replacement of one shared directory scan.
@@ -43,7 +47,7 @@ from amuled_v2.paths import DB_FILE, STATE_JSON, ensure_runtime_dirs
 log = get_tagged_logger(LogTags.STATE, "state")
 
 if TYPE_CHECKING:
-    from amuled_v2.core.ed2k import ServerRecord, StaticServer
+    from amuled_v2.core.ed2k import FoundSources, ServerRecord, StaticServer
     from amuled_v2.core.sharing import SharedFile
 
 try:
@@ -52,7 +56,7 @@ try:
 except ImportError:  # pragma: no cover - exercised only without DuckDB
     _HAS_DUCKDB = False
 
-_CURRENT_SCHEMA_VERSION = 2
+_CURRENT_SCHEMA_VERSION = 3
 _JSON_STORE: dict[str, Any] | None = None
 
 
@@ -124,6 +128,26 @@ def _migrate_v2(con: Any) -> None:
     )
 
 
+def _migrate_v3(con: Any) -> None:
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS file_sources (
+            file_hash   VARCHAR NOT NULL,
+            client_id   UINTEGER NOT NULL,
+            client_port UINTEGER NOT NULL,
+            source_type VARCHAR NOT NULL,
+            server_ip   VARCHAR NOT NULL,
+            server_port UINTEGER NOT NULL,
+            user_hash   VARCHAR,
+            first_seen  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (file_hash, client_id, client_port, source_type)
+        )
+    """)
+    con.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (3)"
+    )
+
+
 def _init_duckdb(con: Any) -> None:
     """Apply all pending schema migrations."""
     log.debug("Initializing DuckDB schema")
@@ -133,6 +157,10 @@ def _init_duckdb(con: Any) -> None:
     if current < 2:
         _migrate_v2(con)
         log.info("DuckDB schema migrated to version 2")
+        current = 2
+    if current < 3:
+        _migrate_v3(con)
+        log.info("DuckDB schema migrated to version 3")
     else:
         log.debug("DuckDB schema is current")
 
@@ -262,6 +290,91 @@ class StateBackend:
             count += 1
         log.info(f"Saved static servers to state: {count}")
         return count
+
+    def save_found_sources(
+        self,
+        record: "FoundSources",
+        *,
+        server_ip: str,
+        server_port: int,
+        source_type: str = "ed2k_server",
+    ) -> int:
+        """Persist sources returned by one ED2K source lookup."""
+        con = self._require_duckdb()
+        count = 0
+        for source in record.sources:
+            con.execute(
+                """
+                INSERT OR REPLACE INTO file_sources (
+                    file_hash, client_id, client_port, source_type,
+                    server_ip, server_port, user_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.file_hash.hex().upper(),
+                    source.client_id,
+                    source.client_port,
+                    source_type,
+                    server_ip,
+                    server_port,
+                    source.user_hash.hex().upper() if source.user_hash else None,
+                ),
+            )
+            count += 1
+        log.info(f"Saved file sources to state: file={record.file_hash.hex().upper()}, count={count}")
+        return count
+
+    def list_file_sources(
+        self,
+        file_hash: str | None = None,
+        *,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """List persisted source rows, optionally filtered by ED2K hash."""
+        con = self._require_duckdb()
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+        if file_hash:
+            normalized = file_hash.strip().lower()
+            if len(normalized) != 32:
+                raise ValueError("file hash must contain 32 hexadecimal digits")
+            bytes.fromhex(normalized)
+            rows = con.execute(
+                """
+                SELECT file_hash, client_id, client_port, source_type,
+                       server_ip, server_port, user_hash, first_seen, last_seen
+                FROM file_sources
+                WHERE lower(file_hash) = ?
+                ORDER BY client_id, client_port
+                LIMIT ?
+                """,
+                (normalized, limit),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                """
+                SELECT file_hash, client_id, client_port, source_type,
+                       server_ip, server_port, user_hash, first_seen, last_seen
+                FROM file_sources
+                ORDER BY file_hash, client_id, client_port
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "hash": row[0],
+                "client_id": row[1],
+                "client_port": row[2],
+                "source_type": row[3],
+                "server_ip": row[4],
+                "server_port": row[5],
+                "user_hash": row[6],
+                "first_seen": str(row[7]),
+                "last_seen": str(row[8]),
+            }
+            for row in rows
+        ]
 
     def save_shared_files(self, records: Iterable["SharedFile"]) -> int:
         con = self._require_duckdb()

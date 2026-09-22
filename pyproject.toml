@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "amuled-v2"
-version = "0.4.3"
+version = "0.5.1"
 description = "AmuleD — pure Python ED2K/Kademlia client (clean-room reimplementation)."
 readme = "README.md"
 requires-python = ">=3.12"

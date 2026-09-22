@@ -1,4 +1,4 @@
-# AmuleD v0.4.3
+# AmuleD v0.5.1
 
 AmuleD — портативный консольный ED2K/Kademlia-клиент на Python 3.12. Это независимая clean-room реализация публичных протоколов ED2K и Kademlia, а не бинарная обёртка вокруг aMule/eMule и не прямой порт GPL-исходников.
 
@@ -91,6 +91,36 @@ AmuleD — ранняя клиентская основа. Сейчас уже �
 
 `share remove dir` по умолчанию удаляет зарегистрированный каталог и его записи файлов. Добавьте `--keep-files`, чтобы удалить только строку каталога. Отдельный файл удаляется по 32-значному ED2K-хэшу.
 
+### Каналы поиска
+
+Команды поиска повторяют явные каналы eMule. Реализован канал `server`:
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause search server `
+  --server 176.123.5.89:4725 `
+  --query "video" `
+  --duration 30 `
+  --json
+```
+
+Канал `server` логинится по TCP, отправляет `OP_SEARCHREQUEST` и накапливает пакеты результатов в течение `--duration` секунд. ED2K-поиск асинхронный: отсутствие ранних пакетов ещё не значит, что запрос неверный.
+
+AUTO использует правила выбора канала eMule. Если подключён только ED2K, он разрешается в `server`:
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause search auto --server 176.123.5.89:4725 --query "video" --json
+```
+
+Остальные каналы явные и сейчас возвращают структурированный статус `not_implemented`, а не подменяются другим каналом:
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause search global --json
+.\AmuleD_Run.ps1 -NoPause search kad --json
+.\AmuleD_Run.ps1 -NoPause search web-edonkey --json
+```
+
+`global` требует UDP search-слой по списку серверов. `kad` требует Kademlia keyword-search. `web-edonkey` требует адаптер внешнего web-сервиса.
+
 ### Импорт bundled сетевых ресурсов
 
 Репозиторий содержит публичные сетевые ресурсы в `assets\v1`. Импортируйте их в проектную базу:
@@ -129,7 +159,7 @@ JSONL содержит стабильные поля времени, уровн�
 Зафиксированы публичное имя и версия:
 
 ```text
-AmuleD v0.4.3
+AmuleD v0.5.1
 ```
 
 Технические имена отделены от публичных и стабильны:
@@ -137,7 +167,7 @@ AmuleD v0.4.3
 | Элемент | Значение |
 |---|---|
 | Публичное имя клиента | `AmuleD` |
-| Публичная строка версии | `AmuleD v0.4.3` |
+| Публичная строка версии | `AmuleD v0.5.1` |
 | Python package | `amuled_v2` |
 | CLI executable | `amuled` |
 | Каталог проекта | `AmuleD_v2` |
@@ -169,8 +199,12 @@ AmuleD планируется под Apache 2.0. GPL-исходники aMule/eM
 | Persistence серверных списков | реализовано | `src/amuled_v2/core/ed2k/server_met.py` |
 | Импорт/хэширование метаданных шаринга | реализовано | `src/amuled_v2/core/sharing/shared_files.py` |
 | ED2K TCP login | подтверждено на живом сервере | `src/amuled_v2/core/ed2k/server_client.py` |
-| ED2K search / `OP_GETSOURCES` | в roadmap | `docs/roadmap.md`, M4 |
-| Kademlia | в roadmap | `docs/roadmap.md`, M5 |
+| Модель каналов поиска | реализовано | `src/amuled_v2/core/search_channels.py` |
+| ED2K SERVER search | подтверждено на живом сервере | `src/amuled_v2/core/ed2k/server_client.py` |
+| ED2K GLOBAL search | в roadmap | UDP search-слой по списку серверов |
+| KAD search | в roadmap | `docs/roadmap.md`, M5 |
+| `OP_GETSOURCES` | подтверждено на живом сервере | `src/amuled_v2/core/ed2k/server_client.py` |
+| Kademlia transport | в roadmap | `docs/roadmap.md`, M5 |
 | Download engine | в roadmap | `docs/roadmap.md`, M8 |
 | Upload engine | в roadmap | `docs/roadmap.md`, M9+ |
 | Obfuscation / secure identification | в roadmap | `docs/roadmap.md`, M11 |
@@ -274,10 +308,10 @@ JSONL-записи можно фильтровать напрямую по по�
 
 Активный протокольный путь:
 
-1. ED2K server search и `OP_GETSOURCES`.
-2. Persistence источников и lifecycle источников.
-3. Kademlia bootstrap и routing.
-4. Unified search для ED2K/KAD.
+1. ED2K GLOBAL UDP search по списку серверов.
+2. Persistence источников и их lifecycle.
+3. Kademlia bootstrap, routing и KAD keyword search.
+4. Unified search-result model для SERVER, GLOBAL и KAD.
 5. Очередь закачек, part files, сборка блоков и resume.
 6. Peer transfer, upload slots и очереди.
 7. Security, obfuscation, IP filter, GeoIP, UPnP/NAT-PMP.

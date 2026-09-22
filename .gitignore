@@ -8,6 +8,7 @@ bin/uv-tool-bin/
 bin/python-userbase/
 bin/amuled-python.cmd
 docs/roadmap.md
+docs/continuation-prompt.md
 
 # === Local private/generated state ===
 config/amuled.jsonc
