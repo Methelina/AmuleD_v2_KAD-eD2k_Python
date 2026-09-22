@@ -6,15 +6,22 @@ Commands:
   - ``config show``         — print current JSONC config.
   - ``config set <key> <v>``— set a dotted config key (type-inferred).
   - ``init``                — ensure runtime dirs and default config exist.
+  - ``import servers/shared`` — import compatible v1 resources into state.
+  - ``share add/scan/list/remove`` — hash files and maintain DuckDB state.
   - ``daemon start/stop``   — M2 stubs returning not_implemented.
 
 Dependencies (duckdb, rich) are optional at runtime; ``--help`` works without
-them installed.  Network/protocol modules are not imported.
+them installed.  Network protocol sessions are not started by share commands.
 
 src/amuled_v2/cli.py
-Version:     0.4.2
+Version:     0.4.3
 Author:      Soror L.'.L.'.
-Updated:     2026-09-22
+Updated:     2026-09-23
+
+Patch Notes v0.4.3 (Soror L.'.L'.):
+  [+] Added `share add`, `share scan`, `share list`, and `share remove`.
+  [+] New and rescanned files are written directly to DuckDB.
+  [*] Directory rescans remove stale rows for missing or moved files.
 
 Patch Notes v0.4.2 (Soror L.'.L'.):
   [+] Unified public display name to `AmuleD v0.4.1` across CLI and status.
@@ -36,7 +43,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+from pathlib import Path
 from typing import Sequence
 
 from amuled_v2 import __app_name__, __version__, __version_string__
@@ -164,6 +173,245 @@ def _cmd_daemon_stop(args: argparse.Namespace) -> int:
             f"message  : {result['message']}",
         ])
     return code
+
+
+# ------------------------------------------------------------------
+# Share command handlers
+# ------------------------------------------------------------------
+
+_HASH_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+def _share_priority(raw: str) -> int:
+    value = raw.lower()
+    if value == "low":
+        return 0
+    if value == "normal":
+        return 1
+    if value == "high":
+        return 2
+    raise ValueError(f"invalid priority: {raw}")
+
+
+def _scan_and_save(
+    paths: list[str | Path],
+    *,
+    recursive: bool,
+    priority: int,
+    save: bool,
+    progress: bool = False,
+) -> dict:
+    """Scan paths, reconcile their DB rows, and return an aggregate summary."""
+    from amuled_v2.core.sharing import scan_shared_directory
+    from amuled_v2.state import get_state
+
+    state = get_state()
+    state.connect()
+
+    if not paths:
+        paths = state.list_shared_directories()
+        if not paths:
+            raise ValueError("no paths supplied and no shared directories are registered")
+
+    scans: list[dict] = []
+    total_saved = 0
+    total_removed = 0
+    total_files = 0
+    for raw_path in paths:
+        root = Path(raw_path).expanduser().resolve()
+        log.debug(
+            f"Share scan started: path={root}, recursive={recursive}, save={save}"
+        )
+        files = scan_shared_directory(
+            root,
+            recursive=recursive,
+            progress=progress,
+        )
+        for file_record in files:
+            file_record.priority = priority
+
+        if save:
+            summary = state.replace_shared_directory_scan(root, files)
+            saved = summary["saved_files"]
+            removed = summary["removed_files"]
+        else:
+            saved = len(files)
+            removed = 0
+        total_saved += saved
+        total_removed += removed
+        total_files += len(files)
+        scans.append(
+            {
+                "directory": str(root),
+                "files_found": len(files),
+                "files_saved": saved,
+                "stale_files_removed": removed,
+                "saved": save,
+            }
+        )
+        log.info(
+            f"Share scan completed: path={root}, files={len(files)}, "
+            f"saved={saved}, removed={removed}"
+        )
+
+    return {
+        "status": "ok",
+        "saved": save,
+        "directories_scanned": len(scans),
+        "files_found": total_files,
+        "files_saved": total_saved,
+        "stale_files_removed": total_removed,
+        "scans": scans,
+    }
+
+
+def _print_share_scan(result: dict, json_output: bool) -> None:
+    if json_output:
+        _print_json(result)
+        return
+    _print_text("Share scan", [
+        f"status        : {result['status']}",
+        f"saved         : {result['saved']}",
+        f"directories   : {result['directories_scanned']}",
+        f"files_found   : {result['files_found']}",
+        f"files_saved   : {result['files_saved']}",
+        f"stale_removed : {result['stale_files_removed']}",
+    ])
+    for scan in result["scans"]:
+        print(f"  {scan['directory']}: found={scan['files_found']}, saved={scan['files_saved']}, removed={scan['stale_files_removed']}")
+
+
+def _cmd_share_add(args: argparse.Namespace) -> int:
+    log.debug(
+        f"Command started: name=share-add, path={args.path}, "
+        f"recursive={not args.no_recursive}, priority={args.priority}, "
+        f"progress={not args.no_progress and not args.json}"
+    )
+    result = _scan_and_save(
+        [args.path],
+        recursive=not args.no_recursive,
+        priority=_share_priority(args.priority),
+        save=not args.dry_run,
+        progress=not args.no_progress and not args.json,
+    )
+    result["action"] = "add"
+    result["progress"] = not args.no_progress and not args.json
+    _print_share_scan(result, args.json)
+    return 0
+
+
+def _cmd_share_scan(args: argparse.Namespace) -> int:
+    log.debug(
+        f"Command started: name=share-scan, paths={args.paths}, "
+        f"recursive={not args.no_recursive}, priority={args.priority}, "
+        f"progress={not args.no_progress and not args.json}"
+    )
+    result = _scan_and_save(
+        args.paths,
+        recursive=not args.no_recursive,
+        priority=_share_priority(args.priority),
+        save=not args.dry_run,
+        progress=not args.no_progress and not args.json,
+    )
+    result["action"] = "scan"
+    result["progress"] = not args.no_progress and not args.json
+    _print_share_scan(result, args.json)
+    return 0
+
+
+def _cmd_share_list(args: argparse.Namespace) -> int:
+    from amuled_v2.state import get_state
+
+    log.debug(
+        f"Command started: name=share-list, limit={args.limit}, "
+        f"files_only={args.files_only}, dirs_only={args.dirs_only}"
+    )
+    state = get_state()
+    state.connect()
+    directories = [] if args.files_only else state.list_shared_directories()
+    files = [] if args.dirs_only else state.list_shared_files(limit=args.limit)
+    result = {
+        "status": "ok",
+        "directories": directories,
+        "files": files,
+        "directory_count": len(directories),
+        "file_count": len(files),
+        "limited": args.limit,
+    }
+    if args.json:
+        _print_json(result)
+        return 0
+
+    lines = [
+        f"status          : ok",
+        f"directories     : {len(directories)}",
+        f"files shown     : {len(files)}",
+    ]
+    for directory in directories:
+        lines.append(f"  DIR  {directory}")
+    for item in files:
+        lines.append(
+            f"  FILE {item['hash']} {item['size']} {item['name']}"
+        )
+    _print_text("Shared files", lines)
+    return 0
+
+
+def _cmd_share_remove(args: argparse.Namespace) -> int:
+    from amuled_v2.state import get_state
+
+    state = get_state()
+    state.connect()
+
+    if args.remove_action == "file":
+        target = args.hash.strip()
+        log.debug(
+            f"Command started: name=share-remove-file, hash={target}"
+        )
+        prior = state.get_shared_file(target)
+        removed = state.remove_shared_file(target)
+        result = {
+            "status": "ok" if removed else "not_found",
+            "kind": "file",
+            "hash": target.lower(),
+            "removed": removed,
+            "name": prior.get("name") if prior else None,
+        }
+        exit_code = 0 if removed else 1
+    else:
+        target = str(Path(args.path).expanduser().resolve())
+        log.debug(
+            f"Command started: name=share-remove-dir, path={target}, "
+            f"keep_files={args.keep_files}"
+        )
+        result = state.remove_shared_directory(
+            target,
+            remove_files=not args.keep_files,
+        )
+        result.update(
+            {
+                "status": "ok" if result["directory_removed"] else "not_found",
+                "kind": "directory",
+                "removed": result["directory_removed"],
+            }
+        )
+        exit_code = 0 if result["directory_removed"] else 1
+
+    if args.json:
+        _print_json(result)
+    else:
+        _print_text("Share remove", [
+            f"status      : {result['status']}",
+            f"kind        : {result['kind']}",
+            f"target      : {target}",
+            f"removed     : {result['removed']}",
+            f"file_rows   : {result.get('removed_files', True)}",
+        ])
+    log.info(
+        f"Share remove completed: action={args.remove_action}, "
+        f"target={target}, status={result['status']}"
+    )
+    return exit_code
 
 
 # ------------------------------------------------------------------
@@ -350,6 +598,131 @@ def build_parser() -> argparse.ArgumentParser:
         help="Persist imported metadata to the project DuckDB state.",
     )
     p_import_shared.set_defaults(func=_cmd_import_shared)
+
+    # --- share ---
+    p_share = sub.add_parser(
+        "share",
+        help="Scan, list, and manage shared files in DuckDB.",
+        parents=parents,
+    )
+    share_sub = p_share.add_subparsers(dest="share_command", metavar="<action>")
+
+    p_share_add = share_sub.add_parser(
+        "add",
+        help="Register a directory, hash its files, and save them to state.",
+        parents=parents,
+    )
+    p_share_add.add_argument("path", help="Directory to register and scan.")
+    p_share_add.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="Do not descend into subdirectories.",
+    )
+    p_share_add.add_argument(
+        "--priority",
+        choices=("low", "normal", "high"),
+        default="normal",
+        help="Priority assigned to files from this scan.",
+    )
+    p_share_add.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Hash files without changing DuckDB state.",
+    )
+    p_share_add.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the tqdm hashing progress bar.",
+    )
+    p_share_add.set_defaults(func=_cmd_share_add)
+
+    p_share_scan = share_sub.add_parser(
+        "scan",
+        help="Rescan registered directories or explicit paths.",
+        parents=parents,
+    )
+    p_share_scan.add_argument(
+        "paths",
+        nargs="*",
+        help="Paths to scan; omit to rescan all registered directories.",
+    )
+    p_share_scan.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="Do not descend into subdirectories.",
+    )
+    p_share_scan.add_argument(
+        "--priority",
+        choices=("low", "normal", "high"),
+        default="normal",
+        help="Priority assigned to files from this scan.",
+    )
+    p_share_scan.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Hash files without changing DuckDB state.",
+    )
+    p_share_scan.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the tqdm hashing progress bar.",
+    )
+    p_share_scan.set_defaults(func=_cmd_share_scan)
+
+    p_share_list = share_sub.add_parser(
+        "list",
+        help="List registered directories and shared files.",
+        parents=parents,
+    )
+    p_share_list.add_argument(
+        "--limit",
+        type=int,
+        default=1000,
+        help="Maximum number of files to show (default: 1000).",
+    )
+    p_share_list.add_argument(
+        "--files-only",
+        action="store_true",
+        help="Omit registered directories.",
+    )
+    p_share_list.add_argument(
+        "--dirs-only",
+        action="store_true",
+        help="Omit shared files.",
+    )
+    p_share_list.set_defaults(func=_cmd_share_list)
+
+    p_share_remove = share_sub.add_parser(
+        "remove",
+        help="Remove one file by ED2K hash or one directory by path.",
+        parents=parents,
+    )
+    remove_sub = p_share_remove.add_subparsers(
+        dest="remove_action",
+        metavar="<kind>",
+        required=True,
+    )
+
+    p_remove_file = remove_sub.add_parser(
+        "file",
+        help="Remove one file row by its 32-hex ED2K hash.",
+        parents=parents,
+    )
+    p_remove_file.add_argument("hash", help="ED2K file hash (32 hexadecimal digits).")
+    p_remove_file.set_defaults(func=_cmd_share_remove)
+
+    p_remove_dir = remove_sub.add_parser(
+        "dir",
+        help="Remove a registered directory and its scanned file rows.",
+        parents=parents,
+    )
+    p_remove_dir.add_argument("path", help="Registered shared directory path.")
+    p_remove_dir.add_argument(
+        "--keep-files",
+        action="store_true",
+        help="Keep the directory's file rows in state.",
+    )
+    p_remove_dir.set_defaults(func=_cmd_share_remove)
 
     # --- daemon ---
     p_daemon = sub.add_parser("daemon", help="Daemon lifecycle (M2 stub).", parents=parents)

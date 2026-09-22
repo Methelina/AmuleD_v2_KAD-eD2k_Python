@@ -7,6 +7,13 @@ bin/uv-tools/
 bin/uv-tool-bin/
 bin/python-userbase/
 bin/amuled-python.cmd
+docs/roadmap.md
+
+# === Local private/generated state ===
+config/amuled.jsonc
+assets/v1/shared_files.json
+assets/v1/shareddir.dat
+AGENTS.MD
 
 # === Generated project state ===
 db/*.db
@@ -15,6 +22,7 @@ logs/
 tmp/
 incoming/
 temp/
+test/
 shared/
 
 # === Python artifacts ===

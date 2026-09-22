@@ -1,6 +1,6 @@
 # ==========================================
 # SYNOPSIS
-#     AmuleD v0.4.1 Portable Installer
+#     AmuleD v0.4.3 Portable Installer
 #     Portable Python 3.12 + uv environment for the pure ED2K/Kademlia client.
 #     Fully isolated: uv, Python interpreters, caches, packages, config, and
 #     runtime state stay inside AmuleD_v2.
@@ -92,7 +92,7 @@ Write-Host "     ░  ░  ░    ░      ░  ░  ░    ░" -ForegroundColo
 Write-Host ""
 Write-Host "  ===========================================" -ForegroundColor Green
 Write-Host "    AmuleD_v2 by Soror L.'.L.'." -ForegroundColor Yellow
-Write-Host "    AmuleD v0.4.1 Portable Installer" -ForegroundColor Green
+Write-Host "    AmuleD v0.4.3 Portable Installer" -ForegroundColor Green
 Write-Host "    Python 3.12 Portable Runtime" -ForegroundColor Cyan
 Write-Host ""
 
@@ -302,8 +302,8 @@ function Get-DefaultConfig {
   // Sharing configuration
   "sharing": {
     "shared_dirs": [],
-    "shared_files_json": "assets/v1/shared_files.json",
-    "shareddir_dat": "assets/v1/shareddir.dat",
+    "shared_files_json": null,
+    "shareddir_dat": null,
     "incoming_dir": "incoming",
     "temp_dir": "temp",
     "max_upload_slots": 3,

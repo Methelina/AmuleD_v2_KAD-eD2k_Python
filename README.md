@@ -1,4 +1,4 @@
-# AmuleD v0.4.1
+# AmuleD v0.4.3
 
 AmuleD is a portable, console-first ED2K/Kademlia client written in Python 3.12. It is an independent clean-room implementation of the public ED2K and Kademlia protocols, not a binary wrapper around aMule/eMule and not a GPL source port.
 
@@ -63,23 +63,46 @@ With no arguments it shows CLI help. Typical commands:
 
 `status --json` reports the active backend, database path, ED2K/KAD switches, and current table counts.
 
-### Import bundled baseline data
+### Add and scan shared files
 
-The repository contains baseline v1 resources under `assets\v1`. Import them into the project-local DuckDB state:
+New files can be registered, ED2K-hashed, and written directly to DuckDB from the CLI:
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause share add D:\Media
+.\AmuleD_Run.ps1 -NoPause share scan
+.\AmuleD_Run.ps1 -NoPause share list --json
+```
+
+Interactive `share add` and `share scan` commands render a tqdm hashing progress bar on stderr. Progress is disabled automatically in `--json` mode, or explicitly with `--no-progress`.
+
+`share add` registers the directory, scans it recursively, and saves the resulting file rows. `share scan` with no paths rescans every registered directory. A rescan also removes state rows for files that no longer exist or were moved out of the scanned tree, so stale rows do not remain.
+
+Useful variants:
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause share add D:\Music --priority high --json
+.\AmuleD_Run.ps1 -NoPause share add D:\Downloads --no-recursive --json
+.\AmuleD_Run.ps1 -NoPause share scan D:\Media --dry-run --json
+.\AmuleD_Run.ps1 -NoPause share add D:\LargeLibrary --no-progress
+.\AmuleD_Run.ps1 -NoPause share list --files-only --limit 100 --json
+.\AmuleD_Run.ps1 -NoPause share remove file 00112233445566778899AABBCCDDEEFF --json
+.\AmuleD_Run.ps1 -NoPause share remove dir D:\Media --json
+```
+
+`share remove dir` removes the registered directory and its scanned file rows by default. Add `--keep-files` to remove only the directory row. A file can be removed by its 32-hex ED2K hash.
+
+### Import bundled network resources
+
+The repository bundles public network resources under `assets\v1`. Import them into the project-local DuckDB state:
 
 ```powershell
 .\AmuleD_Run.ps1 -NoPause import servers `
   --server-met assets\v1\server.met `
   --static assets\v1\staticservers.dat `
   --save --json
-
-.\AmuleD_Run.ps1 -NoPause import shared `
-  --shared-json assets\v1\shared_files.json `
-  --shareddir assets\v1\shareddir.dat `
-  --save --json
 ```
 
-After import, `status --json` should show the bundled server, static-server, shared-file, and shared-directory counts.
+After import, `status --json` should show the bundled server and static-server counts. Do not import shared-file metadata from another person's installation; register your own directories with `share add` so AmuleD hashes and stores only your files.
 
 ### Logs
 
@@ -106,7 +129,7 @@ The JSONL form contains stable fields for timestamp, level, tag, logger, and mes
 The public name and version are:
 
 ```text
-AmuleD v0.4.1
+AmuleD v0.4.3
 ```
 
 The stable technical names are intentionally separate:
@@ -114,7 +137,7 @@ The stable technical names are intentionally separate:
 | Item | Value |
 |---|---|
 | Public client name | `AmuleD` |
-| Public version string | `AmuleD v0.4.1` |
+| Public version string | `AmuleD v0.4.3` |
 | Python package | `amuled_v2` |
 | CLI executable | `amuled` |
 | Project directory | `AmuleD_v2` |
@@ -236,7 +259,7 @@ JSONL records can be filtered directly by the `tag` field.
 
 ### Bundled baseline assets
 
-The repository is self-contained after cloning. The bundled resources are:
+The repository is self-contained after cloning. The bundled resources are public network/bootstrap data:
 
 - `assets/v1/server.met`
 - `assets/v1/nodes.dat`
@@ -244,10 +267,8 @@ The repository is self-contained after cloning. The bundled resources are:
 - `assets/v1/staticservers.dat`
 - `assets/v1/ipfilter.dat`
 - `assets/v1/ipfilter_static.dat`
-- `assets/v1/shareddir.dat`
-- `assets/v1/shared_files.json`
 
-User history, credits, identity files, and partial-download state are not included in the public baseline.
+Shared-file metadata, shared-directory lists, generated configuration, DuckDB state, logs, and partial-download state are private. They are ignored by Git and should be generated locally with `share add` or imported explicitly from your own legacy files when needed.
 
 ### Roadmap
 

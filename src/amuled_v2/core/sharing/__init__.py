@@ -1,9 +1,12 @@
 """AmuleD_v2 sharing package.
 
 src/amuled_v2/core/sharing/__init__.py
-Version:     0.1.0
+Version:     0.2.0
 Author:      Soror L.'.L.'.
-Updated:     2026-09-22
+Updated:     2026-09-23
+
+Patch Notes v0.2.0 (Soror L.'.L'.):
+  [+] Added optional tqdm progress pass-through for native file hashing.
 
 Patch Notes v0.1.0 (Soror L.'.L'.):
   [+] Package marker for shared-file import, scanning, and link generation.

@@ -1,23 +1,24 @@
 """Shared-file import, directory scanning, ED2K hashing, and link generation.
 
 Implements the sharing persistence behavior described by
-``docs/PROTOCOL_MATRIX.md``, section 7.4.  The module imports the v1 wrapper's
-``shared_files.json`` metadata and ``shareddir.dat`` directory list, scans and
-hashes native shared files with the ED2K hash layer, and emits compatible
-``ed2k://|file|...`` links.
+``docs/PROTOCOL_MATRIX.md``, section 7.4.  The module imports optional legacy
+``shared_files.json`` and ``shareddir.dat`` metadata, scans and hashes native
+shared files with the ED2K hash layer, optionally renders a tqdm progress bar,
+and emits compatible ``ed2k://|file|...`` links.
 
 src/amuled_v2/core/sharing/shared_files.py
-Version:     0.1.1
+Version:     0.2.0
 Author:      Soror L.'.L.'.
-Updated:     2026-09-22
+Updated:     2026-09-23
 
-Patch Notes v0.1.1 (Soror L.'.L'.):
+Patch Notes v0.2.0 (Soror L.'.L'.):
+  [+] Added optional tqdm progress reporting for directory hashing.
+  [*] Collected the file list before hashing so progress bars have a total.
+  [*] Preserved deterministic path ordering and JSON-safe stdout behavior.
   [+] Added tagged SHARE diagnostics for metadata imports, directory scans,
       per-file hashing, and final scan counts.
   [+] Added SharedFile metadata model and strict ED2K hash validation.
-  [+] Added v1 shared_files.json and shareddir.dat importers.
-  [+] Added deterministic directory scanning and ED2K hashing pipeline.
-  [+] Added base and part-hash ED2K link generation.
+  [+] Added optional legacy metadata importers and ED2K link generation.
 """
 
 from __future__ import annotations
@@ -25,11 +26,18 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
 from amuled_v2.core.hashes import Ed2kHashResult, ed2k_hash_file
+from amuled_v2.logging_setup import LogTags, get_tagged_logger
+
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:  # pragma: no cover - exercised when tqdm is absent
+    _tqdm = None
 from amuled_v2.logging_setup import LogTags, get_tagged_logger
 
 log = get_tagged_logger(LogTags.SHARE, "core.sharing.shared_files")
@@ -43,7 +51,6 @@ __all__ = [
     "scan_shared_directories",
     "generate_ed2k_link",
 ]
-
 _HEX32 = re.compile(r"^[0-9a-fA-F]{32}$")
 _SIZE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([kmgtp]?i?b?)\s*$", re.I)
 _SIZE_MULTIPLIERS = {
@@ -193,16 +200,38 @@ def scan_shared_directory(
     directory: str | Path,
     *,
     recursive: bool = True,
+    progress: bool = False,
 ) -> list[SharedFile]:
-    """Scan and ED2K-hash all regular files below *directory*."""
+    """Scan and ED2K-hash all regular files below *directory*.
+
+    When *progress* is true and tqdm is installed, hashing is rendered on
+    stderr.  Command JSON output remains on stdout and is unaffected.
+    """
     root = Path(directory)
     if not root.is_dir():
         raise SharingError(f"shared directory does not exist: {root}")
     iterator = root.rglob("*") if recursive else root.glob("*")
+    files = sorted(
+        (path for path in iterator if path.is_file()),
+        key=lambda item: str(item).lower(),
+    )
+
+    if progress and _tqdm is not None:
+        hashed_files = _tqdm(
+            files,
+            desc=f"[SHARE] Hashing {root}",
+            unit="file",
+            dynamic_ncols=True,
+            file=sys.stderr,
+            leave=True,
+        )
+    else:
+        if progress and _tqdm is None:
+            log.warning("tqdm unavailable; hashing progress was disabled")
+        hashed_files = files
+
     shared: list[SharedFile] = []
-    for path in sorted(iterator, key=lambda item: str(item).lower()):
-        if not path.is_file():
-            continue
+    for path in hashed_files:
         result = ed2k_hash_file(str(path))
         log.debug(f"Hashed shared file: path={path}, size={result.file_size}")
         shared.append(
@@ -217,12 +246,16 @@ def scan_shared_directory(
     return shared
 
 
-def scan_shared_directories(directories: Iterable[str | Path]) -> list[SharedFile]:
+def scan_shared_directories(
+    directories: Iterable[str | Path],
+    *,
+    progress: bool = False,
+) -> list[SharedFile]:
     """Scan multiple roots and deduplicate files by ED2K hash and size."""
     result: dict[tuple[bytes, int], SharedFile] = {}
     roots = [Path(directory) for directory in directories]
     for directory in roots:
-        for item in scan_shared_directory(directory):
+        for item in scan_shared_directory(directory, progress=progress):
             result.setdefault((item.file_hash, item.size), item)
     files = list(result.values())
     log.info(f"Scan completed: roots={len(roots)}, files={len(files)}")

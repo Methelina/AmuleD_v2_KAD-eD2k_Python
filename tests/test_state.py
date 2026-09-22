@@ -66,7 +66,7 @@ def test_state_migrates_and_saves_imported_resources(
     assert isolated_state.save_servers(servers) == 2
     assert isolated_state.save_static_servers(static) == 1
     assert isolated_state.save_shared_files(shared) == 1
-    assert isolated_state.save_shared_directories([r"O:\shared\models"]) == 1
+    assert isolated_state.save_shared_directories(["/shared/models"]) == 1
 
     status = isolated_state.get_status()
     assert status["tables"]["servers"] == 2

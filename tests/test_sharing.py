@@ -4,11 +4,13 @@ Uses synthetic temporary files and the real v1 wrapper metadata when present.
 No network access is required.
 
 tests/test_sharing.py
-Version:     0.1.0
+Version:     0.1.1
 Author:      Soror L.'.L.'.
 Updated:     2026-09-22
 
-Patch Notes v0.1.0 (Soror L.'.L'.):
+Patch Notes v0.1.1 (Soror L.'.L'.):
+  [*] Changed local shared-metadata smoke tests to optional environment paths
+      so the public repository does not require private baseline files.
   [+] Tested shared_files.json validation, normalization, and deduplication.
   [+] Tested shareddir.dat parsing and recursive native file scanning.
   [+] Tested ED2K link generation, including compact part hashes.
@@ -18,6 +20,7 @@ Patch Notes v0.1.0 (Soror L.'.L'.):
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -33,9 +36,16 @@ from amuled_v2.core.sharing import (
     scan_shared_directory,
 )
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_REAL_SHARED_JSON = _PROJECT_ROOT / "assets" / "v1" / "shared_files.json"
-_REAL_SHAREDDIR = _PROJECT_ROOT / "assets" / "v1" / "shareddir.dat"
+_REAL_SHARED_JSON = (
+    Path(_path)
+    if (_path := os.environ.get("AMULED_TEST_SHARED_JSON"))
+    else None
+)
+_REAL_SHAREDDIR = (
+    Path(_path)
+    if (_path := os.environ.get("AMULED_TEST_SHAREDDIR_DAT"))
+    else None
+)
 
 
 def _write_v1_json(path: Path) -> None:
@@ -127,16 +137,16 @@ def test_generate_ed2k_link_with_part_hashes() -> None:
     assert link == f"ed2k://|file|tiny.bin|100|{expected_hash}|/"
 
 
-@pytest.mark.skipif(not _REAL_SHARED_JSON.exists(), reason="bundled shared_files.json unavailable")
+@pytest.mark.skipif(_REAL_SHARED_JSON is None, reason="set AMULED_TEST_SHARED_JSON to test private shared_files.json")
 def test_real_shared_files_json_smoke() -> None:
     files = load_shared_files_json(_REAL_SHARED_JSON)
-    assert len(files) == 494
+    assert len(files) > 0
     assert all(len(item.file_hash) == 16 for item in files)
     assert all(item.size >= 0 for item in files)
 
 
-@pytest.mark.skipif(not _REAL_SHAREDDIR.exists(), reason="bundled shareddir.dat unavailable")
+@pytest.mark.skipif(_REAL_SHAREDDIR is None, reason="set AMULED_TEST_SHAREDDIR_DAT to test private shareddir.dat")
 def test_real_shareddir_dat_smoke() -> None:
     directories = load_shareddir_dat(_REAL_SHAREDDIR)
-    assert len(directories) == 246
+    assert len(directories) > 0
     assert all(str(path) for path in directories)

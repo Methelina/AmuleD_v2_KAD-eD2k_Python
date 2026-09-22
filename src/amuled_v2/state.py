@@ -3,11 +3,19 @@
 Provides the portable persistence layer for schema metadata, imported servers,
 static servers, shared-file metadata, and shared directories.  A small JSON
 store remains available only as a bootstrap fallback when DuckDB is absent.
+The shared repository supports direct scanning transactions so removed or
+missing files do not leave stale rows behind.
 
 src/amuled_v2/state.py
-Version:     0.3.2
+Version:     0.4.3
 Author:      Soror L.'.L.'.
-Updated:     2026-09-22
+Updated:     2026-09-23
+
+Patch Notes v0.4.3 (Soror L.'.L'.):
+  [+] Added transactional replacement of one shared directory scan.
+  [+] Added shared directory/file listing, lookup, and removal operations.
+  [*] Directory rescans delete rows whose source files no longer exist.
+  [*] File removal now reports false when the hash was already absent.
 
 Patch Notes v0.3.2 (Soror L.'.L'.):
   [+] Added tagged STATE diagnostics for backend connections, migrations, and
@@ -26,6 +34,7 @@ Patch Notes v0.1.0 (Soror L.'.L'.):
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
 from amuled_v2.logging_setup import LogTags, get_tagged_logger
@@ -283,11 +292,230 @@ class StateBackend:
         for directory in directories:
             con.execute(
                 "INSERT OR REPLACE INTO shared_directories (path) VALUES (?)",
-                (str(directory),),
+                (self._normalize_path(directory),),
             )
             count += 1
         log.info(f"Saved shared directories to state: {count}")
         return count
+
+    def replace_shared_directory_scan(
+        self,
+        directory: str | Path,
+        records: Iterable["SharedFile"],
+    ) -> dict[str, Any]:
+        """Atomically replace one directory's file set with a fresh scan.
+
+        Existing rows under *directory* that are absent from *records* are
+        deleted, preventing stale entries after files are renamed, moved, or
+        deleted.  The directory row is always upserted.
+        """
+        con = self._require_duckdb()
+        root = Path(directory).expanduser().resolve()
+        root_text = self._normalize_path(root)
+        prefix = root_text.rstrip("\\/") + "\\"
+
+        con.execute("BEGIN TRANSACTION")
+        try:
+            con.execute(
+                "INSERT OR REPLACE INTO shared_directories (path) VALUES (?)",
+                (root_text,),
+            )
+
+            saved = 0
+            for record in records:
+                con.execute(
+                    """
+                    INSERT OR REPLACE INTO shared_files (
+                        file_hash, name, size, path, priority, imported
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.hash_hex,
+                        record.name,
+                        record.size,
+                        self._normalize_path(record.path) if record.path else None,
+                        record.priority,
+                        record.imported,
+                    ),
+                )
+                saved += 1
+
+            existing = con.execute(
+                """
+                SELECT file_hash, path FROM shared_files
+                WHERE starts_with(lower(path), lower(?))
+                """,
+                (prefix,),
+            ).fetchall()
+            scanned_paths = {
+                self._normalize_path(record.path).lower()
+                for record in records
+                if record.path is not None
+            }
+            stale_hashes = [
+                file_hash
+                for file_hash, path in existing
+                if (path or "").lower() not in scanned_paths
+            ]
+            removed = 0
+            for file_hash in stale_hashes:
+                con.execute(
+                    "DELETE FROM shared_files WHERE file_hash = ?",
+                    (file_hash,),
+                )
+                removed += 1
+
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            log.exception(f"Shared directory scan rollback: path={root_text}")
+            raise
+
+        result = {
+            "directory": root_text,
+            "saved_files": saved,
+            "removed_files": removed,
+        }
+        log.info(
+            f"Replaced shared directory scan: path={root_text}, "
+            f"saved={saved}, removed={removed}"
+        )
+        return result
+
+    def list_shared_directories(self) -> list[str]:
+        """Return registered shared directories in stable path order."""
+        con = self._require_duckdb()
+        rows = con.execute(
+            "SELECT path FROM shared_directories ORDER BY lower(path)"
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def list_shared_files(
+        self,
+        *,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Return shared-file rows in stable name/hash order."""
+        con = self._require_duckdb()
+        if limit < 0 or offset < 0:
+            raise ValueError("limit and offset must be non-negative")
+        rows = con.execute(
+            """
+            SELECT file_hash, name, size, path, priority, imported
+            FROM shared_files
+            ORDER BY lower(name), file_hash
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        ).fetchall()
+        return [
+            {
+                "hash": row[0],
+                "name": row[1],
+                "size": row[2],
+                "path": row[3],
+                "priority": row[4],
+                "imported": row[5],
+            }
+            for row in rows
+        ]
+
+    def get_shared_file(self, file_hash: str) -> dict[str, Any] | None:
+        """Return one shared-file row by ED2K hash, or ``None``."""
+        normalized = file_hash.strip().lower()
+        if len(normalized) != 32:
+            raise ValueError("file hash must contain 32 hexadecimal digits")
+        bytes.fromhex(normalized)
+        con = self._require_duckdb()
+        row = con.execute(
+            """
+            SELECT file_hash, name, size, path, priority, imported
+            FROM shared_files WHERE lower(file_hash) = ?
+            """,
+            (normalized,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "hash": row[0],
+            "name": row[1],
+            "size": row[2],
+            "path": row[3],
+            "priority": row[4],
+            "imported": row[5],
+        }
+
+    def remove_shared_file(self, file_hash: str) -> bool:
+        """Remove one shared-file row by ED2K hash."""
+        normalized = file_hash.strip().lower()
+        if len(normalized) != 32:
+            raise ValueError("file hash must contain 32 hexadecimal digits")
+        bytes.fromhex(normalized)
+        con = self._require_duckdb()
+        existed = con.execute(
+            "SELECT COUNT(*) FROM shared_files WHERE lower(file_hash) = ?",
+            (normalized,),
+        ).fetchone()[0] > 0
+        if existed:
+            con.execute(
+                "DELETE FROM shared_files WHERE lower(file_hash) = ?",
+                (normalized,),
+            )
+        log.info(f"Removed shared file: hash={normalized}, removed={existed}")
+        return existed
+
+    def remove_shared_directory(
+        self,
+        directory: str | Path,
+        *,
+        remove_files: bool = True,
+    ) -> dict[str, Any]:
+        """Remove a shared directory and optionally all file rows under it."""
+        con = self._require_duckdb()
+        root_text = self._normalize_path(directory)
+        prefix = root_text.rstrip("\\/") + "\\"
+        con.execute("BEGIN TRANSACTION")
+        try:
+            removed_files = 0
+            if remove_files:
+                removed_files = con.execute(
+                    "SELECT COUNT(*) FROM shared_files WHERE starts_with(lower(path), lower(?))",
+                    (prefix,),
+                ).fetchone()[0]
+                con.execute(
+                    "DELETE FROM shared_files WHERE starts_with(lower(path), lower(?))",
+                    (prefix,),
+                )
+            directory_row = con.execute(
+                "SELECT path FROM shared_directories WHERE lower(path) = lower(?)",
+                (root_text,),
+            ).fetchone()
+            con.execute(
+                "DELETE FROM shared_directories WHERE lower(path) = lower(?)",
+                (root_text,),
+            )
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            log.exception(f"Shared directory removal rollback: path={root_text}")
+            raise
+        removed_directory = directory_row is not None
+        result = {
+            "directory": root_text,
+            "directory_removed": removed_directory,
+            "files_removed": remove_files,
+            "removed_files": removed_files,
+        }
+        log.info(
+            f"Removed shared directory: path={root_text}, "
+            f"directory={removed_directory}, files={removed_files}"
+        )
+        return result
+
+    def _normalize_path(self, path: str | Path) -> str:
+        """Return a stable absolute path string for portable persistence."""
+        return str(Path(path).expanduser().resolve())
 
     def close(self) -> None:
         if self._con is not None and self.backend == "duckdb":

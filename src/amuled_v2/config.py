@@ -78,8 +78,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "static_servers": "assets/v1/staticservers.dat",
     },
     "sharing": {
-        "shared_files_json": "assets/v1/shared_files.json",
-        "shareddir_dat": "assets/v1/shareddir.dat",
+        "shared_files_json": None,
+        "shareddir_dat": None,
     },
     "ipfilter": {
         "ipfilter_dat": "assets/v1/ipfilter.dat",

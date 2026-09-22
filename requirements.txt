@@ -11,6 +11,7 @@
 #   [+] Adds PyCryptodome for the required MD4 implementation (Crypto.Hash.MD4).
 #   [+] Adds pytest to the project-local test runtime.
 #   [+] Adds pytest-asyncio for protocol session integration tests.
+#   [+] Adds tqdm for visible hashing progress.
 
 # Patch Notes v0.1.0 (Soror L.'.L'.):
 #   [+] Initial clean-room requirements for AmuleD_v2 (Python ED2K/Kademlia client).
@@ -25,6 +26,7 @@ pycryptodome>=3.20.0
 # === REPL & CLI Rendering ===
 prompt_toolkit>=3.0.47
 rich>=13.7.0
+tqdm>=4.66.0
 
 # === Config (JSONC/JSON5 parsing) ===
 json5>=0.9.25

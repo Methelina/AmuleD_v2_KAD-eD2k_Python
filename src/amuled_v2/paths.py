@@ -72,8 +72,6 @@ BASELINE_NODES_DAT: Path = BASELINE_ASSETS_DIR / "nodes.dat"
 BASELINE_STATIC_SERVERS: Path = BASELINE_ASSETS_DIR / "staticservers.dat"
 BASELINE_IPFILTER: Path = BASELINE_ASSETS_DIR / "ipfilter.dat"
 BASELINE_IPFILTER_STATIC: Path = BASELINE_ASSETS_DIR / "ipfilter_static.dat"
-BASELINE_SHARED_FILES_JSON: Path = BASELINE_ASSETS_DIR / "shared_files.json"
-BASELINE_SHAREDDIR_DAT: Path = BASELINE_ASSETS_DIR / "shareddir.dat"
 BASELINE_GEOIP_DAT: Path = BASELINE_ASSETS_DIR / "GeoIP.dat"
 
 # ------------------------------------------------------------------

@@ -1,5 +1,5 @@
 # ==========================================================
-# AmuleD v0.4.1 Portable Launcher (PowerShell Version)
+# AmuleD v0.4.3 Portable Launcher (PowerShell Version)
 # ==========================================================
 # Version: 1.1.0
 # Author:  Soror L.'.L.'.
@@ -28,7 +28,7 @@ param(
 # Set UTF-8 encoding and working directory
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
-$Host.UI.RawUI.WindowTitle = "AmuleD v0.4.1 Portable Launcher by Soror L.'.L.'."
+$Host.UI.RawUI.WindowTitle = "AmuleD v0.4.3 Portable Launcher by Soror L.'.L.'."
 Set-Location $PSScriptRoot
 
 # ==========================================================
@@ -47,7 +47,7 @@ Write-Host "    ░ ░    ░    ░     ░ ░    ░    ░" -ForegroundColo
 Write-Host "      ░  ░  ░    ░      ░  ░  ░    ░" -ForegroundColor Yellow
 Write-Host ""
 Write-Host " ======================================================" -ForegroundColor Cyan
-Write-Host "   AmuleD v0.4.1 Portable ED2K/Kademlia Launcher" -ForegroundColor White
+Write-Host "   AmuleD v0.4.3 Portable ED2K/Kademlia Launcher" -ForegroundColor White
 Write-Host "   by Soror L.'.L.'." -ForegroundColor Yellow
 Write-Host ""
 

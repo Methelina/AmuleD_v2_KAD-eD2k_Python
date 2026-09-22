@@ -1,4 +1,4 @@
-# AmuleD v0.4.1
+# AmuleD v0.4.3
 
 AmuleD — портативный консольный ED2K/Kademlia-клиент на Python 3.12. Это независимая clean-room реализация публичных протоколов ED2K и Kademlia, а не бинарная обёртка вокруг aMule/eMule и не прямой порт GPL-исходников.
 
@@ -63,23 +63,46 @@ AmuleD — ранняя клиентская основа. Сейчас уже �
 
 `status --json` показывает активный backend, путь базы, состояние ED2K/KAD и количество записей в таблицах.
 
-### Импорт bundled-данных
+### Добавление и сканирование новых файлов
 
-Репозиторий самодостаточен: базовые ресурсы v1 находятся в `assets\v1`. Их нужно импортировать в проектную базу:
+Новые файлы можно зарегистрировать, хэшировать по ED2K и сразу записать в DuckDB через CLI:
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause share add D:\Media
+.\AmuleD_Run.ps1 -NoPause share scan
+.\AmuleD_Run.ps1 -NoPause share list --json
+```
+
+Интерактивные `share add` и `share scan` показывают tqdm-прогресс хэширования в stderr. В режиме `--json` прогресс отключается автоматически; его также можно отключить флагом `--no-progress`.
+
+`share add` регистрирует каталог, рекурсивно сканирует его и сохраняет полученные записи файлов. `share scan` без путей пересканирует все зарегистрированные каталоги. При повторном сканировании удаляются записи для файлов, которых больше нет или которые ушли из дерева сканирования, поэтому stale-хвосты в базе не остаются.
+
+Полезные варианты:
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause share add D:\Music --priority high --json
+.\AmuleD_Run.ps1 -NoPause share add D:\Downloads --no-recursive --json
+.\AmuleD_Run.ps1 -NoPause share scan D:\Media --dry-run --json
+.\AmuleD_Run.ps1 -NoPause share add D:\LargeLibrary --no-progress
+.\AmuleD_Run.ps1 -NoPause share list --files-only --limit 100 --json
+.\AmuleD_Run.ps1 -NoPause share remove file 00112233445566778899AABBCCDDEEFF --json
+.\AmuleD_Run.ps1 -NoPause share remove dir D:\Media --json
+```
+
+`share remove dir` по умолчанию удаляет зарегистрированный каталог и его записи файлов. Добавьте `--keep-files`, чтобы удалить только строку каталога. Отдельный файл удаляется по 32-значному ED2K-хэшу.
+
+### Импорт bundled сетевых ресурсов
+
+Репозиторий содержит публичные сетевые ресурсы в `assets\v1`. Импортируйте их в проектную базу:
 
 ```powershell
 .\AmuleD_Run.ps1 -NoPause import servers `
   --server-met assets\v1\server.met `
   --static assets\v1\staticservers.dat `
   --save --json
-
-.\AmuleD_Run.ps1 -NoPause import shared `
-  --shared-json assets\v1\shared_files.json `
-  --shareddir assets\v1\shareddir.dat `
-  --save --json
 ```
 
-После импорта `status --json` покажет счётчики серверов, статических серверов, файлов и каталогов шаринга.
+После импорта `status --json` покажет счётчики серверов и статических серверов. Не импортируйте метаданные шаринга из чужой установки; регистрируйте собственные каталоги через `share add`, чтобы AmuleD хэшировал и сохранял только ваши файлы.
 
 ### Логи
 
@@ -106,7 +129,7 @@ JSONL содержит стабильные поля времени, уровн�
 Зафиксированы публичное имя и версия:
 
 ```text
-AmuleD v0.4.1
+AmuleD v0.4.3
 ```
 
 Технические имена отделены от публичных и стабильны:
@@ -114,7 +137,7 @@ AmuleD v0.4.1
 | Элемент | Значение |
 |---|---|
 | Публичное имя клиента | `AmuleD` |
-| Публичная строка версии | `AmuleD v0.4.1` |
+| Публичная строка версии | `AmuleD v0.4.3` |
 | Python package | `amuled_v2` |
 | CLI executable | `amuled` |
 | Каталог проекта | `AmuleD_v2` |
@@ -236,7 +259,7 @@ JSONL-записи можно фильтровать напрямую по по�
 
 ### Bundled базовые ресурсы
 
-После клонирования проект самодостаточен. В базовый дистрибутив входят:
+После клонирования проект самодостаточен. В базовый дистрибутив входят только публичные сетевые/bootstrap-ресурсы:
 
 - `assets/v1/server.met`
 - `assets/v1/nodes.dat`
@@ -244,10 +267,8 @@ JSONL-записи можно фильтровать напрямую по по�
 - `assets/v1/staticservers.dat`
 - `assets/v1/ipfilter.dat`
 - `assets/v1/ipfilter_static.dat`
-- `assets/v1/shareddir.dat`
-- `assets/v1/shared_files.json`
 
-История пользователя, client credits, identity-файлы и состояние частичных закачек в публичный baseline не входят.
+Метаданные шаринга, списки общих каталогов, сгенерированный конфиг, DuckDB-состояние, логи и состояние частичных закачек приватны. Они игнорируются Git и должны создаваться локально через `share add` или импортироваться явно только из собственных legacy-файлов.
 
 ### Roadmap
 
