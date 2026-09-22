@@ -6,9 +6,13 @@ server identity/status/message parsing, global search, and TCP source lookup.
 The client is loopback-testable and does not perform obfuscation yet.
 
 src/amuled_v2/core/ed2k/server_client.py
-Version:     0.2.2
+Version:     0.3.0
 Author:      Soror L.'.L.'.
 Updated:     2026-09-23
+
+Patch Notes v0.3.0 (Soror L.'.L'.):
+  [+] Added SearchResultsBatch for persistence and session bookkeeping.
+  [+] Search results now expose their full tag set instead of discarding it.
 
 Patch Notes v0.2.2 (Soror L.'.L'.):
   [+] Search now accumulates result batches over an explicit time window.
@@ -39,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -62,6 +67,7 @@ __all__ = [
     "FoundSources",
     "SearchResult",
     "SearchResultResponse",
+    "SearchResultsBatch",
     "ServerIdentity",
     "ServerIdChange",
     "ServerStatus",
@@ -189,8 +195,8 @@ class SearchResult:
         value = self._tag_value(0x30)
         return value if isinstance(value, int) else 0
 
-    def to_dict(self) -> dict[str, object]:
-        return {
+    def to_dict(self, *, include_tags: bool = False) -> dict[str, object]:
+        result: dict[str, object] = {
             "hash": self.file_hash.hex().upper(),
             "name": self.name,
             "size": self.size,
@@ -199,6 +205,9 @@ class SearchResult:
             "client_id": self.client_id,
             "client_port": self.client_port,
         }
+        if include_tags:
+            result["tags"] = [tag.to_dict() for tag in self.tags]
+        return result
 
 
 @dataclass(frozen=True)
@@ -246,6 +255,38 @@ class SearchResultResponse:
             "results": [result.to_dict() for result in self.results],
             "result_count": len(self.results),
             "more_results_available": self.more_results_available,
+        }
+
+
+@dataclass(frozen=True)
+class SearchResultsBatch:
+    """One completed search window prepared for persistence and reporting."""
+
+    query: str
+    channel: str
+    server_host: str
+    server_port: int
+    results: tuple[SearchResult, ...]
+    more_results_available: bool = False
+    session_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.session_id:
+            object.__setattr__(self, "session_id", str(uuid.uuid4()))
+
+    @property
+    def server(self) -> str:
+        return f"{self.server_host}:{self.server_port}"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "query": self.query,
+            "channel": self.channel,
+            "server": self.server,
+            "session_id": self.session_id,
+            "result_count": len(self.results),
+            "more_results_available": self.more_results_available,
+            "results": [result.to_dict(include_tags=True) for result in self.results],
         }
 
 
@@ -439,6 +480,8 @@ class Ed2kServerClient:
         self.messages: list[str] = []
         self.connected = False
         self.logged_in = False
+        self.last_search_more = False
+        self.last_search_batches = 0
 
     @property
     def is_connected(self) -> bool:
@@ -490,11 +533,11 @@ class Ed2kServerClient:
             raise ServerSessionError("ED2K server session is not connected")
         return self._writer
 
-    async def _send_packet(self, packet: Packet) -> None:
-        from amuled_v2.core.codec.packet import encode_packet
+    async def _send_packet(self, packet: Packet, *, packed: bool = False) -> None:
+        from amuled_v2.core.codec.packet import encode_packet, pack_packet
 
         writer = self._require_writer()
-        wire = encode_packet(packet)
+        wire = pack_packet(packet) if packed else encode_packet(packet)
         writer.write(wire)
         try:
             await writer.drain()
@@ -676,13 +719,17 @@ class Ed2kServerClient:
         self,
         query: str,
         duration: float = 30.0,
+        *,
+        progress_callback: "Optional[callable]" = None,
     ) -> list[SearchResult]:
         """Run a global ED2K search and accumulate results over a time window.
 
         ED2K search is inherently asynchronous: servers deliver result batches
         over time and may legitimately return an empty batch before later data
         arrives.  Therefore this method keeps the session alive and aggregates
-        all packets received within *duration* seconds.
+        all packets received within *duration* seconds.  When supplied,
+        ``progress_callback(elapsed, duration, result_count)`` fires after
+        every receive-loop tick.
         """
         self._require_logged_in()
         if duration <= 0:
@@ -703,14 +750,15 @@ class Ed2kServerClient:
         results: dict[bytes, SearchResult] = {}
         more_results = False
         packet_batches = 0
-        deadline = time.monotonic() + duration
+        started_at = time.monotonic()
+        deadline = started_at + duration
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             try:
                 packet = await self._receive_packet(
-                    timeout=remaining,
+                    timeout=min(remaining, 0.25),
                     close_on_timeout=False,
                 )
             except ServerSessionError as exc:
@@ -724,8 +772,20 @@ class Ed2kServerClient:
                     break
                 raise
 
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        min(time.monotonic() - started_at, duration),
+                        duration,
+                        len(results),
+                    )
+                except Exception:  # progress must never break a search
+                    pass
+
             if packet is None:
-                break
+                # Tick timeout: silence within the accumulation window is
+                # normal; keep the window open until the deadline.
+                continue
             self._require_edonkey(packet)
             if await self._consume_auxiliary_packet(packet):
                 continue
@@ -754,7 +814,60 @@ class Ed2kServerClient:
             f"results={len(results)}, batches={packet_batches}, "
             f"more={more_results}, endpoint={self.host}:{self.port}"
         )
+        self.last_search_more = more_results
+        self.last_search_batches = packet_batches
         return list(results.values())
+
+    async def publish_shared_files(
+        self,
+        files: list[tuple[bytes, str, int]],
+        *,
+        complete_marker: bool = True,
+    ) -> int:
+        """Publish a shared-file list to the server (``OP_OFFERFILES``).
+
+        *files* carries ``(hash, name, size)`` tuples.  Newer servers use the
+        special 0xFBFBFBFB:0xFBFB endpoint marker for complete files; the
+        list must still be sent even when empty, matching the reference
+        client's post-login publish step.
+        """
+        self._require_logged_in()
+        writer = BinaryWriter()
+        writer.write_u32(len(files))
+        for file_hash, name, size in files:
+            if len(file_hash) != 16:
+                raise ServerSessionError(
+                    f"shared file hash must contain 16 bytes: {file_hash.hex()}"
+                )
+            writer.write_hash16(file_hash)
+            if complete_marker:
+                writer.write_u32(0xFBFBFBFB)
+                writer.write_u16(0xFBFB)
+            else:
+                writer.write_u32(0)
+                writer.write_u16(0)
+            tags: list[Ed2kTag] = [
+                Ed2kTag(name_id=0x01, type=0x02, value=name),
+                Ed2kTag(name_id=0x02, value=size),
+            ]
+            writer.write_u32(len(tags))
+            for tag in tags:
+                from amuled_v2.core.codec.tags import write_new_tag
+
+                write_new_tag(tag, writer)
+        await self._send_packet(
+            Packet(
+                protocol=EDONKEY,
+                opcode=C2STCP.OFFERFILES,
+                payload=writer.to_bytes(),
+            ),
+            packed=True,
+        )
+        log.info(
+            f"ED2K shared files published: endpoint={self.host}:{self.port}, "
+            f"count={len(files)}"
+        )
+        return len(files)
 
     async def get_sources(self, file_hash: bytes, file_size: int) -> FoundSources:
         """Request sources and wait one protocol response window.

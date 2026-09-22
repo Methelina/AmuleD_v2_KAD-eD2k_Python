@@ -7,13 +7,15 @@ The shared repository supports direct scanning transactions so removed or
 missing files do not leave stale rows behind.
 
 src/amuled_v2/state.py
-Version:     0.5.0
+Version:     0.6.0
 Author:      Soror L.'.L.'.
 Updated:     2026-09-23
 
-Patch Notes v0.5.0 (Soror L.'.L'.):
-  [+] Added schema migration 3 and persistence for ED2K file sources.
-  [+] Added source listing with optional file-hash filtering.
+Patch Notes v0.6.0 (Soror L.'.L'.):
+  [+] Added schema migration 4 for persisted search results.
+  [+] Added search-result save, listing, filtering, and clearing.
+  [*] Repeated source rows now update last_seen instead of resetting it.
+  [+] Added source expiry, pruning, forgetting, and statistics.
 
 Patch Notes v0.4.3 (Soror L.'.L'.):
   [+] Added transactional replacement of one shared directory scan.
@@ -38,6 +40,8 @@ Patch Notes v0.1.0 (Soror L.'.L'.):
 from __future__ import annotations
 
 import json
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
@@ -47,7 +51,7 @@ from amuled_v2.paths import DB_FILE, STATE_JSON, ensure_runtime_dirs
 log = get_tagged_logger(LogTags.STATE, "state")
 
 if TYPE_CHECKING:
-    from amuled_v2.core.ed2k import FoundSources, ServerRecord, StaticServer
+    from amuled_v2.core.ed2k import FoundSources, SearchResultsBatch, ServerRecord, StaticServer
     from amuled_v2.core.sharing import SharedFile
 
 try:
@@ -56,7 +60,7 @@ try:
 except ImportError:  # pragma: no cover - exercised only without DuckDB
     _HAS_DUCKDB = False
 
-_CURRENT_SCHEMA_VERSION = 3
+_CURRENT_SCHEMA_VERSION = 4
 _JSON_STORE: dict[str, Any] | None = None
 
 
@@ -148,6 +152,65 @@ def _migrate_v3(con: Any) -> None:
     )
 
 
+def _migrate_v4(con: Any) -> None:
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS search_results (
+            query           VARCHAR NOT NULL,
+            channel         VARCHAR NOT NULL,
+            file_hash       VARCHAR NOT NULL,
+            name            VARCHAR NOT NULL,
+            size            BIGINT NOT NULL,
+            sources         INTEGER NOT NULL,
+            complete_sources INTEGER NOT NULL,
+            server          VARCHAR NOT NULL,
+            tags            VARCHAR,
+            client_id       UINTEGER,
+            client_port     UINTEGER,
+            first_seen      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (query, channel, file_hash)
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS search_sessions (
+            session_id      VARCHAR PRIMARY KEY,
+            query           VARCHAR NOT NULL,
+            channel         VARCHAR NOT NULL,
+            server          VARCHAR NOT NULL,
+            started_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_activity   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            result_count    INTEGER NOT NULL DEFAULT 0,
+            active          BOOLEAN NOT NULL DEFAULT TRUE
+        )
+    """)
+    con.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (4)"
+    )
+
+
+def _open_duckdb_with_retry(database: Path, *, attempts: int = 5, delay: float = 0.5) -> Any:
+    """Open DuckDB, retrying briefly when another process still holds the lock.
+
+    Killed CLI runs can leave the database file locked for a few seconds on
+    Windows; retrying is friendlier than failing the whole command.
+    """
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return duckdb.connect(str(database))
+        except Exception as exc:  # duckdb.IOException and friends
+            last_error = exc
+            if attempt < attempts - 1:
+                log.warning(
+                    "DuckDB lock retry: attempt=%d, delay=%.1fs, error=%s",
+                    attempt + 1,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+    raise RuntimeError(f"cannot open DuckDB state {database}: {last_error}") from last_error
+
+
 def _init_duckdb(con: Any) -> None:
     """Apply all pending schema migrations."""
     log.debug("Initializing DuckDB schema")
@@ -161,6 +224,10 @@ def _init_duckdb(con: Any) -> None:
     if current < 3:
         _migrate_v3(con)
         log.info("DuckDB schema migrated to version 3")
+        current = 3
+    if current < 4:
+        _migrate_v4(con)
+        log.info("DuckDB schema migrated to version 4")
     else:
         log.debug("DuckDB schema is current")
 
@@ -208,7 +275,7 @@ class StateBackend:
         ensure_runtime_dirs()
         if _HAS_DUCKDB:
             log.debug(f"Connecting DuckDB state: {DB_FILE}")
-            self._con = duckdb.connect(str(DB_FILE))
+            self._con = _open_duckdb_with_retry(DB_FILE)
             _init_duckdb(self._con)
         else:
             log.warning("DuckDB unavailable; using JSON bootstrap fallback")
@@ -291,6 +358,234 @@ class StateBackend:
         log.info(f"Saved static servers to state: {count}")
         return count
 
+    def save_search_results_batch(
+        self,
+        batch: "SearchResultsBatch",
+        *,
+        persist_tags: bool = True,
+    ) -> int:
+        """Persist one accumulated search batch; repeated hits update last_seen."""
+        con = self._require_duckdb()
+        server_text = f"{batch.server_host}:{batch.server_port}"
+        count = 0
+        for result in batch.results:
+            tags_json = None
+            if persist_tags:
+                tags_json = json.dumps(
+                    [tag.to_dict() for tag in result.tags],
+                    ensure_ascii=False,
+                )
+            con.execute(
+                """
+                INSERT INTO search_results (
+                    query, channel, file_hash, name, size, sources,
+                    complete_sources, server, tags, client_id, client_port
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (query, channel, file_hash) DO UPDATE SET
+                    name      = excluded.name,
+                    size      = excluded.size,
+                    sources   = excluded.sources,
+                    complete_sources = excluded.complete_sources,
+                    server    = excluded.server,
+                    tags      = excluded.tags,
+                    client_id = excluded.client_id,
+                    client_port = excluded.client_port,
+                    last_seen = get_current_timestamp()
+                """,
+                (
+                    batch.query,
+                    batch.channel,
+                    result.file_hash.hex().upper(),
+                    result.name,
+                    result.size,
+                    result.sources,
+                    result.complete_sources,
+                    server_text,
+                    tags_json,
+                    result.client_id,
+                    result.client_port,
+                ),
+            )
+            count += 1
+        con.execute(
+            """
+            INSERT INTO search_sessions (
+                session_id, query, channel, server, result_count, active
+            ) VALUES (?, ?, ?, ?, ?, FALSE)
+            ON CONFLICT (session_id) DO UPDATE SET
+                last_activity = get_current_timestamp(),
+                result_count  = search_sessions.result_count + excluded.result_count
+            """,
+            (
+                batch.session_id,
+                batch.query,
+                batch.channel,
+                server_text,
+                len(batch.results),
+            ),
+        )
+        log.info(
+            "Saved search results to state: query=%r, channel=%s, saved=%d, "
+            "session=%s",
+            batch.query,
+            batch.channel,
+            count,
+            batch.session_id,
+        )
+        return count
+
+    def list_servers(self) -> list[dict[str, Any]]:
+        """List persisted ED2K servers for UDP global search."""
+        con = self._require_duckdb()
+        rows = con.execute(
+            """
+            SELECT ip, port, address, name FROM servers
+            ORDER BY priority DESC, users DESC, name
+            """
+        ).fetchall()
+        return [
+            {
+                "ip": row[0],
+                "port": row[1],
+                "address": row[2],
+                "name": row[3],
+            }
+            for row in rows
+        ]
+
+    def list_search_results(
+        self,
+        *,
+        query: str | None = None,
+        channel: str | None = None,
+        hash_prefix: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """List persisted search results with optional filters."""
+        con = self._require_duckdb()
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+        conditions: list[str] = []
+        params: list[Any] = []
+        if query:
+            conditions.append("lower(query) = lower(?)")
+            params.append(query)
+        if channel:
+            conditions.append("channel = ?")
+            params.append(channel)
+        if hash_prefix:
+            prefix = hash_prefix.strip().lower()
+            if not prefix or any(c not in "0123456789abcdef" for c in prefix):
+                raise ValueError("hash prefix must contain hexadecimal digits")
+            conditions.append("starts_with(lower(file_hash), ?)")
+            params.append(prefix)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+        rows = con.execute(
+            f"""
+            SELECT query, channel, file_hash, name, size, sources,
+                   complete_sources, server, first_seen, last_seen
+            FROM search_results
+            {where}
+            ORDER BY last_seen DESC, lower(name)
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [
+            {
+                "query": row[0],
+                "channel": row[1],
+                "hash": row[2],
+                "name": row[3],
+                "size": row[4],
+                "sources": row[5],
+                "complete_sources": row[6],
+                "server": row[7],
+                "first_seen": str(row[8]),
+                "last_seen": str(row[9]),
+            }
+            for row in rows
+        ]
+
+    def get_search_result_tags(self, file_hash: str) -> list[dict[str, Any]]:
+        """Return stored full tag dictionaries for one result hash."""
+        normalized = file_hash.strip().lower()
+        if len(normalized) != 32:
+            raise ValueError("file hash must contain 32 hexadecimal digits")
+        bytes.fromhex(normalized)
+        con = self._require_duckdb()
+        rows = con.execute(
+            "SELECT tags FROM search_results WHERE lower(file_hash) = ?",
+            (normalized,),
+        ).fetchall()
+        tags: list[dict[str, Any]] = []
+        for (tags_json,) in rows:
+            if not tags_json:
+                continue
+            decoded = json.loads(tags_json)
+            if isinstance(decoded, list):
+                tags.extend(item for item in decoded if isinstance(item, dict))
+        return tags
+
+    def clear_search_results(
+        self,
+        *,
+        query: str | None = None,
+    ) -> int:
+        """Delete cached search results, optionally scoped to one query."""
+        con = self._require_duckdb()
+        if query:
+            removed = con.execute(
+                "SELECT COUNT(*) FROM search_results WHERE lower(query) = lower(?)",
+                (query,),
+            ).fetchone()[0]
+            con.execute(
+                "DELETE FROM search_results WHERE lower(query) = lower(?)",
+                (query,),
+            )
+            con.execute(
+                "DELETE FROM search_sessions WHERE lower(query) = lower(?)",
+                (query,),
+            )
+        else:
+            removed = con.execute("SELECT COUNT(*) FROM search_results").fetchone()[0]
+            con.execute("DELETE FROM search_results")
+            con.execute("DELETE FROM search_sessions")
+        log.info("Cleared search results: query=%r, removed=%d", query, removed)
+        return removed
+
+    def list_search_sessions(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List recorded search sessions, newest first."""
+        con = self._require_duckdb()
+        rows = con.execute(
+            """
+            SELECT session_id, query, channel, server, started_at,
+                   last_activity, result_count, active
+            FROM search_sessions
+            ORDER BY last_activity DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "session_id": row[0],
+                "query": row[1],
+                "channel": row[2],
+                "server": row[3],
+                "started_at": str(row[4]),
+                "last_activity": str(row[5]),
+                "result_count": row[6],
+                "active": row[7],
+            }
+            for row in rows
+        ]
+
     def save_found_sources(
         self,
         record: "FoundSources",
@@ -305,10 +600,15 @@ class StateBackend:
         for source in record.sources:
             con.execute(
                 """
-                INSERT OR REPLACE INTO file_sources (
+                INSERT INTO file_sources (
                     file_hash, client_id, client_port, source_type,
                     server_ip, server_port, user_hash
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (file_hash, client_id, client_port, source_type) DO UPDATE SET
+                    server_ip   = excluded.server_ip,
+                    server_port = excluded.server_port,
+                    user_hash   = excluded.user_hash,
+                    last_seen   = get_current_timestamp()
                 """,
                 (
                     record.file_hash.hex().upper(),
@@ -375,6 +675,107 @@ class StateBackend:
             }
             for row in rows
         ]
+
+    def forget_file_sources(self, file_hash: str) -> int:
+        """Delete all persisted source rows for one ED2K file hash."""
+        normalized = file_hash.strip().lower()
+        if len(normalized) != 32:
+            raise ValueError("file hash must contain 32 hexadecimal digits")
+        bytes.fromhex(normalized)
+        con = self._require_duckdb()
+        removed = con.execute(
+            "SELECT COUNT(*) FROM file_sources WHERE lower(file_hash) = ?",
+            (normalized,),
+        ).fetchone()[0]
+        con.execute(
+            "DELETE FROM file_sources WHERE lower(file_hash) = ?",
+            (normalized,),
+        )
+        log.info("Forgot file sources: hash=%s, removed=%d", normalized, removed)
+        return removed
+
+    def prune_file_sources(
+        self,
+        *,
+        max_age_hours: float | None = None,
+        dead_only: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Delete expired or dead source rows.
+
+        Rows are expired when ``last_seen`` is older than *max_age_hours*.
+        Dead sources are low-id rows (``client_id`` below the high-id
+        threshold) that have not been seen again within *max_age_hours* as
+        well; with ``dead_only`` only those are removed.
+        """
+        con = self._require_duckdb()
+        age_hours = max_age_hours if max_age_hours is not None else 24 * 7
+        if age_hours <= 0:
+            raise ValueError("max_age_hours must be positive")
+        cutoff = datetime.now() - timedelta(hours=age_hours)
+        if dead_only:
+            conditions = (
+                "last_seen < ? AND client_id < 16000000",
+            )
+            params: list[Any] = [cutoff]
+        else:
+            conditions = "last_seen < ?"
+            params = [cutoff]
+        counted = con.execute(
+            f"SELECT COUNT(*) FROM file_sources WHERE {conditions}",
+            params,
+        ).fetchone()[0]
+        if dry_run or counted == 0:
+            return {
+                "matched": counted,
+                "pruned": 0 if dry_run else counted,
+                "dry_run": dry_run,
+                "max_age_hours": age_hours,
+                "dead_only": dead_only,
+            }
+        con.execute(f"DELETE FROM file_sources WHERE {conditions}", params)
+        log.info(
+            "Pruned file sources: matched=%d, max_age_hours=%s, dead_only=%s",
+            counted,
+            age_hours,
+            dead_only,
+        )
+        return {
+            "matched": counted,
+            "pruned": counted,
+            "dry_run": False,
+            "max_age_hours": age_hours,
+            "dead_only": dead_only,
+        }
+
+    def get_source_statistics(self) -> dict[str, Any]:
+        """Return aggregate source counts for status reporting."""
+        con = self._require_duckdb()
+        total, distinct_files = con.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT file_hash) FROM file_sources"
+        ).fetchone()
+        row = con.execute(
+            """
+            SELECT source_type, COUNT(*) FROM file_sources
+            GROUP BY source_type ORDER BY source_type
+            """
+        ).fetchall()
+        by_type = {kind: count for kind, count in row}
+        high_id, low_id = con.execute(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE client_id >= 16000000),
+                COUNT(*) FILTER (WHERE client_id < 16000000)
+            FROM file_sources
+            """
+        ).fetchone()
+        return {
+            "total_sources": total,
+            "distinct_files": distinct_files,
+            "by_type": by_type,
+            "high_id_sources": high_id,
+            "low_id_sources": low_id,
+        }
 
     def save_shared_files(self, records: Iterable["SharedFile"]) -> int:
         con = self._require_duckdb()

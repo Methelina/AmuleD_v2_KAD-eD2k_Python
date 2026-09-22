@@ -13,9 +13,13 @@ from the local, ignored AmuleD v1 metadata file.  Override the defaults with:
     AMULED_LIVE_ED2K_LINK=ed2k://|file|...|
 
 tests/test_live_ed2k.py
-Version:     0.1.0
+Version:     0.2.0
 Author:      Soror L.'.L.'.
 Updated:     2026-09-23
+
+Patch Notes v0.2.0 (Soror L.'.L'.):
+  [*] A live search test counts as passed only with non-empty real results.
+  [*] The default live acceptance query is fixed to `video`.
 
 Patch Notes v0.1.0 (Soror L.'.L'.):
   [+] Added real-server login, search, and source integration tests.
@@ -44,6 +48,7 @@ from amuled_v2.core.ed2k import (
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _REAL_SHARED_JSON = _PROJECT_ROOT / "assets" / "v1" / "shared_files.json"
 _DEFAULT_SERVER = "176.123.5.89:4725"
+_DEFAULT_QUERY = "video"
 _LIVE_ENABLED = os.environ.get("AMULED_LIVE_ED2K", "").strip() == "1"
 
 pytestmark = pytest.mark.skipif(
@@ -140,7 +145,7 @@ def _real_target() -> RealEd2kTarget:
 
 
 def _query() -> str:
-    return os.environ.get("AMULED_LIVE_QUERY", _real_target().name)
+    return os.environ.get("AMULED_LIVE_QUERY", _DEFAULT_QUERY)
 
 
 def _client() -> Ed2kServerClient:
@@ -176,7 +181,11 @@ async def test_live_ed2k_search_real_query() -> None:
         # ED2K search is cumulative over time; let the client own its 30s
         # result-accumulation window instead of cancelling it externally.
         results = await client.search(query)
-        assert isinstance(results, (list, tuple))
+        # Real-test acceptance: only a non-empty live result set proves the
+        # search channel works.  A synthetic or empty run does not count.
+        assert len(results) > 0, (
+            f"live SERVER search for {query!r} returned zero real results"
+        )
         for result in results:
             assert len(result.file_hash) == 16
             assert result.name

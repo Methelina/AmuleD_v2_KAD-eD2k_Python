@@ -17,9 +17,17 @@ Dependencies (duckdb, rich) are optional at runtime; ``--help`` works without
 them installed.  Network protocol sessions are not started by share commands.
 
 src/amuled_v2/cli.py
-Version:     0.5.1
+Version:     0.6.0
 Author:      Soror L.'.L.'.
 Updated:     2026-09-23
+
+Patch Notes v0.6.0 (Soror L.'.L'.):
+  [+] Search results persist in DuckDB with full tag sets.
+  [+] Added `search results list/show/clear` for cached results.
+  [+] Implemented the GLOBAL channel as a real UDP server-list search.
+  [+] AUTO now resolves from the real ED2K connection state.
+  [+] Added `sources forget` and `sources prune` lifecycle commands.
+  [+] Added source statistics to `status --json`.
 
 Patch Notes v0.5.1 (Soror L.'.L'.):
   [+] Added explicit eMule-compatible search channel model.
@@ -71,6 +79,19 @@ from amuled_v2.core.search_channels import (
     parse_search_channel,
     resolve_auto_search_channel,
 )
+from amuled_v2.core.connection_state import get_connection_state
+from amuled_v2.core.ipfilter import IpFilter, load_ipfilter_file
+from amuled_v2.core.server_filter import ServerFilter
+
+_IPFILTER_PATH = Path(__file__).resolve().parents[2] / "assets" / "v1" / "ipfilter.dat"
+
+
+def _load_ipfilter() -> IpFilter:
+    try:
+        return load_ipfilter_file(_IPFILTER_PATH)
+    except FileNotFoundError:
+        log.warning(f"IPFILTER file missing: path={_IPFILTER_PATH}")
+        return IpFilter()
 
 log = get_tagged_logger(LogTags.CLI, "cli")
 from amuled_v2.state import get_state
@@ -88,6 +109,31 @@ def _print_text(header: str, lines: list[str]) -> None:
     print(header)
     for line in lines:
         print(f"  {line}")
+
+
+def _progress_line(text: str) -> None:
+    """Render one in-place progress line when the console supports it."""
+    if sys.stdout.isatty():
+        sys.stdout.write("\r\033[K" + text)
+        sys.stdout.flush()
+
+
+def _progress_done() -> None:
+    if sys.stdout.isatty():
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+def _render_search_progress(
+    elapsed: float,
+    duration: float,
+    result_count: int,
+    label: str,
+) -> None:
+    from amuled_v2.progressbar import render_progress
+
+    bar = render_progress(0.0, duration, elapsed, 30)
+    _progress_line(f"{bar} {label} {elapsed:5.1f}s/{duration:.0f}s results={result_count}")
 
 
 # ------------------------------------------------------------------
@@ -113,9 +159,26 @@ def _cmd_status(args: argparse.Namespace) -> int:
             "enable_kad": cfg["network"]["enable_kad"],
         },
     }
+    connections = get_connection_state()
+    result["connections"] = {
+        "ed2k_connected": connections.snapshot.ed2k_connected,
+        "kad_connected": connections.snapshot.kad_connected,
+        "server": (
+            f"{connections.snapshot.server_host}:{connections.snapshot.server_port}"
+            if connections.snapshot.ed2k_connected
+            else None
+        ),
+    }
+    try:
+        result["source_stats"] = st.get_source_statistics()
+    except Exception as exc:
+        log.warning(f"Source statistics unavailable: error={exc}")
+        result["source_stats"] = None
     if args.json:
         _print_json(result)
     else:
+        source_stats = result.get("source_stats")
+        connections_info = result["connections"]
         _print_text(f"{__version_string__} Status", [
             f"version    : {result['version']}",
             f"backend    : {result['backend']}",
@@ -125,6 +188,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
             f"udp_port   : {result['network']['client_udp_port']}",
             f"ed2k       : {result['network']['enable_ed2k']}",
             f"kad        : {result['network']['enable_kad']}",
+            f"ed2k_conn  : {connections_info['ed2k_connected']}",
+            f"kad_conn   : {connections_info['kad_connected']}",
+            f"sources    : "
+            f"{source_stats['total_sources'] if source_stats else 'n/a'} "
+            f"({source_stats['distinct_files'] if source_stats else '-'} files)",
         ])
     log.info("Status command completed")
     return 0
@@ -450,6 +518,10 @@ def _parse_server_endpoint(value: str) -> tuple[str, int]:
     return host, port
 
 
+_DEFAULT_GLOBAL_SERVER = "176.123.5.89"
+_DEFAULT_GLOBAL_PORT = 4725
+
+
 def _ed2k_login_request() -> "LoginRequest":
     from amuled_v2.core.ed2k import LoginRequest
 
@@ -481,7 +553,7 @@ def _print_search_results(result: dict, json_output: bool) -> None:
 
 
 async def _run_ed2k_search(args: argparse.Namespace) -> dict:
-    from amuled_v2.core.ed2k import Ed2kServerClient
+    from amuled_v2.core.ed2k import Ed2kServerClient, SearchResultsBatch
 
     host, port = _parse_server_endpoint(args.server)
     login = _ed2k_login_request()
@@ -492,20 +564,90 @@ async def _run_ed2k_search(args: argparse.Namespace) -> dict:
         connect_timeout=args.timeout,
         response_timeout=args.timeout,
     )
+    connections = get_connection_state()
+    results = []
+    more_results = False
+    resolved_channel = getattr(args, "channel", SearchChannel.SERVER.value)
+    published = 0
     try:
         await client.connect()
         await client.login()
-        results = await client.search(args.query, duration=args.duration)
+        connections.update_from_server_client(client)
+        published = await _publish_shared_files_to(client)
+
+        if resolved_channel == SearchChannel.AUTO.value:
+            snapshot = connections.snapshot
+            resolved = resolve_auto_search_channel(
+                ed2k_connected=snapshot.ed2k_connected,
+                kad_connected=snapshot.kad_connected,
+                server_is_static=snapshot.server_is_static,
+                server_users=snapshot.server_users,
+                server_files=snapshot.server_files,
+                server_count=snapshot.server_count,
+            )
+            resolved_channel = resolved.channel.value
+
+        raw = await client.search(
+            args.query,
+            duration=args.duration,
+            progress_callback=(
+                (lambda e, d, n: _render_search_progress(e, d, n, f"server {args.server}"))
+                if not args.json
+                else None
+            ),
+        )
+        results = list(raw)
+        more_results = bool(getattr(client, "last_search_more", False))
     finally:
         await client.close()
+        connections.set_ed2k_connected(False)
+        if not args.json:
+            _progress_done()
+
+    batch = SearchResultsBatch(
+        query=args.query,
+        channel=resolved_channel,
+        server_host=host,
+        server_port=port,
+        results=tuple(results),
+        more_results_available=more_results,
+    )
+
+    saved = 0
+    if not getattr(args, "no_save", False):
+        state = get_state()
+        state.connect()
+        saved = state.save_search_results_batch(batch)
+
     return {
         "status": "ok",
-        "channel": getattr(args, "channel", SearchChannel.SERVER.value),
+        "channel": resolved_channel,
         "server": args.server,
         "query": args.query,
+        "session_id": batch.session_id,
+        "published_files": published,
         "results": [item.to_dict() for item in results],
         "result_count": len(results),
+        "saved_results": saved,
     }
+
+
+async def _publish_shared_files_to(client) -> int:
+    """Publish the persisted shared-file list to the connected server."""
+    state = get_state()
+    state.connect()
+    rows = state.list_shared_files(limit=200)
+    files: list[tuple[bytes, str, int]] = []
+    for row in rows:
+        try:
+            files.append((bytes.fromhex(row["hash"]), row["name"], int(row["size"])))
+        except (ValueError, TypeError):
+            continue
+    try:
+        return await client.publish_shared_files(files)
+    except Exception as exc:
+        log.warning(f"Shared file publish failed: error={exc}")
+        return 0
 
 
 def _cmd_search_ed2k(args: argparse.Namespace) -> int:
@@ -520,19 +662,71 @@ def _cmd_search_ed2k(args: argparse.Namespace) -> int:
 
 
 def _cmd_search_auto(args: argparse.Namespace) -> int:
-    resolved = resolve_auto_search_channel(
-        ed2k_connected=True,
-        kad_connected=False,
-        server_users=getattr(args, "server_users", 0),
-        server_files=getattr(args, "server_files", 0),
-        server_count=getattr(args, "server_count", 0),
+    log.debug(
+        f"Command started: name=search-auto, server={args.server}, "
+        f"query={args.query!r}, timeout={args.timeout}, duration={args.duration}"
     )
-    if resolved.channel != SearchChannel.SERVER or resolved.status != ChannelStatus.IMPLEMENTED:
+    args.channel = SearchChannel.AUTO.value
+    return _cmd_search_ed2k(args)
+
+
+def _load_global_servers(explicit: str | None, *, sweep: bool = False) -> list:
+    import ipaddress
+
+    from amuled_v2.core.ed2k import GlobalServerEndpoint
+
+    # Default policy: work with the single Sunrise server where the client
+    # publishes resources.  Sweeping the whole persisted list is opt-in and
+    # exists only as a disabled-by-default fallback branch.
+    if explicit:
+        host, port = _parse_server_endpoint(explicit)
+        return [GlobalServerEndpoint(host=host, port=port)]
+    if not sweep:
+        return [GlobalServerEndpoint(host=_DEFAULT_GLOBAL_SERVER, port=_DEFAULT_GLOBAL_PORT)]
+
+    endpoints: list[GlobalServerEndpoint] = []
+    seen: set[tuple[str, int]] = set()
+    state = get_state()
+    state.connect()
+    server_filter = ServerFilter(ip_filter=_load_ipfilter())
+    for row in state.list_servers():
+        host = str(ipaddress.IPv4Address(row["ip"]))
+        key = (host, row["port"])
+        if key not in seen:
+            seen.add(key)
+            verdict = server_filter.evaluate(host, row["port"])
+            if not verdict.allowed:
+                log.info(
+                    "GLOBAL candidate filtered: host=%s, port=%d, reason=%s",
+                    host,
+                    row["port"],
+                    verdict.reason,
+                )
+                continue
+            endpoints.append(GlobalServerEndpoint(host=host, port=row["port"]))
+    return endpoints
+
+
+def _cmd_search_global(args: argparse.Namespace) -> int:
+    from amuled_v2.core.ed2k import GlobalUdpSearch, SearchResultsBatch
+    from amuled_v2.progressbar import render_progress
+
+    log.debug(
+        f"Command started: name=search-global, server={args.server}, "
+        f"query={args.query!r}, timeout={args.timeout}"
+    )
+    try:
+        endpoints = _load_global_servers(args.server, sweep=args.sweep)
+    except Exception as exc:
+        log.error(f"GLOBAL server list load failed: error={exc}")
+        raise
+    if not endpoints:
         result = {
-            "status": "not_implemented",
-            "channel": resolved.channel.value,
-            "implementation_status": resolved.status.value,
-            "reason": resolved.reason,
+            "status": "no_servers",
+            "channel": SearchChannel.GLOBAL.value,
+            "reason": (
+                "no servers known; run `import servers --save` or pass --server"
+            ),
         }
         if args.json:
             _print_json(result)
@@ -543,8 +737,172 @@ def _cmd_search_auto(args: argparse.Namespace) -> int:
                 f"reason  : {result['reason']}",
             ])
         return 2
-    args.channel = resolved.channel.value
-    return _cmd_search_ed2k(args)
+
+    if len(endpoints) > args.max_servers:
+        log.warning(
+            "GLOBAL server list truncated to live sweep limit: "
+            "total=%d, kept=%d",
+            len(endpoints),
+            args.max_servers,
+        )
+        endpoints = endpoints[: args.max_servers]
+
+    show_progress = not args.json and sys.stdout.isatty()
+    search = GlobalUdpSearch(
+        endpoints,
+        response_window=args.timeout,
+        dead_server_retries=args.dead_retries,
+        progress_callback=(
+            (lambda done, total, results: (
+                _progress_line(
+                    f"{render_progress(0, max(total, 1), done, 30)} GLOBAL "
+                    f"servers={done}/{total} results={results}"
+                )
+            ))
+            if show_progress
+            else None
+        ),
+    )
+    aggregate = asyncio.run(search.search(args.query))
+    if show_progress:
+        _progress_done()
+
+    saved = 0
+    session_id = None
+    if aggregate.results or not getattr(args, "no_save", False):
+        first = endpoints[0]
+        batch = SearchResultsBatch(
+            query=args.query,
+            channel=SearchChannel.GLOBAL.value,
+            server_host=first.host,
+            server_port=first.port,
+            results=aggregate.results,
+            more_results_available=False,
+        )
+        session_id = batch.session_id
+        if not getattr(args, "no_save", False):
+            state = get_state()
+            state.connect()
+            saved = state.save_search_results_batch(batch)
+
+    result = {
+        "status": "ok",
+        "channel": SearchChannel.GLOBAL.value,
+        "query": args.query,
+        "servers_queried": len(endpoints),
+        "per_server": aggregate.per_server,
+        "dead_servers": list(aggregate.dead_servers),
+        "session_id": session_id,
+        "results": [item.to_dict() for item in aggregate.results],
+        "result_count": aggregate.result_count,
+        "saved_results": saved,
+    }
+    if args.json:
+        _print_json(result)
+    else:
+        lines = [
+            f"status     : {result['status']}",
+            f"channel    : {result['channel']}",
+            f"query      : {result['query']}",
+            f"servers    : {result['servers_queried']}",
+            f"results    : {result['result_count']} "
+            f"(saved={result['saved_results']})",
+        ]
+        for server, count in aggregate.per_server.items():
+            lines.append(f"  {server}: {count}")
+        for server in aggregate.dead_servers:
+            lines.append(f"  DEAD {server}")
+        for item in result["results"]:
+            lines.append(
+                f"  {item['hash']} {item['size']} src={item['sources']} {item['name']}"
+            )
+        _print_text("ED2K global search", lines)
+    log.info(
+        f"ED2K global search CLI completed: results={aggregate.result_count}, "
+        f"saved={saved}"
+    )
+    return 0
+
+
+def _cmd_search_results_list(args: argparse.Namespace) -> int:
+    state = get_state()
+    state.connect()
+    rows = state.list_search_results(
+        query=args.query,
+        channel=args.channel,
+        hash_prefix=args.hash,
+        limit=args.limit,
+    )
+    result = {
+        "status": "ok",
+        "results": rows,
+        "result_count": len(rows),
+        "limit": args.limit,
+    }
+    if args.json:
+        _print_json(result)
+    else:
+        lines = [
+            "status  : ok",
+            f"results : {len(rows)}",
+        ]
+        for row in rows:
+            lines.append(
+                f"  {row['hash']} {row['size']} src={row['sources']} "
+                f"[{row['channel']}|{row['query']}] {row['name']}"
+            )
+        _print_text("Cached search results", lines)
+    log.info(f"Search result list completed: count={len(rows)}")
+    return 0
+
+
+def _cmd_search_results_show(args: argparse.Namespace) -> int:
+    state = get_state()
+    state.connect()
+    tags = state.get_search_result_tags(args.hash)
+    result = {
+        "status": "ok" if tags else "not_found",
+        "hash": args.hash.lower(),
+        "tags": tags,
+        "tag_count": len(tags),
+    }
+    if args.json:
+        _print_json(result)
+    else:
+        lines = [
+            f"status : {result['status']}",
+            f"hash   : {result['hash']}",
+            f"tags   : {result['tag_count']}",
+        ]
+        for tag in tags:
+            lines.append(
+                f"  name={tag.get('name')} name_id={tag.get('name_id')} "
+                f"type={tag.get('type')} value={tag.get('value')!r}"
+            )
+        _print_text("Search result tags", lines)
+    log.info(f"Search result show completed: hash={args.hash.lower()}, tags={len(tags)}")
+    return 0
+
+
+def _cmd_search_results_clear(args: argparse.Namespace) -> int:
+    state = get_state()
+    state.connect()
+    removed = state.clear_search_results(query=args.query)
+    result = {
+        "status": "ok",
+        "removed": removed,
+        "query": args.query,
+    }
+    if args.json:
+        _print_json(result)
+    else:
+        _print_text("Search results cleared", [
+            f"status  : ok",
+            f"query   : {args.query or '(all)'}",
+            f"removed : {removed}",
+        ])
+    log.info(f"Search results clear completed: removed={removed}")
+    return 0
 
 
 def _cmd_search_not_implemented(args: argparse.Namespace) -> int:
@@ -554,11 +912,10 @@ def _cmd_search_not_implemented(args: argparse.Namespace) -> int:
         "channel": channel.value,
         "implementation_status": (
             ChannelStatus.PLANNED.value
-            if channel in (SearchChannel.GLOBAL, SearchChannel.KAD)
+            if channel == SearchChannel.KAD
             else ChannelStatus.NOT_IMPLEMENTED.value
         ),
         "reason": {
-            SearchChannel.GLOBAL.value: "GLOBAL requires the ED2K server-list UDP search layer",
             SearchChannel.KAD.value: "KAD requires the Kademlia keyword search engine",
             SearchChannel.WEB_EDONKEY.value: "WEB-EDONKEY requires an external web-service adapter",
         }[channel.value],
@@ -639,6 +996,109 @@ def _cmd_sources_ed2k(args: argparse.Namespace) -> int:
     log.info(
         f"ED2K sources CLI completed: hash={result['hash']}, "
         f"sources={result['source_count']}, saved={result['saved_sources']}"
+    )
+    return 0
+
+
+def _cmd_ipfilter_status(args: argparse.Namespace) -> int:
+    ip_filter = _load_ipfilter()
+    stats = ip_filter.statistics()
+    result = {"status": "ok", "path": str(_IPFILTER_PATH), **stats}
+    if args.json:
+        _print_json(result)
+    else:
+        _print_text("IP filter", [
+            f"status   : ok",
+            f"path     : {result['path']}",
+            f"ranges   : {stats['range_count']}",
+            f"max_level: {stats['max_level']}",
+        ])
+    log.info(f"IP filter status completed: ranges={stats['range_count']}")
+    return 0
+
+
+def _cmd_ipfilter_test(args: argparse.Namespace) -> int:
+    ip_filter = _load_ipfilter()
+    matched = ip_filter.match(args.ip)
+    filtered = ip_filter.is_filtered(args.ip)
+    result = {
+        "status": "ok",
+        "ip": args.ip,
+        "filtered": filtered,
+        "range": (
+            None
+            if matched is None
+            else {
+                "start": str(ipaddress.IPv4Address(matched.start)),
+                "end": str(ipaddress.IPv4Address(matched.end)),
+                "level": matched.level,
+                "description": matched.description,
+            }
+        ),
+    }
+    if args.json:
+        _print_json(result)
+    else:
+        lines = [
+            f"status   : ok",
+            f"ip       : {args.ip}",
+            f"filtered : {filtered}",
+        ]
+        if matched is not None:
+            lines.append(
+                f"range    : {result['range']['start']} - "
+                f"{result['range']['end']} level={matched.level} "
+                f"{matched.description}"
+            )
+        _print_text("IP filter test", lines)
+    log.info(f"IP filter test completed: ip={args.ip}, filtered={filtered}")
+    return 0
+
+
+def _cmd_sources_forget(args: argparse.Namespace) -> int:
+    state = get_state()
+    state.connect()
+    removed = state.forget_file_sources(args.hash)
+    result = {
+        "status": "ok",
+        "hash": args.hash.lower(),
+        "removed": removed,
+    }
+    if args.json:
+        _print_json(result)
+    else:
+        _print_text("Sources forgotten", [
+            f"status  : ok",
+            f"hash    : {args.hash.lower()}",
+            f"removed : {removed}",
+        ])
+    log.info(f"Sources forget completed: hash={args.hash.lower()}, removed={removed}")
+    return 0
+
+
+def _cmd_sources_prune(args: argparse.Namespace) -> int:
+    state = get_state()
+    state.connect()
+    summary = state.prune_file_sources(
+        max_age_hours=args.max_age_hours,
+        dead_only=args.dead_only,
+        dry_run=args.dry_run,
+    )
+    result = {"status": "ok", **summary}
+    if args.json:
+        _print_json(result)
+    else:
+        _print_text("Sources prune", [
+            f"status         : ok",
+            f"matched        : {summary['matched']}",
+            f"pruned         : {summary['pruned']}",
+            f"max_age_hours  : {summary['max_age_hours']}",
+            f"dead_only      : {summary['dead_only']}",
+            f"dry_run        : {summary['dry_run']}",
+        ])
+    log.info(
+        f"Sources prune completed: matched={summary['matched']}, "
+        f"pruned={summary['pruned']}, dry_run={summary['dry_run']}"
     )
     return 0
 
@@ -1013,6 +1473,11 @@ def build_parser() -> argparse.ArgumentParser:
             default=30.0,
             help="Search result accumulation window in seconds.",
         )
+        parser.add_argument(
+            "--no-save",
+            action="store_true",
+            help="Do not persist results into DuckDB.",
+        )
         return parser
 
     p_search_server = add_server_search_parser(
@@ -1026,43 +1491,66 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_search_auto = add_server_search_parser(
         "auto",
-        "Resolve AUTO using eMule rules and search through the available channel.",
-    )
-    p_search_auto.add_argument(
-        "--server-users",
-        type=int,
-        default=0,
-        help="Connected server user count used by AUTO resolution.",
-    )
-    p_search_auto.add_argument(
-        "--server-files",
-        type=int,
-        default=0,
-        help="Connected server file count used by AUTO resolution.",
-    )
-    p_search_auto.add_argument(
-        "--server-count",
-        type=int,
-        default=0,
-        help="Known server count used by AUTO resolution.",
+        "Resolve AUTO from the real connection state using eMule rules.",
     )
     p_search_auto.set_defaults(func=_cmd_search_auto)
 
     p_search_global = search_sub.add_parser(
         "global",
-        help="GLOBAL channel (planned UDP server-list search).",
+        help="GLOBAL channel: UDP search across the known server list.",
         parents=parents,
     )
-    p_search_global.set_defaults(
-        channel_name=SearchChannel.GLOBAL.value,
-        func=_cmd_search_not_implemented,
+    p_search_global.add_argument(
+        "--server",
+        help=(
+            "Explicit endpoint; defaults to the Sunrise server "
+            f"({_DEFAULT_GLOBAL_SERVER}:{_DEFAULT_GLOBAL_PORT})."
+        ),
     )
+    p_search_global.add_argument(
+        "--sweep",
+        action="store_true",
+        help=(
+            "Sweep the whole persisted server list instead of the default "
+            "Sunrise server (fallback branch; disabled by default)."
+        ),
+    )
+    p_search_global.add_argument(
+        "--query",
+        required=True,
+        help="Search query.",
+    )
+    p_search_global.add_argument(
+        "--timeout",
+        type=float,
+        default=6.0,
+        help="Per-server UDP response window in seconds.",
+    )
+    p_search_global.add_argument(
+        "--dead-retries",
+        type=int,
+        default=2,
+        help="Silent searches before a server is skipped for the session.",
+    )
+    p_search_global.add_argument(
+        "--max-servers",
+        type=int,
+        default=25,
+        help="Cap on servers swept in one run (dead/spy server protection).",
+    )
+    p_search_global.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Do not persist results into DuckDB.",
+    )
+    p_search_global.set_defaults(func=_cmd_search_global)
 
     p_search_kad = search_sub.add_parser(
         "kad",
         help="Kademlia channel (planned keyword search engine).",
         parents=parents,
     )
+    p_search_kad.add_argument("--query", help="Search query (unused while planned).")
     p_search_kad.set_defaults(
         channel_name=SearchChannel.KAD.value,
         func=_cmd_search_not_implemented,
@@ -1073,6 +1561,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="External web-eDonkey channel (not implemented).",
         parents=parents,
     )
+    p_search_web.add_argument("--query", help="Search query (unused while not implemented).")
     p_search_web.set_defaults(
         channel_name=SearchChannel.WEB_EDONKEY.value,
         func=_cmd_search_not_implemented,
@@ -1087,6 +1576,55 @@ def build_parser() -> argparse.ArgumentParser:
         channel=SearchChannel.SERVER.value,
         func=_cmd_search_ed2k,
     )
+
+    # --- search results ---
+    p_results = search_sub.add_parser(
+        "results",
+        help="List, inspect, or clear persisted search results.",
+        parents=parents,
+    )
+    results_sub = p_results.add_subparsers(dest="results_command", metavar="<action>")
+
+    p_results_list = results_sub.add_parser(
+        "list",
+        help="List cached search results.",
+        parents=parents,
+    )
+    p_results_list.add_argument("--query", help="Filter by original query.")
+    p_results_list.add_argument(
+        "--channel",
+        help="Filter by channel (server, global, ...).",
+    )
+    p_results_list.add_argument(
+        "--hash",
+        help="Filter by file-hash hexadecimal prefix.",
+    )
+    p_results_list.add_argument(
+        "--limit",
+        type=int,
+        default=1000,
+        help="Maximum rows to return.",
+    )
+    p_results_list.set_defaults(func=_cmd_search_results_list)
+
+    p_results_show = results_sub.add_parser(
+        "show",
+        help="Show the full stored tag set for one result hash.",
+        parents=parents,
+    )
+    p_results_show.add_argument("hash", help="ED2K file hash (32 hexadecimal digits).")
+    p_results_show.set_defaults(func=_cmd_search_results_show)
+
+    p_results_clear = results_sub.add_parser(
+        "clear",
+        help="Clear cached search results.",
+        parents=parents,
+    )
+    p_results_clear.add_argument(
+        "--query",
+        help="Clear only rows from this query; omit for all results.",
+    )
+    p_results_clear.set_defaults(func=_cmd_search_results_clear)
 
     # --- sources ---
     p_sources = sub.add_parser(
@@ -1147,6 +1685,60 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_sources_list.set_defaults(func=_cmd_sources_list)
 
+    p_sources_forget = sources_sub.add_parser(
+        "forget",
+        help="Delete all persisted sources for one ED2K hash.",
+        parents=parents,
+    )
+    p_sources_forget.add_argument("hash", help="ED2K file hash (32 hexadecimal digits).")
+    p_sources_forget.set_defaults(func=_cmd_sources_forget)
+
+    p_sources_prune = sources_sub.add_parser(
+        "prune",
+        help="Delete expired or dead source rows.",
+        parents=parents,
+    )
+    p_sources_prune.add_argument(
+        "--max-age-hours",
+        type=float,
+        default=24 * 7,
+        help="Remove rows not seen within this many hours (default: 168).",
+    )
+    p_sources_prune.add_argument(
+        "--dead-only",
+        action="store_true",
+        help="Only remove low-id rows that expired.",
+    )
+    p_sources_prune.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be pruned without deleting.",
+    )
+    p_sources_prune.set_defaults(func=_cmd_sources_prune)
+
+    # --- ipfilter ---
+    p_ipfilter = sub.add_parser(
+        "ipfilter",
+        help="Inspect the IP filter used for servers and peers.",
+        parents=parents,
+    )
+    ipfilter_sub = p_ipfilter.add_subparsers(dest="ipfilter_command", metavar="<action>")
+
+    p_ipfilter_status = ipfilter_sub.add_parser(
+        "status",
+        help="Show loaded ipfilter statistics.",
+        parents=parents,
+    )
+    p_ipfilter_status.set_defaults(func=_cmd_ipfilter_status)
+
+    p_ipfilter_test = ipfilter_sub.add_parser(
+        "test",
+        help="Test one IPv4 address against the filter.",
+        parents=parents,
+    )
+    p_ipfilter_test.add_argument("ip", help="IPv4 address to test.")
+    p_ipfilter_test.set_defaults(func=_cmd_ipfilter_test)
+
     # --- daemon ---
     p_daemon = sub.add_parser("daemon", help="Daemon lifecycle (M2 stub).", parents=parents)
     d_sub = p_daemon.add_subparsers(dest="daemon_command", metavar="<action>")
@@ -1172,6 +1764,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # Configure a console logger first so even config-loading diagnostics are tagged.
     configure_logging("INFO")
+
+    # Windows consoles default to legacy code pages; JSON output must not die on
+    # non-cp1251 characters from real file names.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
 
     # Configure logging lazily (optional deps already guarded).
     cfg = load_config(save_if_missing=True)

@@ -58,6 +58,18 @@ class Ed2kTag:
         if self.name_id is not None and not 0 <= self.name_id <= 0xFF:
             raise TagError(f"name_id out of range 0..255: {self.name_id}")
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable representation of the tag."""
+        value = self.value
+        if isinstance(value, (bytes, bytearray)):
+            value = bytes(value).hex().upper()
+        return {
+            "name": self.name,
+            "name_id": self.name_id,
+            "type": f"0x{self.type:02X}",
+            "value": value,
+        }
+
 
 def _encoded_string(value: Any) -> bytes:
     if isinstance(value, str):
