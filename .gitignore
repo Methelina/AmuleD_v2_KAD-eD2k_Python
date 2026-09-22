@@ -13,7 +13,7 @@ docs/roadmap.md
 config/amuled.jsonc
 assets/v1/shared_files.json
 assets/v1/shareddir.dat
-AGENTS.MD
+AGENTS.md
 
 # === Generated project state ===
 db/*.db
