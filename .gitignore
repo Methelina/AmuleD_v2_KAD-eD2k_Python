@@ -1,0 +1,26 @@
+# === AmuleD_v2 runtime isolation ===
+.venv/
+.cache/
+bin/uv.exe
+bin/uv-python/
+bin/uv-tools/
+bin/uv-tool-bin/
+bin/python-userbase/
+bin/amuled-python.cmd
+
+# === Generated project state ===
+db/*.db
+db/*.wal
+logs/
+tmp/
+incoming/
+temp/
+shared/
+
+# === Python artifacts ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/

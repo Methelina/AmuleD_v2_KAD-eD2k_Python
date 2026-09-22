@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amuled-v2"
+version = "0.4.1"
+description = "AmuleD — pure Python ED2K/Kademlia client (clean-room reimplementation)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Soror L.'.L'." },
+]
+keywords = ["ed2k", "kademlia", "p2p", "kad", "emule", "amule"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: File Sharing",
+]
+
+dependencies = [
+    "duckdb>=1.0",
+    "aiohttp>=3.9",
+    "cryptography>=43.0",
+    "pycryptodome>=3.20",
+    "prompt_toolkit>=3.0",
+    "rich>=13.7",
+    "json5>=0.9",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+amuled = "amuled_v2.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
