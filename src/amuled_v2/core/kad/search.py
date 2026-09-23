@@ -44,7 +44,7 @@ import struct
 import time
 import zlib
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Callable, Optional, Tuple
 
 from amuled_v2.core.hashes.md4 import md4_digest
 from amuled_v2.core.kad.packets import (
@@ -499,6 +499,7 @@ async def kad_keyword_search(
     timeout: float = 8.0,
     max_results: int = 200,
     local_port: int = 4672,
+    reward_hook: Optional[Callable[[Tuple[str, int], float], None]] = None,
 ) -> KadSearchReport:
     """Run a Kad2 keyword search and return a :class:`KadSearchReport`.
 
@@ -593,7 +594,7 @@ async def kad_keyword_search(
             (ip, udp),
         )
 
-    seed_pool = routing.closest(target, 40)
+    seed_pool = routing.closest(target, 120)
     seed_pos = 0
 
     def _seed_more(count: int) -> int:
@@ -620,21 +621,22 @@ async def kad_keyword_search(
 
     try:
         while time.monotonic() < overall_deadline:
-            # Ask the top-ALPHA strictly-closer candidates (m_mapBest).
+            # Ask the top-ALPHA closest untried candidates.  No best-gate:
+            # on a cold lookup the strictly-closer chain starves, so the
+            # closest-first seed walk (plus RES-followed contacts, which are
+            # strictly closer by construction) drives progress.
             ranked = sorted(possible)
+            asked_this_round = 0
             for d in ranked:
-                if len(best) >= ALPHA and d >= max(best):
+                if asked_this_round >= ALPHA:
                     break
-                if d in best or d in tried:
+                if d in tried:
                     continue
-                if len(best) >= ALPHA:
-                    worst = max(best)
-                    del best[worst]
-                best[d] = None
                 kad_id, ip, udp, _tcp, _ver = possible.pop(d)
                 tried[d] = (ip, udp)
                 tried_entry[d] = (kad_id, ip, udp)
                 addr_to_dist[(ip, udp)] = d
+                asked_this_round += 1
                 await _send_find_value(kad_id, ip, udp, FIND_VALUE)
                 log.debug(
                     "send KADEMLIA2_REQ: remote=%s:%d dist_bits=%d",
@@ -724,6 +726,8 @@ async def kad_keyword_search(
                     continue
                 routing.mark_alive(src_ip, src_port)
                 responded[rdist] = True
+                if reward_hook is not None:
+                    reward_hook((src_ip, src_port), 2.0)
                 for item in answers:
                     if item.file_hash not in results:
                         results[item.file_hash] = item
@@ -757,7 +761,8 @@ async def kad_keyword_search(
             seen_ips: set[str] = {src_ip}
             for cid, cip, cudp, ctcp, cver in contacts:
                 d = _dist(cid)
-                provided_closer = provided_closer or d < rdist
+                if d < rdist:
+                    provided_closer = True
                 if d in tried or d in possible:
                     continue
                 if cip in seen_ips:
@@ -768,6 +773,10 @@ async def kad_keyword_search(
                     continue
                 possible[d] = (KadUInt128(cid), cip, cudp, ctcp, cver)
                 routing.add(_node_from_contact(cid, cip, cudp, ctcp, cver))
+            if reward_hook is not None:
+                reward_hook(
+                    (src_ip, src_port), 1.0 if provided_closer else 0.2
+                )
             responded[rdist] = provided_closer
 
             # Send the keyword search to this freshly responded node.

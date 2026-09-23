@@ -36,6 +36,13 @@ configure_logging(
 from amuled_v2.core.kad.bootstrap import pick_bootstrap_nodes, bootstrap_nodes
 from amuled_v2.core.kad.nodes_dat import load_nodes_dat
 from amuled_v2.core.kad.obfuscation import decode_obfuscated_kad
+from amuled_v2.core.kad.quality import NodeStats, quality_score
+from amuled_v2.core.kad.rtt import RttTracker
+from amuled_v2.core.kad.strategies import (
+    active_strategy_name,
+    get_strategy,
+)
+from amuled_v2.core.kad.vivaldi import LocalVivaldi
 from amuled_v2.core.kad.packets import (
     KADEMLIA2_HELLO_RES,
     KADEMLIA2_PONG,
@@ -193,8 +200,19 @@ async def main() -> None:
                 if rec is not None:
                     rec["pings"] = int(rec["pings"]) + 1
                     rec["last_seen"] = time.time()
+                    sent_at = ping_sent.get(key)
+                    if sent_at:
+                        rtt = (time.time() - sent_at) * 1000.0
+                        rec["rtt_ewma"] = rtt_tracker.update(key, rtt)
+                        vivaldi.update(key, rtt)
 
     recv_task = asyncio.ensure_future(receiver())
+
+    rtt_tracker = RttTracker()
+    vivaldi = LocalVivaldi()
+    ping_sent: Dict[Tuple[str, int], float] = {}
+    strategy = get_strategy(active_strategy_name())
+    log.info("seed strategy: name=%s", active_strategy_name())
 
     async def send_hello(ip: str, port: int) -> None:
         try:
@@ -205,6 +223,7 @@ async def main() -> None:
             pass
 
     async def send_ping(ip: str, port: int) -> None:
+        ping_sent[(ip, port)] = time.time()
         try:
             await loop.sock_sendto(sock, build_ping(), (ip, port))
         except OSError:
@@ -321,7 +340,17 @@ async def main() -> None:
 
     # --- maturation cycles ----------------------------------------------
     while loop.time() - t_start < DURATION_S:
-        # prioritize: never-helloed first, then freshest alive
+        # prioritize: never-helloed first, then freshest alive; the active
+        # strategy (xor/quality/vivaldi) reorders the ordered core
+        def _stats(kv) -> NodeStats:
+            r = kv[1]
+            return NodeStats(
+                hellos=int(r["hellos"]),
+                pings=int(r["pings"]),
+                rtt_ewma=float(r.get("rtt_ewma", 0.0)),
+                last_seen=float(r["last_seen"]),
+            )
+
         pool = sorted(
             nodes.items(),
             key=lambda kv: (
@@ -329,7 +358,9 @@ async def main() -> None:
                 -kv[1]["last_seen"],
             ),
         )
-        batch = pool[:BATCH] + pool[-BATCH:]
+        core = strategy(pool[: len(pool) // 2], _stats, rtt_tracker, vivaldi)
+        tail = pool[len(pool) // 2 :]
+        batch = core[:BATCH] + tail[-BATCH:]
         sent = 0
         for (ip, port), rec in batch:
             await send_hello(ip, port)

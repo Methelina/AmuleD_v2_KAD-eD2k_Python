@@ -28,6 +28,7 @@ Patch Notes v0.1.0 (Soror L.'.L'.):
 from __future__ import annotations
 
 import hashlib
+import os
 import struct
 from typing import Callable, Optional, Tuple
 
@@ -41,6 +42,7 @@ __all__ = [
     "MAGICVALUE_UDP_SYNC_CLIENT",
     "CRYPT_HEADER_WITHOUTPADDING",
     "decode_obfuscated_kad",
+    "encode_obfuscated_kad",
 ]
 
 MAGICVALUE_UDP_SYNC_CLIENT = 0x395F2EC1
@@ -109,3 +111,33 @@ def decode_obfuscated_kad(
         )
         return plain, receiver_key, sender_key
     return None
+
+def encode_obfuscated_kad(
+    kad_datagram: bytes,
+    their_kad_id: bytes,
+    our_sender_key: int,
+    their_receiver_key: int,
+) -> bytes:
+    """Encrypt one KAD UDP datagram for the peer (mirror of its decoder).
+
+    Empirically (live-verified decoder) peers derive the try-0 key from our
+    NodeID in direct wire order, so the encoder uses the peer's wire-order
+    KadID directly.
+
+    ``their_receiver_key`` is the UDP key the peer announced to us
+    (sender key of its obfuscated replies); ``our_sender_key`` is the key we
+    announce so the peer can encrypt back to us.
+    """
+    key_part = os.urandom(2)
+    marker = (os.urandom(1)[0] & 0xFC) | 0x02  # kad marker bits = 2
+    pad_len = 0
+    digest = hashlib.md5(their_kad_id[:16] + key_part).digest()
+    cipher = ARC4.new(digest)
+    plain_head = (
+        struct.pack("<I", MAGICVALUE_UDP_SYNC_CLIENT)
+        + bytes((pad_len,))
+        + struct.pack("<I", their_receiver_key & 0xFFFFFFFF)
+        + struct.pack("<I", our_sender_key & 0xFFFFFFFF)
+    )
+    encrypted = cipher.encrypt(plain_head + kad_datagram)
+    return bytes((marker,)) + key_part + encrypted
