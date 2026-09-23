@@ -185,6 +185,8 @@ def _write_hello_body(
     client_port: int,
     nickname: str,
     version: int = 0x3C,
+    server_ip: int = 0,
+    server_port: int = 0,
 ) -> None:
     if len(user_hash) != _HASH16_SIZE:
         raise PeerCodecError("user hash must contain exactly 16 bytes")
@@ -194,6 +196,10 @@ def _write_hello_body(
         raise PeerCodecError(f"client_port out of UInt16 range: {client_port}")
     if not 0 <= version <= 0xFFFFFFFF:
         raise PeerCodecError(f"version out of UInt32 range: {version}")
+    if not 0 <= server_ip <= 0xFFFFFFFF:
+        raise PeerCodecError(f"server_ip out of UInt32 range: {server_ip}")
+    if not 0 <= server_port <= 0xFFFF:
+        raise PeerCodecError(f"server_port out of UInt16 range: {server_port}")
     writer.write_u8(_HASH16_SIZE)
     writer.write_hash16(user_hash)
     writer.write_u32(client_id)
@@ -205,6 +211,11 @@ def _write_hello_body(
             write_new_tag(tag, writer)
         except TagError as exc:
             raise PeerCodecError(f"cannot encode HELLO tag: {exc}") from exc
+    # Хвост HELLO/HELLOANSWER одинаков: server_ip u32 + server_port u16
+    # (SendHelloTypePacket, BaseClient.cpp:2212-2217). Без этих 6 байт
+    # приёмник читает за концом буфера и рвёт соединение мгновенно.
+    writer.write_u32(server_ip)
+    writer.write_u16(server_port)
 
 
 def parse_hello_tags(reader: BinaryReader) -> tuple[Ed2kTag, ...]:
@@ -273,6 +284,8 @@ def parse_hello(payload: bytes) -> Hello:
         client_id = reader.read_u32()
         client_port = reader.read_u16()
         tags = parse_hello_tags(reader)
+        server_ip = reader.read_u32()
+        server_port = reader.read_u16()
     except CodecError as exc:
         raise PeerCodecError(f"malformed OP_HELLO: {exc}") from exc
     if reader.remaining:
@@ -346,9 +359,10 @@ def build_hello_answer_payload(
     if not 0 <= server_port <= 0xFFFF:
         raise PeerCodecError(f"server_port out of UInt16 range: {server_port}")
     writer = BinaryWriter()
-    _write_hello_body(writer, user_hash, client_id, client_port, nickname, version)
-    writer.write_u32(server_ip)
-    writer.write_u16(server_port)
+    _write_hello_body(
+        writer, user_hash, client_id, client_port, nickname, version,
+        server_ip, server_port,
+    )
     payload = writer.to_bytes()
     log.debug(
         "HELLOANSWER payload built: user_hash=%s, server_ip=%d, server_port=%d, size=%d",
