@@ -82,7 +82,7 @@ def decode_obfuscated_kad(
         magic = cipher.decrypt(datagram[3:7])
         if struct.unpack("<I", magic)[0] != MAGICVALUE_UDP_SYNC_CLIENT:
             continue
-        pad_len = cipher.decrypt(b"\x00")[0]
+        pad_len = cipher.decrypt(datagram[7:8])[0]
         body_len = len(datagram) - CRYPT_HEADER_WITHOUTPADDING - pad_len
         if body_len <= 8:
             log.debug(

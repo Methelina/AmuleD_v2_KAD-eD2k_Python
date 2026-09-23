@@ -138,6 +138,9 @@ async def main() -> None:
 
                     payload = zlib.decompress(payload)
             except Exception:
+                continue
+            if proto not in (0xE4, 0xE5):
+                # not a plain kad datagram: try the obfuscated decoder
                 plain = decode_obfuscated_kad(
                     data,
                     own.to_bytes(),
@@ -149,6 +152,10 @@ async def main() -> None:
                 pkt, recv_key, send_key = plain
                 try:
                     proto, op, payload = parse_kad_packet(pkt)
+                    if proto == 0xE5:
+                        import zlib
+
+                        payload = zlib.decompress(payload)
                 except Exception:
                     continue
                 key = (addr[0], addr[1])
