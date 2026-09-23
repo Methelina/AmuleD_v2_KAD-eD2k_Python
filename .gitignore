@@ -35,6 +35,3 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
-
-docs/*.md
-!docs/LICENSE_POLICY.md
