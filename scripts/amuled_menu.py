@@ -626,7 +626,7 @@ def _print_download_list() -> None:
 def show_kad_status() -> None:
     if not STATUS_FILE.exists():
         print("  Spider daemon not running (no status file).")
-        print("  Hint: run AmuleD_Demon_KAD-Spider.ps1 to warm the KAD network.")
+        print("  Hint: run '.\\AmuleD_Run.ps1 spider' to warm the KAD network.")
         return
     try:
         status = json.loads(STATUS_FILE.read_text(encoding="utf-8"))

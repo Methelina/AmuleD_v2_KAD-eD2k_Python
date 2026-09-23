@@ -1,9 +1,19 @@
 # ==========================================================
-# AmuleD v0.5.1 Portable Launcher (PowerShell Version)
+# AmuleD v0.5.1 Portable Runtime (PowerShell Version)
 # ==========================================================
-# Version: 1.1.0
+# Version: 2.0.0
 # Author:  Soror L.'.L.'.
-# Updated: 2026-09-22
+# Updated: 2026-09-23
+#
+# Patchnote v2.0.0 (By Soror L.'.L.'.):
+#   [+] PROJECT DOCTRINE: exactly two launchers exist -- the installer
+#       (AmuleD_install.ps1) and this single runtime.  Everything runs from
+#       under it:
+#         .\AmuleD_Run.ps1            -> interactive menu (scripts\amuled_menu.py)
+#         .\AmuleD_Run.ps1 spider     -> KAD spider daemon (scripts\kad_spider.py),
+#                                        refuses a second instance unless -Force
+#         .\AmuleD_Run.ps1 <cli args> -> CLI passthrough (python -m amuled_v2 ...)
+#   [*] AmuleD_Menu.ps1 and AmuleD_Demon_KAD-Spider.ps1 removed per doctrine.
 #
 # Patchnote v1.1.0 (By Soror L.'.L.'.):
 #   [+] FULL ISOLATION: all runtime and cache data stay inside AmuleD_v2.
@@ -21,6 +31,7 @@
 
 param(
     [switch]$NoPause,
+    [switch]$Force,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ClientArgs
 )
@@ -28,7 +39,7 @@ param(
 # Set UTF-8 encoding and working directory
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
-$Host.UI.RawUI.WindowTitle = "AmuleD v0.5.1 Portable Launcher by Soror L.'.L.'."
+$Host.UI.RawUI.WindowTitle = "AmuleD v0.5.1 Portable Runtime by Soror L.'.L.'."
 Set-Location $PSScriptRoot
 
 # ==========================================================
@@ -157,20 +168,121 @@ Write-Host "[RUNNER] [INFO] Path   : $VenvPython" -ForegroundColor Cyan
 Write-Host "[RUNNER] [INFO] Root   : $ProjectRoot" -ForegroundColor Cyan
 
 # ==========================================================
-# Argument preparation
+# Mode dispatch (single-runtime doctrine)
+# ==========================================================
+$MenuScript   = Join-Path $ProjectRoot "scripts\amuled_menu.py"
+$SpiderScript = Join-Path $ProjectRoot "scripts\kad_spider.py"
+$StatusFile   = Join-Path $DbDir "kad_status.json"
+
+$Mode = "cli"
+if (-not $ClientArgs -or $ClientArgs.Count -eq 0) {
+    $Mode = "menu"
+} elseif ($ClientArgs[0] -eq "menu") {
+    $Mode = "menu"
+    $ClientArgs = @($ClientArgs | Select-Object -Skip 1)
+} elseif ($ClientArgs[0] -eq "spider") {
+    $Mode = "spider"
+    $ClientArgs = @($ClientArgs | Select-Object -Skip 1)
+}
+
+# The source tree is placed first on PYTHONPATH so the portable runtime works
+# both before and after editable installation without importing another copy.
+$env:PYTHONPATH = "$SrcDir"
+
+if ($Mode -eq "menu") {
+    if (-not (Test-Path $MenuScript)) {
+        Write-Host "[RUNNER] [ERROR] Menu script not found: $MenuScript" -ForegroundColor Red
+        if (-not $NoPause) {
+            Write-Host "Press any key to exit..." -ForegroundColor Gray
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        exit 1
+    }
+    Write-Host "[RUNNER] [INFO] Starting interactive menu (Ctrl+C to exit)..." -ForegroundColor Green
+    try {
+        & $VenvPython -s -W ignore::FutureWarning $MenuScript @ClientArgs
+        $exitCode = $LASTEXITCODE
+    } catch {
+        Write-Host "[RUNNER] [ERROR] Menu launcher exception: $($_.Exception.Message)" -ForegroundColor Red
+        $exitCode = 1
+    }
+    if (-not $NoPause) {
+        Write-Host ""
+        Write-Host "Press any key to exit..." -ForegroundColor Gray
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    }
+    exit $exitCode
+}
+
+if ($Mode -eq "spider") {
+    if (-not (Test-Path $SpiderScript)) {
+        Write-Host "[RUNNER] [ERROR] Spider script not found: $SpiderScript" -ForegroundColor Red
+        if (-not $NoPause) {
+            Write-Host "Press any key to exit..." -ForegroundColor Gray
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        exit 1
+    }
+    $ExistingDaemons = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -match '^python' -and
+            $_.CommandLine -and
+            $_.CommandLine -like '*kad_spider.py*'
+        }
+    if ($ExistingDaemons) {
+        foreach ($daemon in $ExistingDaemons) {
+            Write-Host "[RUNNER] [WARN] KAD spider is already running: pid=$($daemon.ProcessId)" -ForegroundColor Yellow
+        }
+        if (Test-Path $StatusFile) {
+            try {
+                $status = Get-Content $StatusFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                Write-Host "[RUNNER] [INFO] Last status: cycles=$($status.cycles) pool=$($status.pool_size) alive=$($status.alive_estimate) port=$($status.bound_port) uptime_s=$($status.uptime_s)" -ForegroundColor Cyan
+            } catch {
+                Write-Host "[RUNNER] [WARN] Status file unreadable: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+        if (-not $Force) {
+            Write-Host "[RUNNER] [ERROR] Refusing to start a second spider. Stop the running one or re-run with -Force." -ForegroundColor Red
+            if (-not $NoPause) {
+                Write-Host "Press any key to exit..." -ForegroundColor Gray
+                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            }
+            exit 1
+        }
+        Write-Host "[RUNNER] [WARN] -Force passed: starting a second spider anyway (port fallback may engage)." -ForegroundColor Yellow
+    }
+    if (-not $ClientArgs -or $ClientArgs.Count -eq 0) {
+        $ClientArgs = @("--verbose")
+    }
+    Write-Host "[RUNNER] [INFO] Starting KAD spider (Ctrl+C to stop; it saves state on exit)..." -ForegroundColor Green
+    try {
+        & $VenvPython -s -W ignore::FutureWarning $SpiderScript @ClientArgs
+        $exitCode = $LASTEXITCODE
+    } catch {
+        Write-Host "[RUNNER] [ERROR] Spider launcher exception: $($_.Exception.Message)" -ForegroundColor Red
+        $exitCode = 1
+    }
+    if ($exitCode -ne 0) {
+        Write-Host "[RUNNER] [ERROR] KAD spider exited with code $exitCode" -ForegroundColor Red
+    } else {
+        Write-Host "[RUNNER] [INFO] KAD spider stopped cleanly." -ForegroundColor Green
+    }
+    if (-not $NoPause) {
+        Write-Host ""
+        Write-Host "Press any key to exit..." -ForegroundColor Gray
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    }
+    exit $exitCode
+}
+
+# ==========================================================
+# CLI passthrough
 # ==========================================================
 if (-not $ClientArgs -or $ClientArgs.Count -eq 0) {
     $ForwardedArgs = @("--help")
 } else {
     $ForwardedArgs = $ClientArgs
 }
-
-# ==========================================================
-# Environment activation and AmuleD_v2 launch
-# ==========================================================
-# The source tree is placed first on PYTHONPATH so the portable launcher works
-# both before and after editable installation without importing another copy.
-$env:PYTHONPATH = "$SrcDir"
 
 try {
     & $VenvPython -s -W ignore::FutureWarning -m amuled_v2 @ForwardedArgs
