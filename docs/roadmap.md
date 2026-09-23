@@ -712,7 +712,7 @@ Commits f4b9065, c01a9c5 (после f79492a). Состояние:
 Следующие шаги (по порядку):
 1. Спросить внешний LLM (промпт в чате сессии 7, репо https://github.com/eMuleAI/eMuleAI)
    о причине мгновенного FIN после HELLO при валидном handshake.
-2. Поймать расшифровку: tshark iface 6 фильтр SYN от 192.0.2.10 → IP цели →
+2. Поймать расшифровку: tshark iface 6 фильтр SYN от нашего LAN-IP → IP цели →
    kad sources файла, который eMuleAI качает (виден в transfers/логе SXSend) →
    userhash → decrypt → байт-diff его HELLO с нашим.
 3. После решения: подключить obfuscation к PeerClient + download runner,

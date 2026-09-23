@@ -19,7 +19,7 @@ Git только безопасно: запрещены checkout/restore/reset/c
 $env:PYTHONPATH='K:\work\AmuleD_v2\src'; $env:AMULED_ROOT='K:\work\AmuleD_v2'; .\.venv\Scripts\python.exe -m pytest -q tests --ignore=tests/test_live_ed2k.py 2>&1 | Select-Object -Last 3
 Компиляция: .\.venv\Scripts\python.exe -m compileall -q src tests scripts
 Долгие прогоны — НЕ через bash-таймаут, а через background_process (иначе скрипт убивается вместе с таймаутом). KAD из скриптов: state=get_state(); state.connect(); con=state._require_duckdb() (DuckDB однописатель).
-Wire-оракул: tshark K:\Software\WireShark\WiresharkPortable64\App\Wireshark\tshark.exe, интерфейс 6 = Ethernet 2 (наш IP 192.0.2.10; ВЕСЬ исходящий трафик python-клиента идёт через tun0/VPN — на iface 6 пробники НЕ ВИДНЫ, для них снимай интерфейс tun0!). VPN обязателен для интернета и работает — его не трогать и не упоминать.
+Wire-оракул: tshark K:\Software\WireShark\WiresharkPortable64\App\Wireshark\tshark.exe, интерфейс 6 = Ethernet 2 (LAN-интерфейс). ВЕСЬ исходящий трафик python-клиента идёт через отдельный туннельный интерфейс (tun0) — на iface 6 пробники НЕ ВИДНЫ, для них снимай интерфейс tun0.
 
 Состояние (сессия 7): offline suite 195 passed, 2 skipped; compileall 0. KAD-поиск/источники LIVE (200 результатов «ubuntu»), паук-демон тёплый. Незакоммичено: codec.py (фикс HELLO — см. ниже), obfuscation.py v0.2.0 (basic client obfuscation). Изменён scripts\sanitize_log.py (проверить diff перед коммитом). Push копится — только по подтверждению.
 
