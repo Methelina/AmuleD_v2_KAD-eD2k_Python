@@ -10,9 +10,15 @@ that other tools can read while the daemon runs.
 KAD is only responsive when continuously warmed; this daemon is that warmth.
 
 scripts/kad_spider.py
-Version:     0.1.0
+Version:     0.2.0
 Author:      Soror L.'.L'.
 Updated:     2026-09-23
+
+Patch Notes v0.2.0 (Soror L'.L'.):
+  [+] Kadabra neighbor memory: rewards from HELLO/PONG/BOOTSTRAP persisted to
+      db\kad_weights.json (shared with CLI searches).
+  [+] Bandit-weight batch bias and per-cycle trend display (0-5 chevrons) with
+      RTT and Vivaldi prediction.
 
 Patch Notes v0.1.0 (Soror L'.L'.):
   [+] Added permanent-socket KAD spider daemon with HELLO/PING maturation,
@@ -58,6 +64,10 @@ from amuled_v2.core.kad.packets import (
 )
 from amuled_v2.core.kad.quality import NodeStats
 from amuled_v2.core.kad.rtt import RttTracker
+from amuled_v2.core.kad.runtime import (
+    load_kadabra_state,
+    save_kadabra_state,
+)
 from amuled_v2.core.kad.strategies import (
     active_strategy_name,
     get_strategy,
@@ -496,6 +506,9 @@ async def main() -> int:
     ping_sent: Dict[Tuple[str, int], float] = {}
     strategy = get_strategy(active_strategy_name())
     strategy_name = active_strategy_name()
+    kadabra = load_kadabra_state(project_root)
+    prev_weights: Dict[Tuple[str, int], float] = {}
+    prev_ewma: Dict[Tuple[str, int], float] = {}
     log.info("seed strategy: name=%s", strategy_name)
 
     # --- receiver (kad_warmup.py ~130-210) ---------------------------------
@@ -537,6 +550,7 @@ async def main() -> int:
             key = (addr[0], addr[1])
             rec = nodes.get(key)
             if op == KADEMLIA2_HELLO_RES:
+                kadabra.reward((addr[0], addr[1]), 0.5)
                 try:
                     h = parse_hello_res(payload)
                 except Exception:
@@ -562,6 +576,7 @@ async def main() -> int:
                     state["alive"], rec.get("udp_key", ""),
                 )
             elif op == KADEMLIA2_PONG:
+                kadabra.reward((addr[0], addr[1]), 0.2)
                 state["pong"] += 1
                 if rec is not None:
                     rec["pings"] = int(rec["pings"]) + 1
