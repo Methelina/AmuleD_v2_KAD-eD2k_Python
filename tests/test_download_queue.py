@@ -67,7 +67,10 @@ def _parse_size(display: str) -> int:
 
 
 def _real_target() -> object:
-    shared = Path(r"K:\work\AmuleD_v2\assets\v1\shared_files.json")
+    shared = Path(os.environ.get(
+        "AMULED_SHARED_FILES",
+        str(Path(__file__).resolve().parents[1] / "assets" / "v1" / "shared_files.json"),
+    ))
     if not shared.exists():
         pytest.skip("local shared_files.json unavailable")
     with open(shared, "r", encoding="utf-8") as handle:
