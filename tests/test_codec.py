@@ -147,11 +147,12 @@ def test_numeric_integer_tag_is_flagged_and_narrowed() -> None:
     write_new_tag(tag, writer)
     raw = writer.to_bytes()
 
-    # UINT16 wire type with numeric-name flag, UINT16 numeric id, value.
-    # Id тега — всегда UINT16 (u8-вариант был багом, ломавшим живой хендшейк).
+    # UINT16 wire type with numeric-name flag, UINT8 numeric id, value.
+    # Формат eMule: флаг 0x80 => id ОДИН байт (u16-вариант был багом,
+    # сдвигавшим поток и рвавшим живой хендшейк).
     assert raw[0] == (UINT16 | 0x80)
-    assert raw[1:3] == struct.pack("<H", 0x15)
-    assert raw[3:5] == struct.pack("<H", 300)
+    assert raw[1] == 0x15
+    assert raw[2:4] == struct.pack("<H", 300)
 
     decoded = read_new_tag(BinaryReader(raw))
     assert decoded.name is None
