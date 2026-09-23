@@ -39,22 +39,38 @@ from amuled_v2.core.safety import matched_marker  # noqa: E402
 # чисто числовые куски (размеры, даты). Всё остальное звёздочки.
 _EXT_RE = re.compile(r"(?:\.[A-Za-z0-9]{1,6})")
 _WORD_RE = re.compile(r"[^\s|,;\"'()\[\]]+")
+_QUOTED_RE = re.compile(r'"([^"]*)"')
+
+
+def _star_name(name: str) -> str:
+    """Star a filename, keep only its extension (****.mp4)."""
+    ext = _EXT_RE.search(name)
+    if ext and ext.start() >= 1:
+        stars = "*" * min(ext.start(), 26) or "*"
+        return stars + ext.group(0).lower()
+    return "*" * min(len(name), 26)
+
+
+def _redact_quoted(line: str) -> str:
+    """Star the inside of every quoted segment, keep the extension."""
+    return _QUOTED_RE.sub(lambda m: '"' + _star_name(m.group(1)) + '"', line)
 
 
 def _sanitize_line(line: str) -> str:
-    """Star every word token, keep file extensions visible."""
+    """Redact a flagged line: quotes first, then any remaining words.
 
-    def _star(match: re.Match[str]) -> str:
-        token = match.group(0)
-        ext = _EXT_RE.search(token)
-        if ext and ext.start() >= 1:
-            stars = "*" * min(len(token) - len(ext.group(0)), 12) or "*"
-            return stars + ext.group(0).lower()
-        if token.isdigit():
-            return token
-        return "*" * min(len(token), 12)
-
-    return _WORD_RE.sub(_star, line)
+    Structure survives (timestamp, fixed phrases, numbers, extensions),
+    content does not.  If the line is STILL flagged after quoted
+    redaction, the leftover word tokens are starred too -- some logs put
+    the filename without quotes.
+    """
+    redacted = _redact_quoted(line)
+    if matched_marker(redacted) is not None:
+        redacted = _WORD_RE.sub(
+            lambda m: m.group(0).isdigit() and m.group(0) or "*" * min(len(m.group(0)), 12),
+            redacted,
+        )
+    return redacted
 
 
 def sanitize_file(path: Path, out_path: Path | None = None) -> None:
@@ -66,18 +82,20 @@ def sanitize_file(path: Path, out_path: Path | None = None) -> None:
         "w", encoding="utf-8"
     ) as dst:
         for number, line in enumerate(src, 1):
+            # Имя в кавычках звёздочками ВСЕГДА (нам неважно, что там) --
+            # маркер лишь добавляет строке префикс [REDACTED] и счётчик.
             marker = matched_marker(line)
+            line_out = _redact_quoted(line)
+            if marker is not None:
+                flagged += 1
+                by_marker[marker] = by_marker.get(marker, 0) + 1
+                # Маркерные слова вне кавычек тоже гасим (фолбэк: звёздочки
+                # по оставшимся токенам, если после кавычек строка всё ещё
+                # помечена).
+                line_out = f"[REDACTED line {number} marker={marker}] " + _sanitize_line(line)
+            dst.write(line_out + ("\n" if line.endswith("\n") else ""))
             if marker is None:
-                dst.write(line)
                 clean += 1
-                continue
-            flagged += 1
-            by_marker[marker] = by_marker.get(marker, 0) + 1
-            dst.write(
-                f"[REDACTED line {number} marker={marker}] "
-                + _sanitize_line(line)
-                + ("\n" if line.endswith("\n") else "")
-            )
     print(f"file   : {path}")
     print(f"output : {out_path}")
     print(f"clean lines  : {clean}")
