@@ -7,6 +7,8 @@ The current milestone provides a fully working **Kademlia (KAD) keyword search a
 **Author:** Soror L.'.L.'. &nbsp;|&nbsp; **Version:** 0.5.1 &nbsp;|&nbsp; **License:** Apache 2.0
 
 **Documentation:** [English](README.md) · [Русский](README.ru.md)
+**Repositary:** [GitHub - Methelina/AmuleD_v2_KAD-eD2k_Python](https://github.com/Methelina/AmuleD_v2_KAD-eD2k_Python.git)
+
 
 ---
 
