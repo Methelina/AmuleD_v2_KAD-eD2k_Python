@@ -2,7 +2,7 @@
 import sqlite3
 import os
 
-db_path = 'K:/work/AmuleD_v2/db/amuled.db'
+db_path = 'db/amuled.db'  # project-relative path
 print(f'DB exists: {os.path.exists(db_path)}')
 if os.path.exists(db_path):
     print(f'DB size: {os.path.getsize(db_path)}')

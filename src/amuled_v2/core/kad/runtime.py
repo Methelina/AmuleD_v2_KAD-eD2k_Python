@@ -7,7 +7,7 @@ script running in the same process.
 
 This module performs **no network I/O** -- it only reads the local cache and
 the offline nodes.dat bootstrap file.  Online probing (HELLO/PING maturation)
-is left to ``scripts/kad_warmup.py``.
+is left to ``scripts/kad_spider.py``.
 
 src/amuled_v2/core/kad/runtime.py
 Version:     0.1.0

@@ -14,7 +14,7 @@ Metrics tracked for comparison:
   - convergence_rate: how quickly we discover quality peers
 
 Usage:
-    $env:PYTHONPATH='K:\work\AmuleD_v2\src'
+    $env:PYTHONPATH='.\src'
     $env:AMULED_KAD_WARMUP_S='1200'
     .venv\Scripts\python.exe -u scripts\kad_warmup_vivaldi.py 2>&1
 

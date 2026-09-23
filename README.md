@@ -2,7 +2,7 @@
 
 AmuleD is a portable, console-first ED2K/Kademlia client written in Python 3.12. It is an independent clean-room implementation of the public ED2K and Kademlia protocols, not a binary wrapper around aMule/eMule and not a GPL source port.
 
-The current milestone provides a fully working **Kademlia (KAD) engine against the live eMule network** — keyword search (200 real results for a "video" query in about one second) and file-source discovery (KADEMLIA2_SEARCH_SOURCE_REQ, sources persisted to DuckDB) — plus a live-validated ED2K TCP server session with search, a complete download stack (queue, part files, MD4 verification), a peer protocol layer, IP filter and server blacklisting, a searchable DuckDB-backed result store, a permanent KAD spider daemon that keeps the network warm, and an interactive console menu.
+The current milestone provides a fully working **Kademlia (KAD) engine against the live eMule network** — keyword search (200 real results for a "video" query in about one second) and file-source discovery (KADEMLIA2_SEARCH_SOURCE_REQ, sources persisted to DuckDB) — plus a live-validated ED2K TCP server session with search, a complete download stack (queue, part files, MD4 verification), a peer protocol layer with client-side **TCP obfuscation dialing** (the modern network requires it; the obfuscated handshake is live-verified against real eMule peers), IP filter and server blacklisting, a searchable DuckDB-backed result store, a permanent KAD spider daemon that keeps the network warm, and an interactive console menu.
 
 **Author:** Soror L.'.L.'. &nbsp;|&nbsp; **Version:** 0.5.1 &nbsp;|&nbsp; **License:** Apache 2.0
 
@@ -29,7 +29,7 @@ The client is fully portable: it installs into its own folder with a single scri
 
 ### Current status (honestly)
 
-This is an early but live client: search (including KAD) and incoming sources already work against the real eMule network. Still in development: sharing files back to others (upload), publishing your own files into the KAD network, and incoming connections. Follow the progress in the roadmap (sections tagged DONE/WIP/PLANNED).
+This is an early but live client: search (including KAD) and incoming sources already work against the real eMule network, and peer connections use the mandatory TCP obfuscation handshake. Still in development: completing transfers from KAD sources end-to-end, sharing files back to others (upload), publishing your own files into the KAD network, and incoming connections. Follow the progress in the roadmap (sections tagged DONE/WIP/PLANNED).
 
 ### Requirements
 
