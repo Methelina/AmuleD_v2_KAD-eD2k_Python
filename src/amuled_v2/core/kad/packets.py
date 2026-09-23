@@ -101,13 +101,17 @@ class KadPacketError(ValueError):
 
 
 class KadUInt128:
-    """Immutable 128-bit Kad node identifier.
+    """Immutable 128-bit Kad node identifier (eMule internal semantics).
 
-    On the wire Kad IDs are 16 bytes big-endian
-    (``CUInt128::ToByteArray`` / ``ReadUInt128``).  Internally the value is
-    kept as a Python ``int`` so XOR and comparison are trivial; the leading
-    bit index follows the ``GetBitNumber`` semantics from ``UInt128.cpp``
-    where bit 0 is the most-significant bit.
+    eMule serialises CUInt128 through ``CFileDataIO::ReadUInt128`` /
+    ``WriteUInt128`` which are raw 16-byte memcpy of the internal
+    ``m_uData[4]`` little-endian words.  Consequently the distance metric
+    nodes use treats wire bytes as four little-endian 32-bit words, word 0
+    being the most significant in ``CompareTo``.
+
+    Internal representation here: ``w0<<96 | w1<<64 | w2<<32 | w3`` with
+    ``w_i = LEint(wire[4i:4i+4])`` so Python XOR/int comparison matches the
+    eMule metric exactly.
     """
 
     __slots__ = ("_value",)
@@ -125,15 +129,41 @@ class KadUInt128:
                 raise KadPacketError(
                     f"KadUInt128 requires 16 bytes, got {len(raw)}"
                 )
-            self._value = int.from_bytes(raw, "big")
+            self._value = self._words_to_int(
+                struct.unpack_from("<4I", raw, 0)
+            )
         else:
             raise KadPacketError(
                 f"KadUInt128 needs bytes or int, got {type(value).__name__}"
             )
 
+    @staticmethod
+    def _words_to_int(words: tuple) -> int:
+        w0, w1, w2, w3 = words
+        return (w0 << 96) | (w1 << 64) | (w2 << 32) | w3
+
+    @classmethod
+    def from_be_bytes(cls, raw: bytes) -> "KadUInt128":
+        """SetValueBE semantics: word_i = BEint(bytes[4i:4i+4]).
+
+        Used for values that eMule derives via ``SetValueBE`` directly
+        (e.g. the keyword target from MD4), not via file IO.
+        """
+        if len(raw) != _NODE_ID_SIZE:
+            raise KadPacketError(
+                f"KadUInt128.from_be_bytes requires 16 bytes, got {len(raw)}"
+            )
+        words = struct.unpack_from(">4I", raw, 0)
+        return cls(cls._words_to_int(words))
+
     def to_bytes(self) -> bytes:
-        """Return the 16-byte big-endian wire representation."""
-        return self._value.to_bytes(_NODE_ID_SIZE, "big")
+        """Return the 16-byte wire representation (LE words, word0 first)."""
+        v = self._value
+        w3 = v & 0xFFFFFFFF
+        w2 = (v >> 32) & 0xFFFFFFFF
+        w1 = (v >> 64) & 0xFFFFFFFF
+        w0 = (v >> 96) & 0xFFFFFFFF
+        return struct.pack("<4I", w0, w1, w2, w3)
 
     def to_int(self) -> int:
         return self._value

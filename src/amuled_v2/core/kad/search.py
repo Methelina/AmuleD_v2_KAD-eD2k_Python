@@ -156,7 +156,7 @@ def keyword_target(query: str) -> KadUInt128:
         }
     """
     digest = md4_digest(query.encode("utf-8"))
-    return KadUInt128(digest)
+    return KadUInt128.from_be_bytes(digest)
 
 
 # --- Payload builders (local, per Search.cpp semantics) ----------------------
