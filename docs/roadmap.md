@@ -698,7 +698,7 @@ Commits f4b9065, c01a9c5 (после f79492a). Состояние:
   соответствует нашему writer 1:1), формат userhash.
 - Путь к ground truth: расшифровать живой дозвон eMuleAI. keypart — открытым
   текстом (байты 1-5 handshake); ключи = MD5(target_userhash+34/203+keypart).
-  Userhash eMuleAI извлечён: 1415AF07...(redacted)
+  Userhash eMuleAI извлечён: 1415AF07…(redacted)
   (config\preferences.dat offset 0; подтверждён preferencesKad.dat ↔ логом
   myKadID=99F088F0795D8B8613EEC8D4C8E36A25). Расшифровывает ВХОДЯЩИЕ дозвоны
   к eMuleAI. Блокер: поймать дозвон eMuleAI к IP, чей userhash знаем из KAD
