@@ -13,12 +13,14 @@ docs/continuation-prompt.md
 # === Local private/generated state ===
 config/amuled.jsonc
 assets/v1/shared_files.json
+docs/recon/
 assets/v1/shareddir.dat
 AGENTS.md
 
 # === Generated project state ===
 db/*.db
 db/*.wal
+db/*.json
 logs/
 tmp/
 incoming/
