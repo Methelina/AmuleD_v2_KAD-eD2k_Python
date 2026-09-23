@@ -229,6 +229,13 @@ if ($Mode -eq "spider") {
             $_.CommandLine -and
             $_.CommandLine -like '*kad_spider.py*'
         }
+    # The venv python.exe is a shim that spawns the real uv-managed
+    # interpreter: one logical daemon shows up as a parent/child pair.
+    # Keep only top-level processes (parent is not itself a match).
+    if ($ExistingDaemons) {
+        $matchedIds = $ExistingDaemons | ForEach-Object { $_.ProcessId }
+        $ExistingDaemons = $ExistingDaemons | Where-Object { $matchedIds -notcontains $_.ParentProcessId }
+    }
     if ($ExistingDaemons) {
         foreach ($daemon in $ExistingDaemons) {
             Write-Host "[RUNNER] [WARN] KAD spider is already running: pid=$($daemon.ProcessId)" -ForegroundColor Yellow
