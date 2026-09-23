@@ -8,8 +8,8 @@ Commands:
   - ``init``                — ensure runtime dirs and default config exist.
   - ``import servers/shared`` — import compatible v1 resources into state.
   - ``share add/scan/list/remove`` — hash files and maintain DuckDB state.
-  - ``search server/auto`` — ED2K server search with explicit channel model.
-  - ``search global/kad/web-edonkey`` — planned channels with explicit status.
+  - ``search server/auto/global`` — ED2K search channels.
+  - ``search kad`` — live Kad2 keyword search (see also ``kad search``).
   - ``sources ed2k/list`` — request and list ED2K file sources.
   - ``daemon start/stop``   — M2 stubs returning not_implemented.
 
@@ -28,6 +28,8 @@ Patch Notes v0.6.0 (Soror L.'.L'.):
   [+] AUTO now resolves from the real ED2K connection state.
   [+] Added `sources forget` and `sources prune` lifecycle commands.
   [+] Added source statistics to `status --json`.
+  [+] Added kad search/sources commands on the live Kad2 engine
+      (KADEMLIA2_SEARCH_KEY_REQ / KADEMLIA2_SEARCH_SOURCE_REQ).
 
 Patch Notes v0.5.1 (Soror L.'.L'.):
   [+] Added explicit eMule-compatible search channel model.
@@ -1088,6 +1090,260 @@ def _cmd_sources_ed2k(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _run_kad_search(args: argparse.Namespace) -> dict:
+    from amuled_v2.core.kad.runtime import load_kad_runtime
+    from amuled_v2.core.kad.search import KadSearchError, kad_keyword_search
+
+    rt = load_kad_runtime()
+    from amuled_v2.core.kad.runtime import bootstrap_runtime
+
+    await bootstrap_runtime(rt, local_port=0)
+    query = getattr(args, "query", None)
+    report = await kad_keyword_search(
+        query,
+        routing=rt.routing,
+        own_id=rt.own_id,
+        own_tcp_port=4662,
+        timeout=args.timeout,
+        max_results=args.limit,
+        local_port=0,
+    )
+    results = [
+        {
+            "hash": item.file_hash.hex().upper(),
+            "name": item.name,
+            "size": item.size,
+            "sources": item.sources,
+        }
+        for item in report.results
+    ]
+    saved = 0
+    save_error = None
+    if not args.no_save:
+        from amuled_v2.core.ed2k import SearchResult, SearchResultsBatch
+
+        batch = SearchResultsBatch(
+            query=query,
+            channel="kad",
+            server_host="kad",
+            server_port=0,
+            results=tuple(
+                SearchResult(
+                    file_hash=item.file_hash,
+                    client_id=None,
+                    client_port=None,
+                    tags=(),
+                )
+                for item in report.results
+            ),
+            more_results_available=False,
+        )
+        try:
+            state = get_state()
+            state.connect()
+            saved = state.save_search_results_batch(batch)
+        except Exception as exc:
+            # Persistence must never eat live search results (e.g. DuckDB
+            # held open by the kad spider process).
+            save_error = f"{type(exc).__name__}: {exc}"
+            log.warning(f"KAD search persistence failed: {save_error}")
+    result = {
+        "status": "ok",
+        "channel": "kad",
+        "query": query,
+        "nodes": rt.node_count,
+        "queried_nodes": report.queried_nodes,
+        "responded_nodes": report.responded_nodes,
+        "results": results,
+        "result_count": len(results),
+        "saved_results": saved,
+        "duration_s": round(report.duration_s, 3),
+    }
+    if save_error is not None:
+        result["save_error"] = save_error
+    return result
+
+
+def _cmd_kad_search(args: argparse.Namespace) -> int:
+    log.debug(
+        f"Command started: name=kad-search, query={getattr(args, 'query', None)!r}, "
+        f"timeout={args.timeout}, limit={args.limit}, no_save={args.no_save}"
+    )
+    try:
+        result = asyncio.run(_run_kad_search(args))
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        log.error(f"KAD search failed: {reason}")
+        error_result = {"status": "error", "channel": "kad", "reason": reason}
+        if getattr(args, "json", False):
+            _print_json(error_result)
+        else:
+            _print_text("Kad search failed", [
+                "status  : error",
+                f"channel : kad",
+                f"reason  : {reason}",
+            ])
+        return 2
+    if getattr(args, "json", False):
+        _print_json(result)
+    else:
+        lines = [
+            f"status      : {result['status']}",
+            f"channel     : {result['channel']}",
+            f"query       : {result['query']}",
+            f"nodes       : {result['nodes']}",
+            f"queried     : {result['queried_nodes']}",
+            f"responded   : {result['responded_nodes']}",
+            f"results     : {result['result_count']} (saved={result['saved_results']})",
+            f"duration    : {result['duration_s']}s",
+        ]
+        for item in result["results"]:
+            name = item["name"]
+            if len(name) > 80:
+                name = name[:80]
+            lines.append(
+                f"  {item['hash']}  size={item['size']}  "
+                f"sources={item['sources']}  name={name}"
+            )
+        _print_text("Kad keyword search", lines)
+    log.info(
+        f"Kad keyword search CLI completed: query={result['query']}, "
+        f"results={result['result_count']}, saved={result['saved_results']}"
+    )
+    return 0
+
+
+async def _run_kad_sources(args: argparse.Namespace) -> dict:
+    from amuled_v2.core.kad.runtime import load_kad_runtime
+    from amuled_v2.core.kad.source_search import kad_file_source_search
+
+    try:
+        file_hash = bytes.fromhex(args.hash)
+    except ValueError:
+        if len(args.hash) != 32:
+            reason = f"hash must be 32 hexadecimal digits, got {len(args.hash)}"
+        else:
+            reason = f"hash contains non-hexadecimal characters: {args.hash!r}"
+        return {"status": "error", "reason": reason}
+    if len(file_hash) != 16:
+        return {"status": "error", "reason": "hash must decode to 16 bytes"}
+
+    rt = load_kad_runtime()
+    from amuled_v2.core.kad.runtime import bootstrap_runtime
+
+    await bootstrap_runtime(rt, local_port=0)
+    report = await kad_file_source_search(
+        file_hash,
+        file_size=args.size,
+        routing=rt.routing,
+        own_id=rt.own_id,
+        own_tcp_port=4662,
+        timeout=args.timeout,
+        max_sources=args.limit,
+        local_port=0,
+    )
+    sources = [src.to_dict() for src in report.sources]
+    saved = 0
+    save_error = None
+    if not args.no_save and sources:
+        import ipaddress
+
+        from amuled_v2.core.ed2k import FoundSource, FoundSources
+
+        found_sources: list[FoundSource] = []
+        server_ip = "0.0.0.0"
+        server_port = 0
+        for src in report.sources:
+            if src.ip is None:
+                continue
+            if server_ip == "0.0.0.0" and src.buddy_ip:
+                server_ip = src.buddy_ip
+                server_port = src.buddy_port or 0
+            found_sources.append(
+                FoundSource(
+                    client_id=int(ipaddress.IPv4Address(src.ip)),
+                    client_port=src.tcp_port,
+                    user_hash=src.source_id or None,
+                )
+            )
+        record = FoundSources(
+            file_hash=file_hash, sources=tuple(found_sources)
+        )
+        try:
+            state = get_state()
+            state.connect()
+            saved = state.save_found_sources(
+                record,
+                server_ip=server_ip,
+                server_port=server_port,
+                source_type="kad",
+            )
+        except Exception as exc:
+            # Persistence must never eat live source results (e.g. DuckDB
+            # held open by the kad spider process).
+            save_error = f"{type(exc).__name__}: {exc}"
+            log.warning(f"KAD source persistence failed: {save_error}")
+    result = {
+        "status": "ok",
+        "hash": args.hash.upper(),
+        "size": args.size,
+        "nodes": rt.node_count,
+        "queried_nodes": report.queried_nodes,
+        "responded_nodes": report.responded_nodes,
+        "source_count": len(report.sources),
+        "saved_sources": saved,
+        "sources": sources,
+        "duration_s": round(report.duration_s, 3),
+    }
+    if save_error is not None:
+        result["save_error"] = save_error
+    return result
+
+
+def _cmd_kad_sources(args: argparse.Namespace) -> int:
+    log.debug(
+        f"Command started: name=kad-sources, hash={args.hash}, "
+        f"size={args.size}, timeout={args.timeout}, limit={args.limit}, "
+        f"no_save={args.no_save}"
+    )
+    result = asyncio.run(_run_kad_sources(args))
+    if result["status"] != "ok":
+        if getattr(args, "json", False):
+            _print_json(result)
+        else:
+            _print_text("Kad source search failed", [
+                "status  : error",
+                f"reason  : {result.get('reason', 'unknown')}",
+            ])
+        log.info(f"Kad sources CLI blocked: status={result['status']}")
+        return 2
+    if getattr(args, "json", False):
+        _print_json(result)
+    else:
+        lines = [
+            f"status      : {result['status']}",
+            f"hash        : {result['hash']}",
+            f"size        : {result['size']}",
+            f"nodes       : {result['nodes']}",
+            f"queried     : {result['queried_nodes']}",
+            f"responded   : {result['responded_nodes']}",
+            f"sources     : {result['source_count']} (saved={result['saved_sources']})",
+            f"duration    : {result['duration_s']}s",
+        ]
+        for src in result["sources"]:
+            ip = src.get("ip") or "lowid"
+            lines.append(
+                f"  {ip}:{src['tcp_port']} type={src['source_type']} "
+                f"dialable={src['dialable']}"
+            )
+        _print_text("Kad file sources", lines)
+    log.info(
+        f"Kad sources CLI completed: hash={result['hash']}, "
+        f"sources={result['source_count']}, saved={result['saved_sources']}"
+    )
+    return 0
+
+
 def _cmd_servers_failures(args: argparse.Namespace) -> int:
     state = get_state()
     state.connect()
@@ -1875,14 +2131,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_search_kad = search_sub.add_parser(
         "kad",
-        help="Kademlia channel (planned keyword search engine).",
+        help="Kademlia keyword search (live Kad2 engine).",
         parents=parents,
     )
-    p_search_kad.add_argument("--query", help="Search query (unused while planned).")
-    p_search_kad.set_defaults(
-        channel_name=SearchChannel.KAD.value,
-        func=_cmd_search_not_implemented,
+    p_search_kad.add_argument("query", help="Search query.")
+    p_search_kad.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="Overall search window in seconds.",
     )
+    p_search_kad.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Maximum result items to collect.",
+    )
+    p_search_kad.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Do not persist results into DuckDB.",
+    )
+    p_search_kad.set_defaults(func=_cmd_kad_search)
 
     p_search_web = search_sub.add_parser(
         "web-edonkey",
@@ -2043,6 +2313,70 @@ def build_parser() -> argparse.ArgumentParser:
         help="Report what would be pruned without deleting.",
     )
     p_sources_prune.set_defaults(func=_cmd_sources_prune)
+
+    # --- kad ---
+    p_kad = sub.add_parser(
+        "kad",
+        help="Kademlia network commands (search, sources).",
+        parents=parents,
+    )
+    kad_sub = p_kad.add_subparsers(dest="kad_command", metavar="<action>")
+
+    p_kad_search = kad_sub.add_parser(
+        "search",
+        help="Search the Kad2 network for keywords.",
+        parents=parents,
+    )
+    p_kad_search.add_argument("query", help="Keyword to search for.")
+    p_kad_search.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="Overall search window in seconds.",
+    )
+    p_kad_search.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Maximum result items to collect.",
+    )
+    p_kad_search.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Do not persist results to DuckDB.",
+    )
+    p_kad_search.set_defaults(func=_cmd_kad_search)
+
+    p_kad_sources = kad_sub.add_parser(
+        "sources",
+        help="Search the Kad2 network for file sources.",
+        parents=parents,
+    )
+    p_kad_sources.add_argument("hash", help="ED2K file hash (32 hexadecimal digits).")
+    p_kad_sources.add_argument(
+        "--size",
+        type=int,
+        default=0,
+        help="Expected file size; 0 matches any (sent to nodes as a filter).",
+    )
+    p_kad_sources.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="Overall search window in seconds.",
+    )
+    p_kad_sources.add_argument(
+        "--limit",
+        type=int,
+        default=300,
+        help="Maximum source entries to collect.",
+    )
+    p_kad_sources.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Do not persist sources to DuckDB.",
+    )
+    p_kad_sources.set_defaults(func=_cmd_kad_sources)
 
     # --- download ---
     p_download = sub.add_parser(

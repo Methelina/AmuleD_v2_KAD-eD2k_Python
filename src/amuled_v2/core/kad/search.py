@@ -496,7 +496,8 @@ async def kad_keyword_search(
     routing: RoutingZone,
     own_id: KadUInt128,
     own_tcp_port: int,
-    timeout: float = 8.0,
+    timeout: float = 30.0,
+    idle_extend: float = 10.0,
     max_results: int = 200,
     local_port: int = 4672,
     reward_hook: Optional[Callable[[Tuple[str, int], float], None]] = None,
@@ -522,6 +523,14 @@ async def kad_keyword_search(
          ``bootstrap.py``).
       5. Results are deduplicated by file hash; the loop exits early once
          ``max_results`` is collected or no closer candidates remain.
+      6. Sliding-window deadline (project policy, differs from vanilla eMule
+         fixed ``SEARCH_LIFETIME``): ``effective_deadline =
+         min(start + timeout, last_progress + idle_extend)`` recomputed every
+         loop iteration.  ``last_progress`` starts at ``start`` and refreshes
+         on every valid parsed response (closer-contact ``KADEMLIA2_RES`` or
+         ``KADEMLIA2_SEARCH_RES``), so a productive lookup never starves
+         while nodes answer; only genuine silence runs the idle clock down.
+         The hard cap ``start + timeout`` is never exceeded.
 
     Only search (no publishing) is performed.
     """
@@ -579,7 +588,8 @@ async def kad_keyword_search(
     results: dict[bytes, KadSearchResultItem] = {}
 
     sock.setblocking(False)
-    overall_deadline = start + timeout
+    hard_deadline = start + timeout
+    last_progress = start
     idle_strikes = 0
 
     async def _send_find_value(
@@ -620,7 +630,11 @@ async def kad_keyword_search(
     _seed_more(ALPHA)
 
     try:
-        while time.monotonic() < overall_deadline:
+        while True:
+            now = time.monotonic()
+            effective_deadline = min(hard_deadline, last_progress + idle_extend)
+            if now >= effective_deadline:
+                break
             # Ask the top-ALPHA closest untried candidates.  No best-gate:
             # on a cold lookup the strictly-closer chain starves, so the
             # closest-first seed walk (plus RES-followed contacts, which are
@@ -645,7 +659,7 @@ async def kad_keyword_search(
                     128 - d.bit_length(),
                 )
 
-            remaining = overall_deadline - time.monotonic()
+            remaining = effective_deadline - time.monotonic()
             window = min(4.0, max(0.05, remaining))
             datagram = await _recv_dgram(sock, window)
             if datagram is None:
@@ -726,6 +740,7 @@ async def kad_keyword_search(
                     continue
                 routing.mark_alive(src_ip, src_port)
                 responded[rdist] = True
+                last_progress = time.monotonic()
                 if reward_hook is not None:
                     reward_hook((src_ip, src_port), 2.0)
                 for item in answers:
@@ -757,6 +772,7 @@ async def kad_keyword_search(
                 )
                 continue
             routing.mark_alive(src_ip, src_port)
+            last_progress = time.monotonic()
             provided_closer = False
             seen_ips: set[str] = {src_ip}
             for cid, cip, cudp, ctcp, cver in contacts:
@@ -788,7 +804,7 @@ async def kad_keyword_search(
                 await _send_dgram(sock, skr, (src_ip, src_port))
                 asked_search.add((src_ip, src_port))
 
-            if time.monotonic() >= overall_deadline:
+            if time.monotonic() >= effective_deadline:
                 break
             log.info(
                 "kad search: tried=%d responded=%d possible=%d "
