@@ -4,6 +4,11 @@ You are helping continue development of AmuleD, a from-scratch Python 3.12 reimp
 
 ## INPUTS YOU ARE GIVEN
 
+Online copies of the context files:
+
+- roadmap.md: https://github.com/Methelina/AmuleD_v2_KAD-eD2k_Python/blob/main/docs/roadmap.md
+- continuation-prompt.md: https://github.com/Methelina/AmuleD_v2_KAD-eD2k_Python/blob/main/docs/continuation-prompt.md
+
 1. **roadmap.md** — project operational roadmap. Section **"11e. Session 7"** is the CURRENT state: what is implemented and live-verified (KAD search/sources live, BASIC TCP-obfuscation handshake accepted by real peers, HELLO codec fixes), the single remaining blocker, and planned next steps. Earlier sections (3.x, 11b, 11d) hold confirmed wire-level protocol findings — treat them as authoritative measurements, do not contradict or re-derive them.
 2. **continuation-prompt.md** — detailed handoff: exact fixes applied (HELLO 6-byte tail, probe framing), everything tested and ruled out, ground-truth decryption tooling (target userhash = KAD sourceID; keypart is plaintext in the handshake; RC4 keys = MD5(userhash+34/203+keypart), 1024-byte keystream drop), eMuleAI config facts, live-network behavior (plaintext protocol dead on today's network; KAD source entries churn within minutes; TCP SYN-ACK is not proof a peer application is alive), and the mandatory startup order (the KAD spider daemon must be running before any KAD work).
 3. **The git repository** https://github.com/eMuleAI/eMuleAI — the primary protocol reference source. Key files for this task:
