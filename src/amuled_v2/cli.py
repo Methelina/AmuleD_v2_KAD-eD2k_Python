@@ -2415,7 +2415,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_download_run.add_argument(
         "--max-peers",
         type=int,
-        default=3,
+        default=8,
         help="Maximum sequential peers to try.",
     )
     p_download_run.add_argument(

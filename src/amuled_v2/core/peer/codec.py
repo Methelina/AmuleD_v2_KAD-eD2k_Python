@@ -123,10 +123,57 @@ class C2CTCP:
 
 
 def _build_hello_tags(nickname: str, version: int = 0x3C, client_port: int = 0) -> list[Ed2kTag]:
+    """HELLO tag set exactly as the protocol expects it.
+
+    НЕ упрощать (уже сносили дважды, оба раза пиры рвали соединение через
+    10 с — таймаут ожидания валидного хендшейка):
+    - без EMULE-тегов приёмник считает нас старым eDonkey и не отвечает
+      на файловые запросы;
+    - в MISCOPTIONS2 младшие биты — версия KAD; без них пиры считают,
+      что мы не умеем KAD;
+    - CT_PORT в HELLO не входит (порт уже в фиксированном поле), лишние
+      теги меняют tagcount — держим набор 1:1 с протоколом.
+    """
+    # (kad_udp_port << 16) | ed2k_udp_port; постоянного UDP-порта нет — 0.
+    udports = 0
+    # Флаги возможностей: AICH, Unicode, сжатие, source exchange, multipacket,
+    # large files и т.п. Биты должны соответствовать тому, что мы реально
+    # умеем отвечать, иначе пир пришлёт неподдерживаемый формат.
+    miso1 = (
+        (1 << 29)   # AICH version 1
+        | (1 << 28)  # Unicode
+        | (4 << 24)  # UDP version
+        | (1 << 20)  # data compression
+        | (0 << 16)  # SecIdent (нет)
+        | (4 << 12)  # source exchange v4
+        | (2 << 8)   # extended requests v2
+        | (1 << 4)   # accept comment
+        | (0 << 3)   # peer cache (нет)
+        | (1 << 2)   # no view shared files
+        | (1 << 1)   # multipacket
+        | (0 << 0)   # preview (нет)
+    )
+    miso2 = (
+        (1 << 13)   # file identifiers
+        | (0 << 12)  # direct UDP callback (нет)
+        | (0 << 11)  # captcha (нет)
+        | (1 << 10)  # source exchange v2
+        | (0 << 9) | (0 << 8) | (0 << 7)  # TCP-криптослой (не реализован)
+        | (0 << 6)   # reserved (mod bit)
+        | (1 << 5)   # extended multipacket
+        | (1 << 4)   # large files
+        | 9          # KAD version 9 (kad2)
+    )
+    # Версия, под которой нас видят пиры: (major << 17) | (minor << 10) |
+    # (update << 7) = eMule 0.50a. Держать синхронно с build_emuleinfo_payload.
+    emule_version_tag = (0 << 17) | (50 << 10) | (0 << 7)
     tags: list[Ed2kTag] = [
-        Ed2kTag(name_id=0x01, type=STRING, value=nickname),
-        Ed2kTag(name_id=0x11, type=UINT32, value=version),
-        Ed2kTag(name_id=0x0B, type=UINT32, value=client_port),
+        Ed2kTag(name_id=0x01, type=STRING, value=nickname),           # имя
+        Ed2kTag(name_id=0x11, type=UINT32, value=version),            # ed2k version
+        Ed2kTag(name_id=0xF9, type=UINT32, value=udports),            # udp ports
+        Ed2kTag(name_id=0xFA, type=UINT32, value=miso1),              # misc options 1
+        Ed2kTag(name_id=0xFB, type=UINT32, value=emule_version_tag),  # emule version
+        Ed2kTag(name_id=0xFE, type=UINT32, value=miso2),              # misc options 2
     ]
     return tags
 

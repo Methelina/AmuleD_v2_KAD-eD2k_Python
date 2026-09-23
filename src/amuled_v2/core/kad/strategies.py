@@ -14,7 +14,6 @@ Patch Notes v0.1.0 (Soror L.'.L'.):
 
 from __future__ import annotations
 
-import math
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -100,29 +99,41 @@ def active_strategy_name() -> str:
 
 
 class KadabraState:
-    """Multi-armed bandit weights per node (Kadabra, arXiv 2210.12858).
+    """Веса соседей = скользящая средняя скорости их наград (EWMA-бандит).
 
-    Reward rule used by the search loop: 1.0 when a response contained a
-    strictly-closer contact, 2.0 for a SEARCH_RES, 0.2 for any response.
-    Weights decay multiplicatively so stale nodes fade out.
+    Схема (важно: раньше тут был жёсткий потолок 50.0 с экспоненциальным
+    ростом — все активные узлы упирались в него и сливались в массу):
+
+    - reward ДОБАВЛЯЕТ значение к весу (2.0 поделился контактами/результатом,
+      1.0 дал ближний контакт, 0.5 ответил на HELLO, 0.2 ответил на PING);
+    - decay умножает вес на фактор < 1, поэтому вес сходится к равновесию
+      w = (наград за цикл) / (1 - decay): отвечающий каждый цикл узел
+      держит ~10 при decay 0.95, редкий собеседник 1-3, молчащий уходит к 0;
+    - потолок не нужен и вреден — он убивает различимость. MAX — только
+      численный предохранитель.
     """
 
-    ETA = 0.3
-    DECAY = 0.9
-    BASE = 1.0
+    BASE = 0.0
+    DECAY = 0.95
+    # Численный предохранитель, при штатных decay штатно не достигается.
+    MAX = 1000.0
 
     def __init__(self) -> None:
         self.weights: Dict[Tuple[str, int], float] = {}
 
     def reward(self, key: Tuple[str, int], value: float) -> None:
-        weight = self.weights.get(key, self.BASE)
-        weight *= math.exp(self.ETA * value)
-        self.weights[key] = min(weight, 50.0)
+        weight = self.weights.get(key, self.BASE) + value
+        self.weights[key] = min(weight, self.MAX)
 
     def decay(self, factor: float | None = None) -> None:
         f = self.DECAY if factor is None else factor
         for key in list(self.weights):
-            self.weights[key] *= f
+            w = self.weights[key] * f
+            # Не таскаем вечный хвост: ниже порога значимости вес обнуляется.
+            if w < 0.05:
+                del self.weights[key]
+            else:
+                self.weights[key] = w
 
     def weight(self, key: Tuple[str, int]) -> float:
         return self.weights.get(key, self.BASE)

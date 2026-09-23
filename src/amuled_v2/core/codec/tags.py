@@ -185,8 +185,12 @@ def write_new_tag(tag: Ed2kTag, writer: BinaryWriter) -> None:
         wire_type = tag.type
 
     if tag.name_id is not None:
+        # ВАЖНО: id тега всегда UINT16 (и в старом формате eMule, и в
+        # new-формате с битом 0x80). Было write_u8 — каждый тег сдвигал
+        # поток на байт, приёмники не могли распарсить HELLO и молча
+        # рвали соединение по таймауту.
         writer.write_u8(wire_type | 0x80)
-        writer.write_u8(tag.name_id)
+        writer.write_u16(tag.name_id)
     else:
         encoded_name = tag.name.encode("utf-8")
         if len(encoded_name) > 0xFFFF:
@@ -200,7 +204,9 @@ def write_new_tag(tag: Ed2kTag, writer: BinaryWriter) -> None:
 
 def _read_identifier(reader: BinaryReader, type_byte: int) -> tuple[Optional[str], Optional[int]]:
     if type_byte & 0x80:
-        return None, reader.read_u8()
+        # Id тега — UINT16 (зеркало write_new_tag; исторически читали u8 и
+        # ломали парсинг чужих пакетов).
+        return None, reader.read_u16()
 
     name_length = reader.read_u16()
     if name_length == 1:

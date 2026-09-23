@@ -80,6 +80,10 @@ log = get_tagged_logger(LogTags.KAD, "kad.spider")
 NODES_DAT = ROOT / "assets" / "v1" / "nodes.dat"
 CACHE_FILE = ROOT / "db" / "kad_nodes.json"
 STATUS_FILE = ROOT / "db" / "kad_status.json"
+# Ротация пула: узел без ответа дольше STALE_DAYS суток удаляется, пул
+# обрезается до MAX_POOL (самые старые). См. prune_pool().
+STALE_DAYS = int(os.environ.get("AMULED_KAD_SPIDER_STALE_DAYS", "7"))
+MAX_POOL = int(os.environ.get("AMULED_KAD_SPIDER_MAX_POOL", "2000"))
 BATCH = 24
 DEFAULT_PORT = int(os.environ.get("AMULED_KAD_SPIDER_PORT", "4672"))
 
@@ -141,6 +145,38 @@ def build_pool(cache: Dict[str, Any]) -> Dict[Tuple[str, int], Dict[str, Any]]:
                 },
             )
     return nodes
+
+
+def prune_pool(
+    nodes: Dict[Tuple[str, int], Dict[str, Any]],
+) -> int:
+    """Rotate stale nodes out of the pool; returns pruned count.
+
+    Правило ротации (нельзя отключать — пул без prune растёт бесконтрольно
+    от bootstrap-контактов и забивается мёртвыми записями, после чего
+    routing.closest ведёт поиски по мёртвым узлам):
+
+    - узел, не отвечавший дольше STALE_DAYS суток, удаляется по давности
+      last_seen (nodes.dat-контакты без единого ответа живут 1 день);
+    - если пул всё равно больше MAX_POOL — удаляются самые старые.
+    """
+    now = time.time()
+    stale_seconds = STALE_DAYS * 86400
+    stale_keys = [
+        k for k, r in nodes.items() if now - r["last_seen"] > stale_seconds
+    ]
+    for k in stale_keys:
+        del nodes[k]
+    pruned = len(stale_keys)
+    overflow = len(nodes) - MAX_POOL
+    if overflow > 0:
+        oldest = sorted(
+            nodes.items(), key=lambda kv: kv[1]["last_seen"]
+        )[:overflow]
+        for k, _ in oldest:
+            del nodes[k]
+        pruned += overflow
+    return pruned
 
 
 def save_snapshot(
@@ -731,8 +767,11 @@ async def main() -> int:
             # periodic save (kad_warmup.py ~375-379)
             now = loop.time()
             if now >= state["next_save"]:
+                pruned = prune_pool(nodes)
+                if pruned:
+                    log.info("pool pruned: removed=%d pool=%d", pruned, len(nodes))
                 save_snapshot(nodes, own)
-                save_kadabra_state(kadabra, project_root, decay_factor=0.995)
+                save_kadabra_state(kadabra, project_root, decay_factor=0.95)
                 state["last_save"] = time.time()
                 state["next_save"] = now + args.save_s
 
@@ -791,8 +830,8 @@ async def main() -> int:
                     top_entries = []
                     for key, w in top_items[:5]:
                         ip, udp_port = key
-                        trend = w - prev_weights.get(key, 1.0)
-                        prev_w = prev_weights.get(key, 1.0)
+                        trend = w - prev_weights.get(key, 0.0)
+                        prev_w = prev_weights.get(key, 0.0)
                         if prev_w > 0:
                             ratio = abs(trend) / max(abs(prev_w), 1e-6)
                             n = min(5, max(1, int(round(ratio * 5))))

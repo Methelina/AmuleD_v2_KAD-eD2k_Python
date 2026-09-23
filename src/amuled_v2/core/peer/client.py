@@ -142,28 +142,33 @@ def _pack_ip(value: int) -> str:
 
 
 def build_emuleinfo_payload(emule_version: int = 0x3C) -> bytes:
-    """Build a minimal OP_EMULEINFO payload (version, protocol, tags)."""
-    import io
+    """OP_EMULEINFO: u8 версия, u8 протокол (0xC5!), u32 tagcount, 7 флаг-тегов.
 
-    writer_chunks: list[bytes] = []
-    writer_chunks.append(bytes([emule_version, 0x01]))
-    writer = struct.Struct("<I")
-
-    tags: list[Ed2kTag] = [
-        Ed2kTag(name_id=0x20, type=0x03, value=1),   # ET_COMPRESSION
-        Ed2kTag(name_id=0x15, type=0x03, value=1),   # ET_SOURCEEXCHANGE
-        Ed2kTag(name_id=0x0F, type=0x03, value=0),   # ET_UDPPORTS placeholder
-    ]
-    body = io.BytesIO()
-    body.write(writer.pack(len(tags)))
+    ВАЖНО (уже ломали): второй байт обязан быть 0xC5, иначе приёмник считает
+    нас не-eMule, не принимает инфо-пакет и рвёт соединение по своему
+    таймауту хендшейка (~10 с). Набор тегов — стандартные 7 флагов
+    возможностей; их id и значения менять нельзя.
+    """
     from amuled_v2.core.codec.binary import BinaryWriter
 
-    tag_writer = BinaryWriter()
+    writer = BinaryWriter()
+    writer.write_u8(emule_version)
+    writer.write_u8(EMULE_PROTOCOL)
+    tags: list[Ed2kTag] = [
+        Ed2kTag(name_id=0x20, type=0x03, value=1),   # сжатие данных
+        Ed2kTag(name_id=0x22, type=0x03, value=4),   # udp version
+        Ed2kTag(name_id=0x21, type=0x03, value=0),   # udp port (нет)
+        Ed2kTag(name_id=0x23, type=0x03, value=3),   # source exchange
+        Ed2kTag(name_id=0x24, type=0x03, value=1),   # comments
+        Ed2kTag(name_id=0x25, type=0x03, value=2),   # extended requests
+        Ed2kTag(name_id=0x27, type=0x03, value=0),   # features (без крипты)
+    ]
+    writer.write_u32(len(tags))
     for tag in tags:
-        write_new_tag(tag, tag_writer)
-    body.write(tag_writer.to_bytes())
-    writer_chunks.append(body.getvalue())
-    return b"".join(writer_chunks)
+        write_new_tag(tag, writer)
+    payload = writer.to_bytes()
+    log.debug("EMULEINFO payload built: size=%d", len(payload))
+    return payload
 
 
 class PeerClient:
