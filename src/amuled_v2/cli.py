@@ -1123,6 +1123,17 @@ async def _run_kad_search(args: argparse.Namespace) -> dict:
         }
         for item in report.results
     ]
+    # Контент-фильтр выдачи: помеченные имена не доходят до пользователя.
+    from amuled_v2.core.safety import matched_marker
+
+    visible = [
+        r for r in results if matched_marker(r.get("name", "")) is None
+    ]
+    filtered_out = len(results) - len(visible)
+    if filtered_out:
+        log.warning(
+            f"Search results filtered by content policy: count={filtered_out}"
+        )
     saved = 0
     save_error = None
     if not args.no_save:
@@ -1160,8 +1171,9 @@ async def _run_kad_search(args: argparse.Namespace) -> dict:
         "nodes": rt.node_count,
         "queried_nodes": report.queried_nodes,
         "responded_nodes": report.responded_nodes,
-        "results": results,
-        "result_count": len(results),
+        "results": visible,
+        "result_count": len(visible),
+        "filtered_out": filtered_out,
         "saved_results": saved,
         "duration_s": round(report.duration_s, 3),
     }
