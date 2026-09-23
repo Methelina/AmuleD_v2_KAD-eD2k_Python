@@ -2,7 +2,7 @@
 
 AmuleD is a portable, console-first ED2K/Kademlia client written in Python 3.12. It is an independent clean-room implementation of the public ED2K and Kademlia protocols, not a binary wrapper around aMule/eMule and not a GPL source port.
 
-The current milestone provides a fully working **Kademlia (KAD) keyword search against the live eMule network** (200 real results for a "video" query in about one second), a live-validated ED2K TCP server session with search, a complete download stack (queue, part files, MD4 verification), a peer protocol layer, IP filter and server blacklisting, and a searchable DuckDB-backed result store.
+The current milestone provides a fully working **Kademlia (KAD) engine against the live eMule network** — keyword search (200 real results for a "video" query in about one second) and file-source discovery (KADEMLIA2_SEARCH_SOURCE_REQ, sources persisted to DuckDB) — plus a live-validated ED2K TCP server session with search, a complete download stack (queue, part files, MD4 verification), a peer protocol layer, IP filter and server blacklisting, a searchable DuckDB-backed result store, a permanent KAD spider daemon that keeps the network warm, and an interactive console menu.
 
 **Author:** Soror L.'.L.'. &nbsp;|&nbsp; **Version:** 0.5.1 &nbsp;|&nbsp; **License:** Apache 2.0
 
@@ -50,13 +50,20 @@ The installer is idempotent. It provisions `uv`, Python 3.12, dependencies, runt
 
 ### Run
 
-Use the portable launcher:
+The project has exactly two launchers: the installer and the single runtime. `AmuleD_Run.ps1` is a dispatcher — everything runs from under it:
 
 ```powershell
-.\AmuleD_Run.ps1 -NoPause --help
+.\AmuleD_Run.ps1                      # interactive console menu (Server / KAD / Share / Search / Downloads)
+.\AmuleD_Run.ps1 spider               # KAD spider daemon: keeps the network warm (verbose, Ctrl+C to stop)
+.\AmuleD_Run.ps1 -NoPause --help      # CLI passthrough
 .\AmuleD_Run.ps1 -NoPause status --json
-.\AmuleD_Run.ps1 -NoPause config show --json
 ```
+
+The KAD network only answers after warm-up. Keep the spider running in a console while you use search or sources; it continuously matures the routing table, refreshes the node cache (`db\kad_nodes.json`), and writes a live status snapshot to `db\kad_status.json` (including hot-connection statistics from the node database at the end of every cycle).
+
+### Interactive menu
+
+With no arguments the runtime opens an interactive menu: numbered search results (pick one or several — `1,3,5` or `2-5` — to add and download), KAD status, share management, downloads with progress bars, IP filter tests. The menu is a thin shell over the same CLI; every action is one keypress instead of a command line.
 
 ### Search
 
@@ -75,7 +82,22 @@ Search results are persisted in DuckDB and can be listed later:
 .\AmuleD_Run.ps1 -NoPause search results clear --json
 ```
 
-KAD search runs over the Kademlia engine (bootstrap → mature routing table → iterative keyword lookup). The KAD CLI is being integrated over the new engine; until then the same functionality is available through the Python API (`amuled_v2.core.kad.search.kad_keyword_search`) and `scripts\kad_warmup.py` / `scripts\kad_node_collector.py`, which build and cache the KAD node table in `db\kad_nodes.json`.
+KAD search runs over the Kademlia engine (bootstrap → mature routing table → iterative keyword lookup) with a sliding-window budget: the lookup keeps going while nodes answer and stops after a quiet window:
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause kad search "video" --timeout 45 --json
+.\AmuleD_Run.ps1 -NoPause search kad "video" --json   # same engine via the search-channel model
+```
+
+### KAD file sources
+
+Discover peers sharing a file directly through Kademlia and persist them into the same DuckDB source store the downloader consumes:
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause kad sources <file_hash> --size <size_bytes> --timeout 45 --json
+```
+
+Each source carries its eMule source type (1 = high-ID, 3/5 = firewalled with buddy, 6 = direct callback), a dialability flag, and the publisher's KadID. Entries with reserved/multicast addresses or invalid ports are filtered out (`IsGoodIPPort` rule).
 
 ### Sources and downloads
 
@@ -181,9 +203,12 @@ Core policy documents:
 | KAD routing table | Implemented | `src/amuled_v2/core/kad/routing.py` |
 | KAD UDP obfuscation (RC4) | Live-validated | `src/amuled_v2/core/kad/obfuscation.py` |
 | KAD keyword search | **Live: 200 results/query** | `src/amuled_v2/core/kad/search.py` |
+| KAD file-source search (`SEARCH_SOURCE_REQ`) | **Live: sources persisted** | `src/amuled_v2/core/kad/source_search.py` |
+| KAD runtime (cache → routing, bootstrap) | Implemented | `src/amuled_v2/core/kad/runtime.py` |
+| KAD CLI commands (`kad search/sources`) | **Live-validated** | `src/amuled_v2/cli.py` |
+| KAD spider daemon (network warm-up) | Implemented | `scripts/kad_spider.py` |
+| Interactive console menu | Implemented | `scripts/amuled_menu.py` |
 | Selection strategies (xor/quality/vivaldi/kadabra) | Implemented | `src/amuled_v2/core/kad/strategies.py` |
-| KAD CLI commands | Planned | `src/amuled_v2/cli.py` |
-| KAD source lookup (`SEARCH_SOURCE_REQ`) | Planned | `docs/roadmap.md` §11c |
 | Upload engine | Planned | `docs/roadmap.md` |
 | Incoming KAD listener | Planned | `docs/roadmap.md` |
 | GeoIP / UPnP-NAT-PMP | Planned | `docs/roadmap.md` |
@@ -199,7 +224,7 @@ Core policy documents:
 ```text
 AmuleD_v2/
 ├── AmuleD_install.ps1         # Idempotent portable installer
-├── AmuleD_Run.ps1             # Portable launcher for CLI commands
+├── AmuleD_Run.ps1             # Single runtime dispatcher: menu / spider / CLI
 ├── pyproject.toml             # Package metadata and dependencies
 ├── requirements.txt           # Locked dependency groups
 ├── AGENTS.md                  # Project-local development rules
@@ -212,7 +237,7 @@ AmuleD_v2/
 ├── temp/                      # Partial downloads
 ├── shared/                    # Default shared storage
 ├── docs/                      # Specification, roadmap, protocol matrix
-├── scripts/                   # Warm-up, node collector, diagnostic scripts
+├── scripts/                   # KAD spider daemon, interactive menu, warm-up and diagnostic scripts
 ├── src/amuled_v2/             # Python implementation
 │   └── core/kad/              # KAD engine (packets, bootstrap, routing, search, obfuscation, strategies)
 └── tests/                     # Unit, codec, state, and protocol tests
@@ -249,7 +274,7 @@ Run all commands from `AmuleD_v2` using the project-local interpreter:
 Current full offline-suite status:
 
 ```text
-184 passed, 2 skipped
+192 passed, 2 skipped
 ```
 
 ### Tagged diagnostics
@@ -291,18 +316,18 @@ Completed development stations:
 - Download queue, part files, MD4 verification, peer transfer - **DONE**
 - IP filter and server blacklist - **DONE**
 - Kademlia engine (bootstrap, routing, obfuscation, keyword search) - **DONE** (live: 200 results/query)
+- KAD file-source search with DuckDB persistence - **DONE** (live: sources from the real network)
+- KAD CLI commands (`kad search/sources`), spider daemon, interactive menu - **DONE**
 
 Active / next stations (WIP/PLANNED):
 
-1. KAD source lookup (KADEMLIA2_SEARCH_SOURCE_REQ) and source persistence - **WIP**
-2. Downloads fed from KAD sources end to end (MD4-verified) - **PLANNED**
-3. KAD CLI commands (kad bootstrap/search/status/sources) - **WIP**
-4. Long-run live-network stabilization (session warm-up, node cache growth) - **WIP**
-5. Upload slots and queues - **PLANNED**
-6. Incoming KAD listener, firewall checks - **PLANNED**
-7. GeoIP / UPnP-NAT-PMP - **PLANNED**
+1. Downloads fed from KAD sources end to end (MD4-verified) - **WIP** (peer handshake wire-verification in progress)
+2. Spider daemon stale-node rotation and incoming KAD listener - **WIP**
+3. Search tactics (quality/kadabra) as CLI flags - **PLANNED**
+4. Upload slots and queues - **PLANNED**
+5. GeoIP / UPnP-NAT-PMP - **PLANNED**
 
-Deprecated early-session notes are kept for context in docs/roadmap.md - every section there is tagged DONE/SOLVED/WIP/DEPRECATED/TODO; the live state is in sections 11a-11c.
+Deprecated early-session notes are kept for context in docs/roadmap.md - every section there is tagged DONE/SOLVED/WIP/DEPRECATED/TODO; the live state is in sections 11a-11d.
 
 ---
 

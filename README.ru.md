@@ -2,7 +2,7 @@
 
 AmuleD — переносимый консольный ED2K/Kademlia-клиент на Python 3.12. Это независимая clean-room реализация открытых протоколов ED2K и Kademlia.
 
-Текущий майлстоун включает полностью работающий **Kademlia-поиск (KAD) по ключевым словам в живой сети eMule** (200 реальных результатов по запросу «video» примерно за секунду), живую ED2K TCP-сессию с сервером и поиском, полный download-стек (очередь, part-файлы, верификация MD4), слой пирингового протокола, IP-фильтр и автоблокировку серверов, а также хранилище результатов поиска в DuckDB.
+Текущий майлстоун включает полностью работающий **движок Kademlia в живой сети eMule** — keyword-поиск (200 реальных результатов по запросу «video» примерно за секунду) и поиск источников файлов (KADEMLIA2_SEARCH_SOURCE_REQ, сохранение в DuckDB), — живую ED2K TCP-сессию с сервером и поиском, полный download-стек (очередь, part-файлы, верификация MD4), слой пирингового протокола, IP-фильтр и автоблокировку серверов, хранилище результатов поиска в DuckDB, постоянного KAD-паука, держащего сеть тёплой, и интерактивное консольное меню.
 
 **Автор:** Soror L.'.L.'. &nbsp;|&nbsp; **Версия:** 0.5.1 &nbsp;|&nbsp; **Лицензия:** Apache 2.0
 
@@ -50,13 +50,20 @@ AmuleD — клиент для децентрализованного обмен
 
 ### Запуск
 
-Штатный лаунчер:
+В проекте ровно два пусковика: установщик и единый рантайм. `AmuleD_Run.ps1` — диспетчер, всё делается из-под него:
 
 ```powershell
-.\AmuleD_Run.ps1 -NoPause --help
+.\AmuleD_Run.ps1                      # интерактивное меню (Server / KAD / Share / Search / Downloads)
+.\AmuleD_Run.ps1 spider               # KAD-паук: держит сеть тёплой (verbose, Ctrl+C — остановить)
+.\AmuleD_Run.ps1 -NoPause --help      # CLI passthrough
 .\AmuleD_Run.ps1 -NoPause status --json
-.\AmuleD_Run.ps1 -NoPause config show --json
 ```
+
+KAD-сеть отвечает только после прогрева. Держите паука запущенным в отдельной консоли, пока пользуетесь поиском и источниками: он непрерывно созревает routing-таблицу, обновляет кеш узлов (`db\kad_nodes.json`) и пишет живой статус-снимок `db\kad_status.json` (включая статистику горячих соединений из базы узлов в конце каждого цикла).
+
+### Интерактивное меню
+
+Без аргументов рантайм открывает интерактивное меню: нумерованные результаты поиска (выбор одного или нескольких — `1,3,5` или `2-5` — с добавлением в загрузки), статус KAD, управление share, загрузки с прогресс-барами, тесты IP-фильтра. Меню — тонкая оболочка над тем же CLI; каждое действие — одно нажатие вместо командной строки.
 
 ### Поиск
 
@@ -75,7 +82,22 @@ AmuleD — клиент для децентрализованного обмен
 .\AmuleD_Run.ps1 -NoPause search results clear --json
 ```
 
-KAD-поиск работает поверх движка Kademlia (бутстрап → созревание routing-таблицы → итеративный keyword-lookup). CLI kad-команд сейчас интегрируются; то же самое доступно через Python-API (`amuled_v2.core.kad.search.kad_keyword_search`) и `scripts\kad_warmup.py` / `scripts\kad_node_collector.py`, которые строят и кешируют таблицу KAD-узлов в `db\kad_nodes.json`.
+KAD-поиск работает поверх движка Kademlia (бутстрап → созревание routing-таблицы → итеративный keyword-lookup) со sliding-window-бюджетом: lookup продолжается, пока узлы отвечают, и завершается после тихого окна:
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause kad search "video" --timeout 45 --json
+.\AmuleD_Run.ps1 -NoPause search kad "video" --json   # тот же движок через модель каналов поиска
+```
+
+### KAD-источники
+
+Поиск пиров, раздающих файл, напрямую через Kademlia, с сохранением в то же DuckDB-хранилище источников, которое потребляет загрузчик:
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause kad sources <file_hash> --size <size_bytes> --timeout 45 --json
+```
+
+Каждый источник несёт eMule-тип (1 = high-ID, 3/5 = firewalled с buddy, 6 = direct callback), флаг dialable и KadID публикатора. Записи с reserved/multicast-адресами и невалидными портами отфильтровываются (правило `IsGoodIPPort`).
 
 ### Источники и загрузки
 
@@ -181,9 +203,12 @@ AmuleD распространяется по Apache 2.0. GPL-деревья aMul
 | KAD routing-таблица                            | Реализовано                       | `src/amuled_v2/core/kad/routing.py`                        |
 | KAD UDP-обфускация (RC4)                       | Проверено живой сетью             | `src/amuled_v2/core/kad/obfuscation.py`                    |
 | KAD keyword-поиск                              | **Живой: 200 результатов/запрос** | `src/amuled_v2/core/kad/search.py`                         |
+| KAD-поиск источников (`SEARCH_SOURCE_REQ`)     | **Живой: источники сохраняются**  | `src/amuled_v2/core/kad/source_search.py`                  |
+| KAD-runtime (кеш → routing, bootstrap)         | Реализовано                       | `src/amuled_v2/core/kad/runtime.py`                        |
+| KAD CLI-команды (`kad search/sources`)         | **Проверено живой сетью**         | `src/amuled_v2/cli.py`                                     |
+| KAD-паук (прогрев сети)                        | Реализовано                       | `scripts/kad_spider.py`                                    |
+| Интерактивное консольное меню                  | Реализовано                       | `scripts/amuled_menu.py`                                   |
 | Стратегии выбора (xor/quality/vivaldi/kadabra) | Реализовано                       | `src/amuled_v2/core/kad/strategies.py`                     |
-| KAD CLI-команды                                | В плане                           | `src/amuled_v2/cli.py`                                     |
-| KAD-источники (`SEARCH_SOURCE_REQ`)            | В плане                           | `docs/roadmap.md` §11c                                     |
 | Upload-движок                                  | В плане                           | `docs/roadmap.md`                                          |
 | Входящий KAD-listener                          | В плане                           | `docs/roadmap.md`                                          |
 | GeoIP / UPnP-NAT-PMP                           | В плане                           | `docs/roadmap.md`                                          |
@@ -199,7 +224,7 @@ AmuleD распространяется по Apache 2.0. GPL-деревья aMul
 ```text
 AmuleD_v2/
 ├── AmuleD_install.ps1         # Идемпотентный переносимый установщик
-├── AmuleD_Run.ps1             # Лаунчер CLI-команд
+├── AmuleD_Run.ps1             # Единый рантайм-диспетчер: меню / паук / CLI
 ├── pyproject.toml             # Метаданные пакета и зависимости
 ├── requirements.txt           # Зафиксированные группы зависимостей
 ├── AGENTS.md                  # Правила разработки проекта
@@ -212,7 +237,7 @@ AmuleD_v2/
 ├── temp/                      # Частичные загрузки
 ├── shared/                    # Хранилище по умолчанию
 ├── docs/                      # Спецификация, roadmap, матрица протокола
-├── scripts/                   # Прогрев, сборщик узлов, диагностические скрипты
+├── scripts/                   # KAD-паук, интерактивное меню, прогрев и диагностические скрипты
 ├── src/amuled_v2/             # Реализация на Python
 │   └── core/kad/              # KAD-движок (packets, bootstrap, routing, search, obfuscation, strategies)
 └── tests/                     # Юнит-, кодек-, state- и протокольные тесты
@@ -249,7 +274,7 @@ config\ db\ logs\ tmp\ # Конфигурация, состояние, диаг�
 Текущий статус offline-набора:
 
 ```text
-184 passed, 2 skipped
+192 passed, 2 skipped
 ```
 
 ### Тегированная диагностика
@@ -289,18 +314,18 @@ JSONL-записи фильтруются напрямую по полю `tag`.
 - Очередь загрузок, part-файлы, верификация MD4, пиринговый протокол - **DONE**
 - IP-фильтр и blacklist серверов - **DONE**
 - Движок Kademlia (бутстрап, routing, обфускация, keyword-поиск) - **DONE** (живой: 200 результатов/запрос)
+- KAD-поиск источников с сохранением в DuckDB - **DONE** (живой: источники из реальной сети)
+- KAD CLI-команды (`kad search/sources`), паук-демон, интерактивное меню - **DONE**
 
 Активные / следующие станции (WIP/PLANNED):
 
-1. KAD-поиск источников (KADEMLIA2_SEARCH_SOURCE_REQ) и их хранение - **WIP**
-2. Загрузки от KAD-источников end-to-end (верификация MD4) - **PLANNED**
-3. KAD CLI-команды (kad bootstrap/search/status/sources) - **WIP**
-4. Долгоживущая стабилизация сети (прогрев сессии, рост кеша узлов) - **WIP**
-5. Upload-слоты и очереди - **PLANNED**
-6. Входящий KAD-listener, firewall-проверки - **PLANNED**
-7. GeoIP / UPnP-NAT-PMP - **PLANNED**
+1. Загрузки от KAD-источников end-to-end (верификация MD4) - **WIP** (идёт wire-сверка пирингового хендшейка)
+2. Ротация протухших узлов паука и входящий KAD-listener - **WIP**
+3. Тактики поиска (quality/kadabra) как CLI-флаги - **PLANNED**
+4. Upload-слоты и очереди - **PLANNED**
+5. GeoIP / UPnP-NAT-PMP - **PLANNED**
 
-Заметки ранних сессий хранятся для контекста в docs/roadmap.md - каждая секция там помечена DONE/SOLVED/WIP/DEPRECATED/TODO; живое состояние - в секциях 11a-11c.
+Заметки ранних сессий хранятся для контекста в docs/roadmap.md - каждая секция там помечена DONE/SOLVED/WIP/DEPRECATED/TODO; живое состояние - в секциях 11a-11d.
 
 ---
 
