@@ -1,299 +1,275 @@
 # AmuleD v0.5.1
 
-AmuleD — портативный консольный ED2K/Kademlia-клиент на Python 3.12. Это независимая clean-room реализация публичных протоколов ED2K и Kademlia, а не бинарная обёртка вокруг aMule/eMule и не прямой порт GPL-исходников.
+AmuleD — переносимый консольный ED2K/Kademlia-клиент на Python 3.12. Это независимая clean-room реализация открытых протоколов ED2K и Kademlia.
 
-Текущая веха уже даёт портативный runtime, конфигурацию JSONC, состояние DuckDB, хэши MD4/ED2K/SHA1/AICH, кодек ED2K-пакетов, persistence серверных списков, импорт данных шаринга, тегированную диагностику и живо проверенную ED2K TCP login-сессию. Поиск, discovery источников, скачивание, upload и Kademlia ещё не реализованы и входят в следующие протокольные вехи.
+Текущий майлстоун включает полностью работающий **Kademlia-поиск (KAD) по ключевым словам в живой сети eMule** (200 реальных результатов по запросу «video» примерно за секунду), живую ED2K TCP-сессию с сервером и поиском, полный download-стек (очередь, part-файлы, верификация MD4), слой пирингового протокола, IP-фильтр и автоблокировку серверов, а также хранилище результатов поиска в DuckDB.
 
-**Автор:** Soror L.'.L.'. &nbsp;|&nbsp; **Версия:** 0.4.1 &nbsp;|&nbsp; **Лицензия:** Apache 2.0
+**Автор:** Soror L.'.L.'. &nbsp;|&nbsp; **Версия:** 0.5.1 &nbsp;|&nbsp; **Лицензия:** Apache 2.0
 
-**Документация:** [Русский](README.ru.md) · [English](README.md)
+**Документация:** [English](README.md) · [Русский](README.ru.md)
+
+**Репозитарий:** [GitHub - Methelina/AmuleD_v2_KAD-eD2k_Python](https://github.com/Methelina/AmuleD_v2_KAD-eD2k_Python.git)
 
 ---
 
-## Для пользователя
+## Для пользователей
 
-### Текущий статус
+### Что это такое
 
-AmuleD — ранняя клиентская основа. Сейчас уже доступны:
+AmuleD — клиент для децентрализованного обмена файлами в p2p-сетях eD2K/Kademlia (сеть eMule). Архитектура сети не имеет центрального сервера-посредника: поиск файлов и обмен идут напрямую между узлами-участниками через распределённую хеш-таблицу (DHT), поэтому ни один узел не хранит полный каталог, а трафик и участники распределены по миллионам машин по всему миру.
 
-- полностью портативное окружение Python 3.12;
-- конфигурация JSONC и runtime-состояние DuckDB;
-- импорт bundled-ресурсов v1 в локальное состояние;
-- импорт и persistence серверных списков, статических серверов, метаданных шаринга и общих каталогов;
-- вычисление MD4, ED2K-хэшей по чанкам, SHA-1 и AICH-деревьев;
-- кодирование и декодирование ED2K-пакетов, тегов, сжатых payload и login-сообщений;
-- подключение к ED2K-серверу, отправка `OP_LOGINREQUEST`, разбор серверных сообщений, identity, status и `OP_IDCHANGE`;
-- тегированный вывод в консоль и JSONL-лог.
+Что вы можете делать прямо сейчас:
 
-Пока недоступны поиск, discovery источников, скачивание файлов, публикация в Kademlia, upload peer'ам и полноценная замена eMule/aMule. Эти этапы зафиксированы в roadmap.
+- **Расшарить свои папки** — AmuleD просканирует их, посчитает хеши и зарегистрирует файлы для сети (команды `share add` / `share scan`).
+- **Найти файл в сети** по ключевому слову — через серверный поиск или по Kademlia (DHT) без серверов (команды `search server|auto` и движок `kad search`; поиск по «video» возвращает сотни реальных результатов).
+- **Скачать найденное** — добавить файл в очередь по хешу, клиент сам запросит источники, будет докачивать частями с паузой/возобновлением и сверит MD4-хеш после завершения (команды `sources ed2k`, `download add|run|pause|resume|cancel`, прогресс-бар).
+- **Работать безопасно** — IP-фильтр отсекает нежелательные адреса, ненадёжные серверы автоматически попадают в чёрный список (команды `ipfilter status|test`, `servers failures|forgive`).
 
-### Системные требования
+Клиент полностью переносимый: ставится в свою папку одним скриптом, ничего не пишет в системные каталоги и не требует установленного Python.
 
-- Windows 10/11 для bundled PowerShell installer/runner.
-- Интернет при первой установке.
-- Отдельно ставить Python не нужно: установщик создаёт проектный Python 3.12.
-- Свободное место для venv, кэшей, runtime-базы, временных файлов и будущих закачек.
+### Текущий статус (честно)
+
+Это ранний, но живой клиент: поиск (включая KAD) и приём источников работают против реальной сети eMule. Ещё в разработке: отдача файлов другим (upload), публикация ваших файлов в KAD-сети, входящие соединения. Следить за прогрессом можно в roadmap (секции помечены DONE/WIP/PLANNED).
+
+### Требования
+
+- Windows 10/11 для штатного PowerShell-установщика и лаунчера.
+- Доступ в интернет при первой установке.
+- Не требуется вручную установленный Python: установщик создаёт проект-локальное окружение Python 3.12.
+- Достаточно места для виртуального окружения, кешей, базы состояния, временных файлов и будущих загрузок.
 
 ### Установка
 
-Из каталога `AmuleD_v2` один раз запустите portable-установщик:
+Из каталога `AmuleD_v2` один раз запустите переносимый установщик:
 
 ```powershell
 .\AmuleD_install.ps1
 ```
 
-Установщик идемпотентен: он подготавливает `uv`, Python 3.12, зависимости, runtime-каталоги и JSONC-конфиг внутри проекта. Он не использует системный Python и не перезаписывает существующую конфигурацию.
+Установщик идемпотентен: разворачивает `uv`, Python 3.12, зависимости, рабочие каталоги и JSONC-конфигурацию по умолчанию внутри проекта. Системный Python не используется, существующая конфигурация не перезаписывается.
 
 ### Запуск
 
-Используйте portable-лаунчер:
+Штатный лаунчер:
 
 ```powershell
-.\AmuleD_Run.ps1
-```
-
-Без аргументов он показывает CLI-справку. Типовые команды:
-
-```powershell
-.\AmuleD_Run.ps1 -NoPause init --json
+.\AmuleD_Run.ps1 -NoPause --help
 .\AmuleD_Run.ps1 -NoPause status --json
 .\AmuleD_Run.ps1 -NoPause config show --json
-.\AmuleD_Run.ps1 -NoPause config set network.client_tcp_port 8089 --json
 ```
 
-`status --json` показывает активный backend, путь базы, состояние ED2K/KAD и количество записей в таблицах.
+### Поиск
 
-### Добавление и сканирование новых файлов
-
-Новые файлы можно зарегистрировать, хэшировать по ED2K и сразу записать в DuckDB через CLI:
+Поиск через ED2K-сервер:
 
 ```powershell
-.\AmuleD_Run.ps1 -NoPause share add D:\Media
-.\AmuleD_Run.ps1 -NoPause share scan
-.\AmuleD_Run.ps1 -NoPause share list --json
-```
-
-Интерактивные `share add` и `share scan` показывают tqdm-прогресс хэширования в stderr. В режиме `--json` прогресс отключается автоматически; его также можно отключить флагом `--no-progress`.
-
-`share add` регистрирует каталог, рекурсивно сканирует его и сохраняет полученные записи файлов. `share scan` без путей пересканирует все зарегистрированные каталоги. При повторном сканировании удаляются записи для файлов, которых больше нет или которые ушли из дерева сканирования, поэтому stale-хвосты в базе не остаются.
-
-Полезные варианты:
-
-```powershell
-.\AmuleD_Run.ps1 -NoPause share add D:\Music --priority high --json
-.\AmuleD_Run.ps1 -NoPause share add D:\Downloads --no-recursive --json
-.\AmuleD_Run.ps1 -NoPause share scan D:\Media --dry-run --json
-.\AmuleD_Run.ps1 -NoPause share add D:\LargeLibrary --no-progress
-.\AmuleD_Run.ps1 -NoPause share list --files-only --limit 100 --json
-.\AmuleD_Run.ps1 -NoPause share remove file 00112233445566778899AABBCCDDEEFF --json
-.\AmuleD_Run.ps1 -NoPause share remove dir D:\Media --json
-```
-
-`share remove dir` по умолчанию удаляет зарегистрированный каталог и его записи файлов. Добавьте `--keep-files`, чтобы удалить только строку каталога. Отдельный файл удаляется по 32-значному ED2K-хэшу.
-
-### Каналы поиска
-
-Команды поиска повторяют явные каналы eMule. Реализован канал `server`:
-
-```powershell
-.\AmuleD_Run.ps1 -NoPause search server `
-  --server 176.123.5.89:4725 `
-  --query "video" `
-  --duration 30 `
-  --json
-```
-
-Канал `server` логинится по TCP, отправляет `OP_SEARCHREQUEST` и накапливает пакеты результатов в течение `--duration` секунд. ED2K-поиск асинхронный: отсутствие ранних пакетов ещё не значит, что запрос неверный.
-
-AUTO использует правила выбора канала eMule. Если подключён только ED2K, он разрешается в `server`:
-
-```powershell
+.\AmuleD_Run.ps1 -NoPause search server --server 176.123.5.89:4725 --query "video" --duration 30 --json
 .\AmuleD_Run.ps1 -NoPause search auto --server 176.123.5.89:4725 --query "video" --json
 ```
 
-Остальные каналы явные и сейчас возвращают структурированный статус `not_implemented`, а не подменяются другим каналом:
+Результаты поиска сохраняются в DuckDB и доступны позже:
 
 ```powershell
-.\AmuleD_Run.ps1 -NoPause search global --json
-.\AmuleD_Run.ps1 -NoPause search kad --json
-.\AmuleD_Run.ps1 -NoPause search web-edonkey --json
+.\AmuleD_Run.ps1 -NoPause search results list --json
+.\AmuleD_Run.ps1 -NoPause search results show <file_hash> --json
+.\AmuleD_Run.ps1 -NoPause search results clear --json
 ```
 
-`global` требует UDP search-слой по списку серверов. `kad` требует Kademlia keyword-search. `web-edonkey` требует адаптер внешнего web-сервиса.
+KAD-поиск работает поверх движка Kademlia (бутстрап → созревание routing-таблицы → итеративный keyword-lookup). CLI kad-команд сейчас интегрируются; то же самое доступно через Python-API (`amuled_v2.core.kad.search.kad_keyword_search`) и `scripts\kad_warmup.py` / `scripts\kad_node_collector.py`, которые строят и кешируют таблицу KAD-узлов в `db\kad_nodes.json`.
 
-### Импорт bundled сетевых ресурсов
-
-Репозиторий содержит публичные сетевые ресурсы в `assets\v1`. Импортируйте их в проектную базу:
+### Источники и загрузки
 
 ```powershell
-.\AmuleD_Run.ps1 -NoPause import servers `
-  --server-met assets\v1\server.met `
-  --static assets\v1\staticservers.dat `
-  --save --json
+.\AmuleD_Run.ps1 -NoPause sources ed2k <file_hash> --server 176.123.5.89:4725 --save --json
+.\AmuleD_Run.ps1 -NoPause download add <file_hash> <size_bytes> --name "имя файла" --json
+.\AmuleD_Run.ps1 -NoPause download run --json
+.\AmuleD_Run.ps1 -NoPause download list --json
+.\AmuleD_Run.ps1 -NoPause download pause <file_hash> --json
+.\AmuleD_Run.ps1 -NoPause download resume <file_hash> --json
+.\AmuleD_Run.ps1 -NoPause download cancel <file_hash> --json
 ```
 
-После импорта `status --json` покажет счётчики серверов и статических серверов. Не импортируйте метаданные шаринга из чужой установки; регистрируйте собственные каталоги через `share add`, чтобы AmuleD хэшировал и сохранял только ваши файлы.
+`download run` подключается к известным источникам, запрашивает части файла, собирает part-файл и сверяет MD4 по завершении. Прогресс-бары рисуются в stderr и отключаются в `--json`-режиме.
+
+### Серверы и защита
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause import servers --server-met assets\v1\server.met --static assets\v1\staticservers.dat --save --json
+.\AmuleD_Run.ps1 -NoPause servers failures --json
+.\AmuleD_Run.ps1 -NoPause servers forgive <ip> <port> --json
+.\AmuleD_Run.ps1 -NoPause ipfilter status --json
+.\AmuleD_Run.ps1 -NoPause ipfilter test <ip> --json
+```
+
+Серверы с повторными сбоями автоматически попадают в blacklist на cooldown; `servers forgive` снимает запись. Заблокированные серверы пропускаются командами серверного канала и `import servers --save`.
 
 ### Логи
 
-Диагностика отделена от вывода команд. Результаты команд идут в stdout; тегированная диагностика — в stderr и дополнительно в JSONL-файл:
+Диагностика отделена от вывода команд: результаты — на stdout, тегированные сообщения — на stderr и в JSONL-файле:
 
 ```text
 logs\amuled.jsonl
 ```
 
-Консольный формат выглядит так:
+Пример консольной диагностики:
 
 ```text
-2026-09-22 23:49:29 | INFO | [CLI] Status command completed
+2026-09-23 07:23:52 | INFO | [KAD] bootstrap done: live=63 pool=397
 ```
 
-JSONL содержит стабильные поля времени, уровня, тега, logger и сообщения, поэтому поток удобно разбирать скриптом или раскладывать по отдельным окнам будущего GUI.
+JSONL содержит стабильные поля: timestamp, level, tag, logger, message — логи можно разбивать по модулям для скриптов или будущего GUI.
 
 ---
 
-## Для разработчика и технический справочник
+## Для разработчиков и технического справочника
 
-### Публичная идентичность
+### Идентификация продукта
 
-Зафиксированы публичное имя и версия:
+Публичные имя и версия:
 
 ```text
 AmuleD v0.5.1
 ```
 
-Технические имена отделены от публичных и стабильны:
+Стабильные технические имена:
 
-| Элемент | Значение |
-|---|---|
-| Публичное имя клиента | `AmuleD` |
-| Публичная строка версии | `AmuleD v0.5.1` |
-| Python package | `amuled_v2` |
-| CLI executable | `amuled` |
-| Каталог проекта | `AmuleD_v2` |
+| Параметр              | Значение        |
+| --------------------- | --------------- |
+| Публичное имя клиента | `AmuleD`        |
+| Публичная версия      | `AmuleD v0.5.1` |
+| Python-пакет          | `amuled_v2`     |
+| Исполняемый файл CLI  | `amuled`        |
+| Каталог проекта       | `AmuleD_v2`     |
 
-При продвижении версии клиента обновляются package-константы, тесты, баннеры и документация.
+Изменение публичной версии синхронно обновляет константы пакета, тесты, баннеры и документацию.
 
 ### Clean-room политика
 
-AmuleD планируется под Apache 2.0. GPL-исходники aMule/eMule можно изучать для выявления протокольных фактов, констант, переходов состояний и наблюдаемого поведения, но нельзя копировать GPL-код в реализацию. Сначала протокольное знание фиксируется в clean-room-документах, затем независимо реализуется на Python.
+AmuleD распространяется по Apache 2.0. GPL-деревья aMule/eMule можно изучать для выявления wire-фактов, констант, переходов состояний и наблюдаемого поведения, но GPL-код не копируется в реализацию. Знания о протоколе сначала фиксируются в clean-room документах, затем независимо реализуются на Python.
 
 Основные документы:
 
 - [`docs/AmuleD_v2_SPEC.md`](docs/AmuleD_v2_SPEC.md)
 - [`docs/PROTOCOL_MATRIX.md`](docs/PROTOCOL_MATRIX.md)
 - [`docs/LICENSE_POLICY.md`](docs/LICENSE_POLICY.md)
-- [`docs/roadmap.md`](docs/roadmap.md)
+- [`docs/roadmap.md`](docs/roadmap.md) (каждая секция помечена DONE/SOLVED/WIP/DEPRECATED/TODO)
 
 ### Реализованные технические слои
 
-| Слой | Статус | Расположение |
-|---|---|---|
-| Portable installer/runner | реализовано | `AmuleD_install.ps1`, `AmuleD_Run.ps1` |
-| Конфигурация JSONC | реализовано | `src/amuled_v2/config.py`, `jsonc.py` |
-| DuckDB state и миграции | реализовано | `src/amuled_v2/state.py` |
-| Тегированное логирование | реализовано | `src/amuled_v2/logging_setup.py` |
-| MD4 / ED2K hashing | реализовано | `src/amuled_v2/core/hashes` |
-| SHA-1 / AICH hashing | реализовано | `src/amuled_v2/core/hashes/aich.py` |
-| Binary/tag/packet codec | реализовано | `src/amuled_v2/core/codec` |
-| Persistence серверных списков | реализовано | `src/amuled_v2/core/ed2k/server_met.py` |
-| Импорт/хэширование метаданных шаринга | реализовано | `src/amuled_v2/core/sharing/shared_files.py` |
-| ED2K TCP login | подтверждено на живом сервере | `src/amuled_v2/core/ed2k/server_client.py` |
-| Модель каналов поиска | реализовано | `src/amuled_v2/core/search_channels.py` |
-| ED2K SERVER search | подтверждено на живом сервере | `src/amuled_v2/core/ed2k/server_client.py` |
-| ED2K GLOBAL search | в roadmap | UDP search-слой по списку серверов |
-| KAD search | в roadmap | `docs/roadmap.md`, M5 |
-| `OP_GETSOURCES` | подтверждено на живом сервере | `src/amuled_v2/core/ed2k/server_client.py` |
-| Kademlia transport | в roadmap | `docs/roadmap.md`, M5 |
-| Download engine | в roadmap | `docs/roadmap.md`, M8 |
-| Upload engine | в roadmap | `docs/roadmap.md`, M9+ |
-| Obfuscation / secure identification | в roadmap | `docs/roadmap.md`, M11 |
+| Слой                                           | Статус                            | Расположение                                               |
+| ---------------------------------------------- | --------------------------------- | ---------------------------------------------------------- |
+| Переносимый установщик/лаунчер                 | Реализовано                       | `AmuleD_install.ps1`, `AmuleD_Run.ps1`                     |
+| JSONC-конфигурация                             | Реализовано                       | `src/amuled_v2/config.py`, `jsonc.py`                      |
+| Состояние DuckDB и миграции                    | Реализовано                       | `src/amuled_v2/state.py`                                   |
+| Тегированное логирование                       | Реализовано                       | `src/amuled_v2/logging_setup.py`                           |
+| MD4 / ED2K-хеширование                         | Реализовано                       | `src/amuled_v2/core/hashes`                                |
+| SHA-1 / AICH                                   | Реализовано                       | `src/amuled_v2/core/hashes/aich.py`                        |
+| Бинарный/теговый/пакетный кодек                | Реализовано                       | `src/amuled_v2/core/codec`                                 |
+| Хранение списков серверов                      | Реализовано                       | `src/amuled_v2/core/ed2k/server_met.py`                    |
+| Импорт метаданных share-файлов                 | Реализовано                       | `src/amuled_v2/core/sharing/shared_files.py`               |
+| ED2K TCP login                                 | Проверено живой сетью             | `src/amuled_v2/core/ed2k/server_client.py`                 |
+| Модель каналов поиска                          | Реализовано                       | `src/amuled_v2/core/search_channels.py`                    |
+| ED2K SERVER-поиск                              | Проверено живой сетью             | `src/amuled_v2/core/ed2k/server_client.py`                 |
+| ED2K GLOBAL-поиск                              | Реализовано                       | `src/amuled_v2/core/ed2k/`                                 |
+| `OP_GETSOURCES`                                | Проверено живой сетью             | `src/amuled_v2/core/ed2k/server_client.py`                 |
+| Хранение результатов поиска                    | Реализовано                       | `src/amuled_v2/state.py`                                   |
+| IP-фильтр + blacklist серверов                 | Реализовано                       | `src/amuled_v2/core/ipfilter.py`, `server_filter.py`       |
+| Download-стек (очередь/parts/MD4)              | Реализовано                       | `src/amuled_v2/core/download/`, `src/amuled_v2/core/peer/` |
+| KAD-кодек пакетов (kad2)                       | Проверено живой сетью             | `src/amuled_v2/core/kad/packets.py`                        |
+| Парсер nodes.dat                               | Реализовано                       | `src/amuled_v2/core/kad/nodes_dat.py`                      |
+| KAD-бутстрап (HELLO/PING/BOOT)                 | Проверено живой сетью             | `src/amuled_v2/core/kad/bootstrap.py`                      |
+| KAD routing-таблица                            | Реализовано                       | `src/amuled_v2/core/kad/routing.py`                        |
+| KAD UDP-обфускация (RC4)                       | Проверено живой сетью             | `src/amuled_v2/core/kad/obfuscation.py`                    |
+| KAD keyword-поиск                              | **Живой: 200 результатов/запрос** | `src/amuled_v2/core/kad/search.py`                         |
+| Стратегии выбора (xor/quality/vivaldi/kadabra) | Реализовано                       | `src/amuled_v2/core/kad/strategies.py`                     |
+| KAD CLI-команды                                | В плане                           | `src/amuled_v2/cli.py`                                     |
+| KAD-источники (`SEARCH_SOURCE_REQ`)            | В плане                           | `docs/roadmap.md` §11c                                     |
+| Upload-движок                                  | В плане                           | `docs/roadmap.md`                                          |
+| Входящий KAD-listener                          | В плане                           | `docs/roadmap.md`                                          |
+| GeoIP / UPnP-NAT-PMP                           | В плане                           | `docs/roadmap.md`                                          |
 
-ED2K TCP wire framing выглядит так: байт протокола, little-endian `UInt32 packet_length`, байт opcode, затем payload. Поле длины включает opcode, поэтому `packet_length = payload_size + 1`. Живая проверка сервера подтвердила эту раскладку и расширенный eMule-compatible payload `OP_IDCHANGE`.
+### Заметки о KAD-движке
+
+- ID узлов используют внутреннюю **LE-словную семантику eMule**: `CFileDataIO::ReadUInt128` — сырые 16 байт memcpy четырёх little-endian слов, а сравнение дистанций идёт по слову 0. `KadUInt128` в `src/amuled_v2/core/kad/packets.py` реализует это точно; байты на проводе не меняются.
+- UDP-обфускация KAD следует `EncryptedDatagramSocket.cpp`: ключ = `MD5(NodeID пира || wire[1:3])`, RC4 без key-drop, magic `0x395F2EC1`, ключи receiver/sender после паддинга. Оба направления (decode/encode) реализованы и проверены живой сетью.
+- Тёплый кеш узлов (`db/kad_nodes.json` + таблица DuckDB `kad_nodes`) общий для `scripts/kad_warmup.py` и `scripts/kad_node_collector.py` и привязан к персистентному `own_id` — узлы узнают клиент между рестартами.
 
 ### Структура проекта
 
 ```text
 AmuleD_v2/
-├── AmuleD_install.ps1         # Идемпотентный portable-установщик
-├── AmuleD_Run.ps1             # Portable-лаунчер CLI-команд
+├── AmuleD_install.ps1         # Идемпотентный переносимый установщик
+├── AmuleD_Run.ps1             # Лаунчер CLI-команд
 ├── pyproject.toml             # Метаданные пакета и зависимости
-├── requirements.txt           # Группы зависимостей
+├── requirements.txt           # Зафиксированные группы зависимостей
 ├── AGENTS.md                  # Правила разработки проекта
-├── assets/v1/                 # Bundled базовые ресурсы
-├── config/                    # Пользовательский JSONC-конфиг
-├── db/                        # DuckDB state и генерируемые файлы
+├── assets/v1/                 # Базовые ресурсы сети
+├── config/                    # Пользовательская JSONC-конфигурация
+├── db/                        # Состояние DuckDB, KAD-кеш узлов
 ├── logs/                      # JSONL-диагностика
-├── tmp/                       # Проектные временные файлы
-├── incoming/                  # Будущие завершённые закачки
-├── temp/                      # Будущие частичные закачки
-├── shared/                    # Каталог шаринга по умолчанию
-├── docs/                      # Спецификация, roadmap, протокольная матрица
-├── scripts/                   # Диагностика и live-проверки
-├── src/amuled_v2/             # Python-реализация
-└── tests/                     # Unit, codec, state и protocol тесты
+├── tmp/                       # Временные файлы проекта
+├── incoming/                  # Завершённые загрузки
+├── temp/                      # Частичные загрузки
+├── shared/                    # Хранилище по умолчанию
+├── docs/                      # Спецификация, roadmap, матрица протокола
+├── scripts/                   # Прогрев, сборщик узлов, диагностические скрипты
+├── src/amuled_v2/             # Реализация на Python
+│   └── core/kad/              # KAD-движок (packets, bootstrap, routing, search, obfuscation, strategies)
+└── tests/                     # Юнит-, кодек-, state- и протокольные тесты
 ```
 
-### Портативная изоляция
+### Изоляция окружения
 
 Все генерируемые данные остаются внутри `AmuleD_v2`:
 
 ```text
 .venv\                 # Проектный Python 3.12
-bin\uv.exe             # Локальный uv
-bin\uv-python\         # uv-managed интерпретаторы Python
-.cache\uv\             # кэш uv
-.cache\pip\            # кэш пакетов
-.cache\pycache\        # bytecode-кэш
-.cache\tmp\            # временные файлы
-config\ db\ logs\      # конфигурация, состояние, диагностика
+bin\uv.exe             # Проектный uv
+bin\uv-python\         # Интерпретаторы uv
+.cache\uv\             # Кеш uv
+.cache\pip\            # Кеш pip
+.cache\pycache\        # Кеш байткода
+.cache\tmp\            # Временные файлы pytest/инструментов
+config\ db\ logs\ tmp\ # Конфигурация, состояние, диагностика, scratch
 ```
 
-Runner использует только:
-
-```text
-.venv\Scripts\python.exe
-```
-
-Системный Python не выбирается и не модифицируется.
+Лаунчер использует только `.venv\Scripts\python.exe` и не выбирает и не изменяет системный Python. Все временные файлы, включая артефакты pytest, перенаправляются в проект (см. `tests/conftest.py`) — на системный диск ничего не пишется.
 
 ### Команды разработки
 
-Команды выполняются из `AmuleD_v2` через проектный интерпретатор:
+Все команды — из каталога `AmuleD_v2` проектным интерпретатором:
 
 ```powershell
 .\.venv\Scripts\python.exe -m compileall -q src tests
-.\.venv\Scripts\python.exe -m pytest -q tests
+.\.venv\Scripts\python.exe -m pytest -q tests --ignore=tests/test_live_ed2k.py
 .\.venv\Scripts\python.exe -m amuled_v2 --help
 .\.venv\Scripts\python.exe -m amuled_v2 status --json
 ```
 
-Текущий статус полного набора тестов для v0.4.1:
+Текущий статус offline-набора:
 
 ```text
-128 passed
+184 passed, 2 skipped
 ```
 
 ### Тегированная диагностика
 
-Каждое диагностическое сообщение имеет стабильный uppercase-тег. Стабильные теги:
+Весь диагностический вывод использует стабильный тег модуля: `APP`, `CLI`, `CONFIG`, `STATE`, `IMPORT`, `SERVER`, `KAD`, `ED2K`, `SEARCH`, `DOWNLOAD`, `UPLOAD`, `PEER`, `SHARE`, `HASH`, `CODEC`, `SECURITY`, `IPFILTER`, `NAT`, `DAEMON`, `INSTALL`, `RUNNER`, `TEST`.
 
-`APP`, `CLI`, `CONFIG`, `STATE`, `IMPORT`, `SERVER`, `KAD`, `ED2K`, `SEARCH`, `DOWNLOAD`, `UPLOAD`, `PEER`, `SHARE`, `HASH`, `CODEC`, `SECURITY`, `IPFILTER`, `NAT`, `DAEMON`, `INSTALL`, `RUNNER`, `TEST`.
-
-Python-код использует проектный logger:
+Пример:
 
 ```python
 from amuled_v2.logging_setup import LogTags, get_tagged_logger
 
-log = get_tagged_logger(LogTags.DOWNLOAD, "core.transfer.download")
-log.debug("Block stored: file=%s, start=%d, length=%d", file_hash, start, length)
+log = get_tagged_logger(LogTags.KAD, "core.kad.search")
+log.info("kad search done: results=%d, nodes=%d", results, nodes)
 ```
 
-JSONL-записи можно фильтровать напрямую по полю `tag`.
+JSONL-записи фильтруются напрямую по полю `tag`.
 
-### Bundled базовые ресурсы
+### Базовые ресурсы
 
-После клонирования проект самодостаточен. В базовый дистрибутив входят только публичные сетевые/bootstrap-ресурсы:
+Репозиторий самодостаточен после клонирования. В комплекте публичные сетевые/бутстрап-данные:
 
 - `assets/v1/server.met`
 - `assets/v1/nodes.dat`
@@ -302,25 +278,32 @@ JSONL-записи можно фильтровать напрямую по по�
 - `assets/v1/ipfilter.dat`
 - `assets/v1/ipfilter_static.dat`
 
-Метаданные шаринга, списки общих каталогов, сгенерированный конфиг, DuckDB-состояние, логи и состояние частичных закачек приватны. Они игнорируются Git и должны создаваться локально через `share add` или импортироваться явно только из собственных legacy-файлов.
+Метаданные share-файлов, списки каталогов, сгенерированная конфигурация, состояние DuckDB, логи, KAD-кеш узлов и состояние частичных загрузок — приватные. Они игнорируются Git и генерируются локально через `share add`, скрипты прогрева или импортируются из ваших собственных legacy-файлов.
 
 ### Roadmap
 
-Активный протокольный путь:
+Завершённые станции разработки:
 
-1. ED2K GLOBAL UDP search по списку серверов.
-2. Persistence источников и их lifecycle.
-3. Kademlia bootstrap, routing и KAD keyword search.
-4. Unified search-result model для SERVER, GLOBAL и KAD.
-5. Очередь закачек, part files, сборка блоков и resume.
-6. Peer transfer, upload slots и очереди.
-7. Security, obfuscation, IP filter, GeoIP, UPnP/NAT-PMP.
-8. Длительная live-network стабилизация.
+- Сессия с ED2K-сервером, SERVER/AUTO/GLOBAL-поиск, хранение результатов - **DONE**
+- Жизненный цикл источников (sources ed2k --save) - **DONE**
+- Очередь загрузок, part-файлы, верификация MD4, пиринговый протокол - **DONE**
+- IP-фильтр и blacklist серверов - **DONE**
+- Движок Kademlia (бутстрап, routing, обфускация, keyword-поиск) - **DONE** (живой: 200 результатов/запрос)
 
-Критерии приёмки — в [`docs/roadmap.md`](docs/roadmap.md).
+Активные / следующие станции (WIP/PLANNED):
+
+1. KAD-поиск источников (KADEMLIA2_SEARCH_SOURCE_REQ) и их хранение - **WIP**
+2. Загрузки от KAD-источников end-to-end (верификация MD4) - **PLANNED**
+3. KAD CLI-команды (kad bootstrap/search/status/sources) - **WIP**
+4. Долгоживущая стабилизация сети (прогрев сессии, рост кеша узлов) - **WIP**
+5. Upload-слоты и очереди - **PLANNED**
+6. Входящий KAD-listener, firewall-проверки - **PLANNED**
+7. GeoIP / UPnP-NAT-PMP - **PLANNED**
+
+Заметки ранних сессий хранятся для контекста в docs/roadmap.md - каждая секция там помечена DONE/SOLVED/WIP/DEPRECATED/TODO; живое состояние - в секциях 11a-11c.
 
 ---
 
 ## Лицензия
 
-Apache 2.0. Совместимость и clean-room ограничения описаны в [`docs/LICENSE_POLICY.md`](docs/LICENSE_POLICY.md).
+Apache 2.0. См. [`docs/LICENSE_POLICY.md`](docs/LICENSE_POLICY.md) — политика clean-room совместимости.
