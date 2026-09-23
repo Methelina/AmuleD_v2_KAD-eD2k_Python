@@ -16,7 +16,7 @@ Updated:     2026-09-23
 
 Patch Notes v0.2.0 (Soror L'.L'.):
   [+] Kadabra neighbor memory: rewards from HELLO/PONG/BOOTSTRAP persisted to
-      db\kad_weights.json (shared with CLI searches).
+      the shared db/kad_weights.json store (also fed by CLI searches).
   [+] Bandit-weight batch bias and per-cycle trend display (0-5 chevrons) with
       RTT and Vivaldi prediction.
 
@@ -69,6 +69,7 @@ from amuled_v2.core.kad.runtime import (
     save_kadabra_state,
 )
 from amuled_v2.core.kad.strategies import (
+    KadabraState,
     active_strategy_name,
     get_strategy,
 )
@@ -587,6 +588,7 @@ async def main() -> int:
                         rec["rtt_ewma"] = rtt_tracker.update(key, rtt)
                         vivaldi.update(key, rtt)
             elif op == KADEMLIA2_BOOTSTRAP_RES:
+                kadabra.reward((addr[0], addr[1]), 2.0)
                 try:
                     sender_id, contacts = parse_bootstrap_res(payload)
                 except Exception:
@@ -701,6 +703,7 @@ async def main() -> int:
             )
             mid = len(pool) // 2
             core = strategy(pool[:mid], _stats, rtt_tracker, vivaldi)
+            core = sorted(core, key=lambda kv: -kadabra.weight(kv[0]))
             tail = pool[mid:]
             batch = core[:BATCH] + tail[-BATCH:]
 
@@ -729,6 +732,7 @@ async def main() -> int:
             now = loop.time()
             if now >= state["next_save"]:
                 save_snapshot(nodes, own)
+                save_kadabra_state(kadabra, project_root, decay_factor=0.995)
                 state["last_save"] = time.time()
                 state["next_save"] = now + args.save_s
 
@@ -742,7 +746,7 @@ async def main() -> int:
                 nodes, own, bound_port, strategy_name, rtt_tracker, state
             )
 
-            # per-cycle console print (verbose only)
+            now_weights = dict(kadabra.weights)
             if args.verbose:
                 uptime_s = int(time.time() - state["started_at"])
                 mm, ss = divmod(uptime_s, 60)
@@ -777,6 +781,68 @@ async def main() -> int:
                     flush=True,
                 )
 
+                top_items = [
+                    (k, v)
+                    for k, v in now_weights.items()
+                    if v > KadabraState.BASE * 1.05
+                ]
+                if top_items:
+                    top_items.sort(key=lambda kv: -kv[1])
+                    top_entries = []
+                    for key, w in top_items[:5]:
+                        ip, udp_port = key
+                        trend = w - prev_weights.get(key, 1.0)
+                        prev_w = prev_weights.get(key, 1.0)
+                        if prev_w > 0:
+                            ratio = abs(trend) / max(abs(prev_w), 1e-6)
+                            n = min(5, max(1, int(round(ratio * 5))))
+                        else:
+                            n = 1
+                        if trend > 0:
+                            arrow = ">"
+                        elif trend < 0:
+                            arrow = "<"
+                        else:
+                            arrow = "-"
+                        chevrons = (arrow * n).ljust(5, "-")
+                        now_rtt = rtt_tracker._ewma.get(key)
+                        prev_rtt = prev_ewma.get(key)
+                        if now_rtt is not None:
+                            rtt_str = str(int(now_rtt))
+                            if prev_rtt is not None:
+                                if now_rtt < prev_rtt:
+                                    rtt_char = "/"
+                                elif now_rtt > prev_rtt:
+                                    rtt_char = "\\"
+                                else:
+                                    rtt_char = "="
+                            else:
+                                rtt_char = "="
+                        else:
+                            rtt_str = "--"
+                            rtt_char = ""
+                        try:
+                            v_rtt = int(vivaldi.predict(key))
+                            v_str = str(v_rtt)
+                        except Exception:
+                            v_str = "--"
+                        top_entries.append(
+                            "%s:%d %s w=%.1f rtt=%sms%s v=%sms"
+                            % (ip, udp_port, chevrons, w, rtt_str, rtt_char, v_str)
+                        )
+                    print(
+                        "[kad-spider] top: " + " | ".join(top_entries),
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[kad-spider] top: (no rewarded neighbors yet)",
+                        flush=True,
+                    )
+
+                prev_weights = now_weights
+                prev_ewma = dict(rtt_tracker._ewma)
+
             # reset per-cycle counters
             state["new_nodes"] = 0
             state["hello_res"] = 0
@@ -795,6 +861,7 @@ async def main() -> int:
         except Exception:
             pass
         save_snapshot(nodes, own)
+        save_kadabra_state(kadabra, project_root, decay_factor=1.0)
         _write_status(
             nodes, own, bound_port, strategy_name, rtt_tracker, state
         )
