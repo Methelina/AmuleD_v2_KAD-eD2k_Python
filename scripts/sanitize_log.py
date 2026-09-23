@@ -85,15 +85,27 @@ def _sanitize_line(line: str) -> str:
     return redacted
 
 
+def _read_text(path: Path) -> str:
+    """Read text with BOM detection (eMule пишет логи в UTF-16 LE)."""
+    raw = path.read_bytes()
+    if raw.startswith(b"\xff\xfe"):
+        return raw.decode("utf-16")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp1251", errors="replace")
+
+
 def sanitize_file(path: Path, out_path: Path | None = None) -> None:
     out_path = out_path or path.with_suffix(path.suffix + ".clean.txt")
     flagged = 0
     clean = 0
     by_marker: dict[str, int] = {}
-    with path.open("r", encoding="utf-8", errors="replace") as src, out_path.open(
-        "w", encoding="utf-8"
-    ) as dst:
-        for number, line in enumerate(src, 1):
+    text = _read_text(path)
+    with out_path.open("w", encoding="utf-8") as dst:
+        for number, line in enumerate(text.splitlines(keepends=True), 1):
             # Имя в кавычках звёздочками ВСЕГДА (нам неважно, что там) --
             # маркер лишь добавляет строке префикс [REDACTED] и счётчик.
             marker = matched_marker(line)
