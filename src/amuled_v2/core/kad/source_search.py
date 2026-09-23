@@ -369,6 +369,7 @@ async def kad_file_source_search(
     reasked = False
     sources: dict[Tuple[bytes], KadFileSource] = {}
     seen_sources: set[Tuple[bytes, Tuple[str, int]]] = set()
+    rewards: dict[Tuple[str, int], float] = {}
 
     sock.setblocking(False)
     hard_deadline = start + timeout
@@ -522,6 +523,7 @@ async def kad_file_source_search(
                 routing.mark_alive(src_ip, src_port)
                 responded[rdist] = True
                 last_progress = time.monotonic()
+                rewards[(src_ip, src_port)] = rewards.get((src_ip, src_port), 0.0) + 2.0
                 if reward_hook is not None:
                     reward_hook((src_ip, src_port), 2.0)
                 for source_id, fields in entries:
@@ -591,6 +593,9 @@ async def kad_file_source_search(
                 reward_hook(
                     (src_ip, src_port), 1.0 if provided_closer else 0.2
                 )
+            rewards[(src_ip, src_port)] = rewards.get((src_ip, src_port), 0.0) + (
+                1.0 if provided_closer else 0.2
+            )
             responded[rdist] = provided_closer
 
             if (src_ip, src_port) not in asked_source:
@@ -618,6 +623,69 @@ async def kad_file_source_search(
                 len(asked_source),
                 len(sources),
             )
+
+        # --- delayed re-ask pass (neighbor-memory rewards) -----------------
+        # Give the top-rewarded responders a settle pause (their k-buckets
+        # refresh on minutes scale), then ask them once more before giving
+        # the sources back.
+        top = sorted(rewards, key=lambda k: -rewards[k])[:3]
+        if top and len(sources) < max_sources:
+            await asyncio.sleep(min(3.0, max(1.0, idle_extend / 3)))
+            sreq = (
+                bytes((KAD_PROTOCOL, KADEMLIA2_SEARCH_SOURCE_REQ))
+                + build_search_source_req(target, file_size)
+            )
+            for key in top:
+                await _send_dgram(sock, sreq, key)
+                log.info(
+                    "re-ask rewarded node: remote=%s:%d reward=%.1f",
+                    key[0],
+                    key[1],
+                    rewards[key],
+                )
+            collect_deadline = time.monotonic() + 5.0
+            while time.monotonic() < collect_deadline and len(sources) < max_sources:
+                datagram = await _recv_dgram(sock, 1.0)
+                if datagram is None:
+                    continue
+                data, src_addr = datagram
+                if addr_to_dist.get((src_addr[0], src_addr[1])) is None:
+                    continue
+                try:
+                    protocol, opcode, payload = parse_kad_packet(data)
+                    if protocol == 0xE5:
+                        payload = zlib.decompress(payload)
+                        protocol = 0xE4
+                except (KadPacketError, zlib.error):
+                    continue
+                if opcode != KADEMLIA2_SEARCH_RES:
+                    continue
+                try:
+                    entries = parse_search_res_source_entries(payload)
+                except KadSearchError:
+                    continue
+                routing.mark_alive(src_addr[0], src_addr[1])
+                last_progress = time.monotonic()
+                for source_id, fields in entries:
+                    dedup_key = (source_id, (fields["ip"], fields["tcp_port"]))
+                    if dedup_key in seen_sources:
+                        continue
+                    seen_sources.add(dedup_key)
+                    sources[source_id] = KadFileSource(
+                        file_hash=file_hash,
+                        source_id=source_id,
+                        source_type=fields["source_type"],
+                        ip=fields["ip"],
+                        tcp_port=fields["tcp_port"],
+                        udp_port=fields["udp_port"],
+                        buddy_ip=fields["buddy_ip"],
+                        buddy_port=fields["buddy_port"],
+                        buddy_hash=fields["buddy_hash"],
+                        crypt_options=fields["crypt_options"],
+                    )
+                    if len(sources) >= max_sources:
+                        break
+
     finally:
         sock.close()
 

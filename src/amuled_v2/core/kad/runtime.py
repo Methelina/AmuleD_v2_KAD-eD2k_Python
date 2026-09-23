@@ -28,13 +28,20 @@ from pathlib import Path
 from typing import Any
 
 from amuled_v2.core.kad.nodes_dat import KadNodeInfo
+from amuled_v2.core.kad.strategies import KadabraState
 from amuled_v2.core.kad.packets import KadUInt128
 from amuled_v2.core.kad.routing import RoutingZone
 from amuled_v2.logging_setup import LogTags, get_tagged_logger
 
 log = get_tagged_logger(LogTags.KAD, "core.kad.runtime")
 
-__all__ = ["KadRuntime", "load_kad_runtime", "bootstrap_runtime"]
+__all__ = [
+    "KadRuntime",
+    "load_kad_runtime",
+    "bootstrap_runtime",
+    "load_kadabra_state",
+    "save_kadabra_state",
+]
 
 
 @dataclass
@@ -286,3 +293,47 @@ async def bootstrap_runtime(
         added,
     )
     return len(boot.live_nodes)
+
+
+def _weights_file(root: str | Path | None = None) -> Path:
+    """Path of the persistent cross-search neighbor-weight store."""
+    base = _resolve_root(root) if root is not None else _resolve_root(None)
+    return base / "db" / "kad_weights.json"
+
+
+def load_kadabra_state(root: str | Path | None = None) -> KadabraState:
+    """Load the persistent neighbor-weight memory (db/kad_weights.json).
+
+    Weights accumulate across searches AND across the spider daemon: a node
+    that systematically answers and shares contacts stays high-weight, so
+    both the search re-ask pass and the spider batch selection prefer it.
+    Missing/corrupt file -> fresh state (never fatal).
+    """
+    path = _weights_file(root)
+    state = KadabraState()
+    if path.exists():
+        try:
+            state.load(json.loads(path.read_text(encoding="utf-8")))
+            log.info("kadabra weights loaded: file=%s entries=%d", path, len(state.weights))
+        except Exception as exc:
+            log.warning("kadabra weights load failed: file=%s error=%s", path, exc)
+    return state
+
+
+def save_kadabra_state(
+    state: KadabraState,
+    root: str | Path | None = None,
+    *,
+    decay_factor: float = 0.99,
+) -> None:
+    """Apply slow decay and atomically persist the neighbor weights."""
+    state.decay(decay_factor)
+    path = _weights_file(root)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(state.export(), indent=1), encoding="utf-8")
+        os.replace(tmp, path)
+        log.debug("kadabra weights saved: file=%s entries=%d", path, len(state.weights))
+    except Exception as exc:
+        log.warning("kadabra weights save failed: file=%s error=%s", path, exc)

@@ -1091,13 +1091,17 @@ def _cmd_sources_ed2k(args: argparse.Namespace) -> int:
 
 
 async def _run_kad_search(args: argparse.Namespace) -> dict:
-    from amuled_v2.core.kad.runtime import load_kad_runtime
+    from amuled_v2.core.kad.runtime import (
+        bootstrap_runtime,
+        load_kad_runtime,
+        load_kadabra_state,
+        save_kadabra_state,
+    )
     from amuled_v2.core.kad.search import KadSearchError, kad_keyword_search
 
     rt = load_kad_runtime()
-    from amuled_v2.core.kad.runtime import bootstrap_runtime
-
     await bootstrap_runtime(rt, local_port=0)
+    kadabra = load_kadabra_state()
     query = getattr(args, "query", None)
     report = await kad_keyword_search(
         query,
@@ -1107,7 +1111,9 @@ async def _run_kad_search(args: argparse.Namespace) -> dict:
         timeout=args.timeout,
         max_results=args.limit,
         local_port=0,
+        reward_hook=kadabra.reward,
     )
+    save_kadabra_state(kadabra)
     results = [
         {
             "hash": item.file_hash.hex().upper(),
@@ -1214,7 +1220,12 @@ def _cmd_kad_search(args: argparse.Namespace) -> int:
 
 
 async def _run_kad_sources(args: argparse.Namespace) -> dict:
-    from amuled_v2.core.kad.runtime import load_kad_runtime
+    from amuled_v2.core.kad.runtime import (
+        bootstrap_runtime,
+        load_kad_runtime,
+        load_kadabra_state,
+        save_kadabra_state,
+    )
     from amuled_v2.core.kad.source_search import kad_file_source_search
 
     try:
@@ -1229,9 +1240,8 @@ async def _run_kad_sources(args: argparse.Namespace) -> dict:
         return {"status": "error", "reason": "hash must decode to 16 bytes"}
 
     rt = load_kad_runtime()
-    from amuled_v2.core.kad.runtime import bootstrap_runtime
-
     await bootstrap_runtime(rt, local_port=0)
+    kadabra = load_kadabra_state()
     report = await kad_file_source_search(
         file_hash,
         file_size=args.size,
@@ -1241,7 +1251,9 @@ async def _run_kad_sources(args: argparse.Namespace) -> dict:
         timeout=args.timeout,
         max_sources=args.limit,
         local_port=0,
+        reward_hook=kadabra.reward,
     )
+    save_kadabra_state(kadabra)
     sources = [src.to_dict() for src in report.sources]
     saved = 0
     save_error = None

@@ -119,9 +119,10 @@ class KadabraState:
         weight *= math.exp(self.ETA * value)
         self.weights[key] = min(weight, 50.0)
 
-    def decay(self) -> None:
+    def decay(self, factor: float | None = None) -> None:
+        f = self.DECAY if factor is None else factor
         for key in list(self.weights):
-            self.weights[key] *= self.DECAY
+            self.weights[key] *= f
 
     def weight(self, key: Tuple[str, int]) -> float:
         return self.weights.get(key, self.BASE)

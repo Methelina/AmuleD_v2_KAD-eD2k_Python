@@ -586,6 +586,7 @@ async def kad_keyword_search(
     addr_to_dist: dict[Tuple[str, int], int] = {}
     reasked = False
     results: dict[bytes, KadSearchResultItem] = {}
+    rewards: dict[Tuple[str, int], float] = {}
 
     sock.setblocking(False)
     hard_deadline = start + timeout
@@ -741,6 +742,7 @@ async def kad_keyword_search(
                 routing.mark_alive(src_ip, src_port)
                 responded[rdist] = True
                 last_progress = time.monotonic()
+                rewards[(src_ip, src_port)] = rewards.get((src_ip, src_port), 0.0) + 2.0
                 if reward_hook is not None:
                     reward_hook((src_ip, src_port), 2.0)
                 for item in answers:
@@ -793,6 +795,9 @@ async def kad_keyword_search(
                 reward_hook(
                     (src_ip, src_port), 1.0 if provided_closer else 0.2
                 )
+            rewards[(src_ip, src_port)] = rewards.get((src_ip, src_port), 0.0) + (
+                1.0 if provided_closer else 0.2
+            )
             responded[rdist] = provided_closer
 
             # Send the keyword search to this freshly responded node.
@@ -816,6 +821,54 @@ async def kad_keyword_search(
                 len(asked_search),
                 len(results),
             )
+
+        # --- delayed re-ask pass (neighbor-memory rewards) -----------------
+        # Give the top-rewarded responders a settle pause (their k-buckets
+        # refresh on minutes scale), then ask them once more before giving
+        # the results back.
+        top = sorted(rewards, key=lambda k: -rewards[k])[:3]
+        if top and len(results) < max_results:
+            await asyncio.sleep(min(3.0, max(1.0, idle_extend / 3)))
+            skr = (
+                bytes((KAD_PROTOCOL, KADEMLIA2_SEARCH_KEY_REQ))
+                + _build_search_key_req(target)
+            )
+            for key in top:
+                await _send_dgram(sock, skr, key)
+                log.info(
+                    "re-ask rewarded node: remote=%s:%d reward=%.1f",
+                    key[0],
+                    key[1],
+                    rewards[key],
+                )
+            collect_deadline = time.monotonic() + 5.0
+            while time.monotonic() < collect_deadline and len(results) < max_results:
+                datagram = await _recv_dgram(sock, 1.0)
+                if datagram is None:
+                    continue
+                data, src_addr = datagram
+                if addr_to_dist.get((src_addr[0], src_addr[1])) is None:
+                    continue
+                try:
+                    protocol, opcode, payload = parse_kad_packet(data)
+                    if protocol == 0xE5:
+                        payload = zlib.decompress(payload)
+                        protocol = 0xE4
+                except (KadPacketError, zlib.error):
+                    continue
+                if opcode != KADEMLIA2_SEARCH_RES:
+                    continue
+                try:
+                    answers = _parse_search_res_answers(payload)
+                except KadSearchError:
+                    continue
+                routing.mark_alive(src_addr[0], src_addr[1])
+                last_progress = time.monotonic()
+                for item in answers:
+                    if item.file_hash not in results:
+                        results[item.file_hash] = item
+                        if len(results) >= max_results:
+                            break
 
     finally:
         sock.close()
