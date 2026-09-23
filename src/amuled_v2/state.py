@@ -60,7 +60,7 @@ try:
 except ImportError:  # pragma: no cover - exercised only without DuckDB
     _HAS_DUCKDB = False
 
-_CURRENT_SCHEMA_VERSION = 4
+_CURRENT_SCHEMA_VERSION = 5
 _JSON_STORE: dict[str, Any] | None = None
 
 
@@ -211,6 +211,24 @@ def _open_duckdb_with_retry(database: Path, *, attempts: int = 5, delay: float =
     raise RuntimeError(f"cannot open DuckDB state {database}: {last_error}") from last_error
 
 
+def _migrate_v5(con: Any) -> None:
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS downloads (
+            file_hash      VARCHAR PRIMARY KEY,
+            name           VARCHAR NOT NULL,
+            size           BIGINT NOT NULL,
+            part_path      VARCHAR NOT NULL,
+            status         VARCHAR NOT NULL,
+            downloaded     BIGINT NOT NULL DEFAULT 0,
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    con.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (5)"
+    )
+
+
 def _init_duckdb(con: Any) -> None:
     """Apply all pending schema migrations."""
     log.debug("Initializing DuckDB schema")
@@ -228,6 +246,10 @@ def _init_duckdb(con: Any) -> None:
     if current < 4:
         _migrate_v4(con)
         log.info("DuckDB schema migrated to version 4")
+        current = 4
+    if current < 5:
+        _migrate_v5(con)
+        log.info("DuckDB schema migrated to version 5")
     else:
         log.debug("DuckDB schema is current")
 
@@ -776,6 +798,126 @@ class StateBackend:
             "high_id_sources": high_id,
             "low_id_sources": low_id,
         }
+
+    def add_download(
+        self,
+        *,
+        file_hash: str,
+        name: str,
+        size: int,
+        part_path: str,
+        status: str,
+    ) -> None:
+        """Insert one queued download row."""
+        con = self._require_duckdb()
+        con.execute(
+            """
+            INSERT INTO downloads (
+                file_hash, name, size, part_path, status, downloaded
+            ) VALUES (?, ?, ?, ?, ?, 0)
+            """,
+            (file_hash.upper(), name, size, part_path, status),
+        )
+        log.info(
+            "Added download: hash=%s, name=%r, size=%d, status=%s",
+            file_hash,
+            name,
+            size,
+            status,
+        )
+
+    def get_download(self, file_hash: str) -> dict[str, Any] | None:
+        con = self._require_duckdb()
+        row = con.execute(
+            """
+            SELECT file_hash, name, size, part_path, status, downloaded,
+                   created_at, updated_at
+            FROM downloads WHERE lower(file_hash) = ?
+            """,
+            (file_hash.lower(),),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "hash": row[0],
+            "name": row[1],
+            "size": row[2],
+            "part_path": row[3],
+            "status": row[4],
+            "downloaded": row[5],
+            "created_at": str(row[6]),
+            "updated_at": str(row[7]),
+        }
+
+    def list_downloads(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        con = self._require_duckdb()
+        rows = con.execute(
+            """
+            SELECT file_hash, name, size, part_path, status, downloaded,
+                   created_at, updated_at
+            FROM downloads
+            ORDER BY created_at, file_hash
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "hash": row[0],
+                "name": row[1],
+                "size": row[2],
+                "part_path": row[3],
+                "status": row[4],
+                "downloaded": row[5],
+                "created_at": str(row[6]),
+                "updated_at": str(row[7]),
+            }
+            for row in rows
+        ]
+
+    def set_download_status(self, file_hash: str, status: str) -> bool:
+        con = self._require_duckdb()
+        con.execute(
+            """
+            UPDATE downloads
+            SET status = ?, updated_at = get_current_timestamp()
+            WHERE lower(file_hash) = ?
+            """,
+            (status, file_hash.lower()),
+        )
+        return con.execute(
+            "SELECT COUNT(*) FROM downloads WHERE lower(file_hash) = ?",
+            (file_hash.lower(),),
+        ).fetchone()[0] > 0
+
+    def update_download_progress(
+        self,
+        file_hash: str,
+        *,
+        downloaded_bytes: int,
+        status: str,
+    ) -> None:
+        con = self._require_duckdb()
+        con.execute(
+            """
+            UPDATE downloads
+            SET downloaded = ?, status = ?, updated_at = get_current_timestamp()
+            WHERE lower(file_hash) = ?
+            """,
+            (downloaded_bytes, status, file_hash.lower()),
+        )
+
+    def remove_download(self, file_hash: str) -> bool:
+        con = self._require_duckdb()
+        existed = con.execute(
+            "SELECT COUNT(*) FROM downloads WHERE lower(file_hash) = ?",
+            (file_hash.lower(),),
+        ).fetchone()[0] > 0
+        con.execute(
+            "DELETE FROM downloads WHERE lower(file_hash) = ?",
+            (file_hash.lower(),),
+        )
+        return existed
 
     def save_shared_files(self, records: Iterable["SharedFile"]) -> int:
         con = self._require_duckdb()

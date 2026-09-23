@@ -1131,6 +1131,169 @@ def _cmd_sources_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _download_queue():
+    from amuled_v2.core.download import DownloadQueue
+    from amuled_v2.paths import INCOMING_DIR, TEMP_DIR
+
+    state = get_state()
+    state.connect()
+    return DownloadQueue(
+        state=state,
+        temp_dir=TEMP_DIR,
+        incoming_dir=INCOMING_DIR,
+    )
+
+
+def _cmd_download_add(args: argparse.Namespace) -> int:
+    from amuled_v2.core.ed2k import parse_ed2k_file_link
+
+    log.debug(f"Command started: name=download-add, link={args.link!r}")
+    parsed = parse_ed2k_file_link(args.link)
+    queue = _download_queue()
+    entry = queue.add(
+        file_hash=parsed.file_hash.hex(),
+        name=parsed.name,
+        size=parsed.size,
+    )
+    result = {"status": "ok", "action": "add", **entry}
+    if args.json:
+        _print_json(result)
+    else:
+        _print_text("Download added", [
+            f"status : ok",
+            f"hash   : {entry['hash']}",
+            f"name   : {entry['name']}",
+            f"size   : {entry['size']}",
+            f"queue  : {entry['status']}",
+        ])
+    log.info(f"Download add completed: hash={entry['hash']}")
+    return 0
+
+
+def _cmd_download_run(args: argparse.Namespace) -> int:
+    from amuled_v2.core.download import DownloadRunner
+
+    log.debug(
+        f"Command started: name=download-run, hash={args.hash}, "
+        f"max_peers={args.max_peers}, verify={not args.no_verify}"
+    )
+    queue = _download_queue()
+    runner = DownloadRunner(
+        queue,
+        local_port=int(load_config(save_if_missing=True).get("network", {}).get("client_tcp_port", 8089)),
+        max_peers=args.max_peers,
+        queue_wait_timeout=args.queue_wait,
+    )
+
+    def _progress(received: int, total: int, blocks: int) -> None:
+        from amuled_v2.progressbar import render_progress
+
+        _progress_line(
+            f"{render_progress(0, total, received, 30)} download "
+            f"{received}/{total} bytes, blocks={blocks}"
+        )
+
+    result = asyncio.run(
+        runner.run(
+            args.hash,
+            verify=not args.no_verify,
+            progress_callback=None if args.json else _progress,
+        )
+    )
+    _progress_done()
+    result = {"status": result.get("status", "ok"), **result}
+    if args.json:
+        _print_json(result)
+    else:
+        lines = [f"status : {result['status']}"]
+        outcome = result.get("outcome")
+        if isinstance(outcome, dict):
+            lines.append(
+                f"peer   : received={outcome.get('bytes_received')}, "
+                f"blocks={outcome.get('blocks_received')}, "
+                f"detail={outcome.get('detail')}"
+            )
+        finalized = result.get("finalized")
+        if isinstance(finalized, dict):
+            lines.append(f"target : {finalized.get('target')}")
+        _print_text("Download run", lines)
+    log.info(f"Download run completed: hash={args.hash}, status={result['status']}")
+    return 0 if result["status"] in ("complete", "already_complete") else 1
+
+
+def _cmd_download_list(args: argparse.Namespace) -> int:
+    queue = _download_queue()
+    entries = queue.list(limit=args.limit)
+    result = {
+        "status": "ok",
+        "downloads": entries,
+        "download_count": len(entries),
+    }
+    if args.json:
+        _print_json(result)
+    else:
+        lines = [
+            "status    : ok",
+            f"downloads : {len(entries)}",
+        ]
+        for entry in entries:
+            lines.append(
+                f"  {entry['hash']} [{entry['status']}] "
+                f"{entry['downloaded']}/{entry['size']} {entry['name']}"
+            )
+        _print_text("Download queue", lines)
+    log.info(f"Download list completed: count={len(entries)}")
+    return 0
+
+
+def _download_lifecycle(args: argparse.Namespace, action: str) -> int:
+    queue = _download_queue()
+    if action == "pause":
+        entry = queue.pause(args.hash)
+    elif action == "resume":
+        entry = queue.resume(args.hash)
+    elif action == "start":
+        entry = queue.start(args.hash)
+    else:
+        raise ValueError(f"unknown lifecycle action: {action}")
+    result = {"status": "ok", "action": action, **entry}
+    if args.json:
+        _print_json(result)
+    else:
+        _print_text(f"Download {action}", [
+            f"status : ok",
+            f"hash   : {entry['hash']}",
+            f"name   : {entry['name']}",
+            f"queue  : {entry['status']}",
+        ])
+    log.info(f"Download {action} completed: hash={entry['hash']}")
+    return 0
+
+
+def _cmd_download_pause(args: argparse.Namespace) -> int:
+    return _download_lifecycle(args, "pause")
+
+
+def _cmd_download_resume(args: argparse.Namespace) -> int:
+    return _download_lifecycle(args, "resume")
+
+
+def _cmd_download_cancel(args: argparse.Namespace) -> int:
+    queue = _download_queue()
+    summary = queue.cancel(args.hash, keep_files=args.keep_files)
+    result = {"status": "ok", **summary}
+    if args.json:
+        _print_json(result)
+    else:
+        _print_text("Download cancelled", [
+            f"status        : ok",
+            f"hash          : {summary['hash']}",
+            f"files_removed : {summary['files_removed']}",
+        ])
+    log.info(f"Download cancel completed: hash={summary['hash']}")
+    return 0
+
+
 # ------------------------------------------------------------------
 # Import command handlers
 # ------------------------------------------------------------------
@@ -1715,6 +1878,89 @@ def build_parser() -> argparse.ArgumentParser:
         help="Report what would be pruned without deleting.",
     )
     p_sources_prune.set_defaults(func=_cmd_sources_prune)
+
+    # --- download ---
+    p_download = sub.add_parser(
+        "download",
+        help="Manage the download queue.",
+        parents=parents,
+    )
+    download_sub = p_download.add_subparsers(dest="download_command", metavar="<action>")
+
+    p_download_add = download_sub.add_parser(
+        "add",
+        help="Queue a download from a real ed2k:// file link.",
+        parents=parents,
+    )
+    p_download_add.add_argument("link", help="ed2k://|file|... link.")
+    p_download_add.set_defaults(func=_cmd_download_add)
+
+    p_download_run = download_sub.add_parser(
+        "run",
+        help="Download one queued file from its known sources.",
+        parents=parents,
+    )
+    p_download_run.add_argument("hash", help="ED2K file hash (32 hexadecimal digits).")
+    p_download_run.add_argument(
+        "--max-peers",
+        type=int,
+        default=3,
+        help="Maximum sequential peers to try.",
+    )
+    p_download_run.add_argument(
+        "--queue-wait",
+        type=float,
+        default=60.0,
+        help="Upload-slot wait per peer in seconds.",
+    )
+    p_download_run.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Skip the MD4 verification on finalize.",
+    )
+    p_download_run.set_defaults(func=_cmd_download_run)
+
+    p_download_list = download_sub.add_parser(
+        "list",
+        help="List queued downloads.",
+        parents=parents,
+    )
+    p_download_list.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Maximum rows to return.",
+    )
+    p_download_list.set_defaults(func=_cmd_download_list)
+
+    p_download_pause = download_sub.add_parser(
+        "pause",
+        help="Pause one download.",
+        parents=parents,
+    )
+    p_download_pause.add_argument("hash", help="ED2K file hash (32 hexadecimal digits).")
+    p_download_pause.set_defaults(func=_cmd_download_pause)
+
+    p_download_resume = download_sub.add_parser(
+        "resume",
+        help="Resume one paused download.",
+        parents=parents,
+    )
+    p_download_resume.add_argument("hash", help="ED2K file hash (32 hexadecimal digits).")
+    p_download_resume.set_defaults(func=_cmd_download_resume)
+
+    p_download_cancel = download_sub.add_parser(
+        "cancel",
+        help="Remove a download and its part files.",
+        parents=parents,
+    )
+    p_download_cancel.add_argument("hash", help="ED2K file hash (32 hexadecimal digits).")
+    p_download_cancel.add_argument(
+        "--keep-files",
+        action="store_true",
+        help="Keep the .part files on disk.",
+    )
+    p_download_cancel.set_defaults(func=_cmd_download_cancel)
 
     # --- ipfilter ---
     p_ipfilter = sub.add_parser(
