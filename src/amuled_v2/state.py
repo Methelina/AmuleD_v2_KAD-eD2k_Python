@@ -60,7 +60,7 @@ try:
 except ImportError:  # pragma: no cover - exercised only without DuckDB
     _HAS_DUCKDB = False
 
-_CURRENT_SCHEMA_VERSION = 5
+_CURRENT_SCHEMA_VERSION = 6
 _JSON_STORE: dict[str, Any] | None = None
 
 
@@ -229,6 +229,24 @@ def _migrate_v5(con: Any) -> None:
     )
 
 
+def _migrate_v6(con: Any) -> None:
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS server_blacklist (
+            ip             VARCHAR NOT NULL,
+            port           UINTEGER NOT NULL,
+            failures       INTEGER NOT NULL DEFAULT 0,
+            last_error     VARCHAR,
+            blacklisted_at TIMESTAMP,
+            blacklisted_until TIMESTAMP,
+            updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (ip, port)
+        )
+    """)
+    con.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (6)"
+    )
+
+
 def _init_duckdb(con: Any) -> None:
     """Apply all pending schema migrations."""
     log.debug("Initializing DuckDB schema")
@@ -250,6 +268,10 @@ def _init_duckdb(con: Any) -> None:
     if current < 5:
         _migrate_v5(con)
         log.info("DuckDB schema migrated to version 5")
+        current = 5
+    if current < 6:
+        _migrate_v6(con)
+        log.info("DuckDB schema migrated to version 6")
     else:
         log.debug("DuckDB schema is current")
 
@@ -918,6 +940,119 @@ class StateBackend:
             (file_hash.lower(),),
         )
         return existed
+
+    def record_server_failure(
+        self,
+        ip: str,
+        port: int,
+        *,
+        reason: str,
+        threshold: int = 3,
+        cooldown_hours: float = 0.5,
+    ) -> bool:
+        """Increment one server's failure count; blacklist at threshold.
+
+        Returns True when this call put the server on the blacklist.
+        """
+        con = self._require_duckdb()
+        con.execute(
+            """
+            INSERT INTO server_blacklist (ip, port, failures, last_error, updated_at)
+            VALUES (?, ?, 1, ?, get_current_timestamp())
+            ON CONFLICT (ip, port) DO UPDATE SET
+                failures = CASE
+                    WHEN server_blacklist.blacklisted_until IS NOT NULL
+                         AND server_blacklist.blacklisted_until > get_current_timestamp()
+                    THEN server_blacklist.failures
+                    WHEN server_blacklist.blacklisted_until IS NOT NULL
+                         AND server_blacklist.blacklisted_until <= get_current_timestamp()
+                    THEN 1
+                    ELSE server_blacklist.failures + 1
+                END,
+                last_error = excluded.last_error,
+                updated_at = get_current_timestamp()
+            """,
+            (ip, port, reason),
+        )
+        failures = con.execute(
+            "SELECT failures FROM server_blacklist WHERE ip = ? AND port = ?",
+            (ip, port),
+        ).fetchone()[0]
+        if failures >= threshold:
+            until = datetime.now() + timedelta(hours=cooldown_hours)
+            con.execute(
+                """
+                UPDATE server_blacklist
+                SET blacklisted_at = get_current_timestamp(),
+                    blacklisted_until = ?
+                WHERE ip = ? AND port = ?
+                """,
+                (until, ip, port),
+            )
+            log.warning(
+                "Server blacklisted: ip=%s, port=%d, failures=%d, "
+                "cooldown_hours=%s, reason=%s",
+                ip,
+                port,
+                failures,
+                cooldown_hours,
+                reason,
+            )
+            return True
+        return False
+
+    def record_server_success(self, ip: str, port: int) -> None:
+        """Clear one server's failure history after a working exchange."""
+        con = self._require_duckdb()
+        con.execute(
+            "DELETE FROM server_blacklist WHERE ip = ? AND port = ?",
+            (ip, port),
+        )
+
+    def list_blacklisted_servers(self) -> list[dict[str, Any]]:
+        """Return currently blacklisted servers."""
+        con = self._require_duckdb()
+        rows = con.execute(
+            """
+            SELECT ip, port, failures, last_error, blacklisted_until
+            FROM server_blacklist
+            WHERE blacklisted_until IS NOT NULL
+              AND blacklisted_until > ?
+            ORDER BY blacklisted_until
+            """,
+            (datetime.now(),),
+        ).fetchall()
+        return [
+            {
+                "ip": row[0],
+                "port": row[1],
+                "failures": row[2],
+                "last_error": row[3],
+                "blacklisted_until": str(row[4]),
+            }
+            for row in rows
+        ]
+
+    def list_server_failures(self) -> list[dict[str, Any]]:
+        """Return all tracked servers with their failure counts."""
+        con = self._require_duckdb()
+        rows = con.execute(
+            """
+            SELECT ip, port, failures, last_error, updated_at
+            FROM server_blacklist
+            ORDER BY failures DESC, updated_at DESC
+            """
+        ).fetchall()
+        return [
+            {
+                "ip": row[0],
+                "port": row[1],
+                "failures": row[2],
+                "last_error": row[3],
+                "updated_at": str(row[4]),
+            }
+            for row in rows
+        ]
 
     def save_shared_files(self, records: Iterable["SharedFile"]) -> int:
         con = self._require_duckdb()

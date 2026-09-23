@@ -569,9 +569,12 @@ async def _run_ed2k_search(args: argparse.Namespace) -> dict:
     more_results = False
     resolved_channel = getattr(args, "channel", SearchChannel.SERVER.value)
     published = 0
+    state = get_state()
+    state.connect()
     try:
         await client.connect()
         await client.login()
+        state.record_server_success(host, port)
         connections.update_from_server_client(client)
         published = await _publish_shared_files_to(client)
 
@@ -601,6 +604,16 @@ async def _run_ed2k_search(args: argparse.Namespace) -> dict:
     finally:
         await client.close()
         connections.set_ed2k_connected(False)
+        if not results:
+            # Silence counts as a soft failure for the persistent blacklist;
+            # three consecutive silent searches put the server on cooldown.
+            state.record_server_failure(
+                host,
+                port,
+                reason="search returned no results",
+                threshold=3,
+                cooldown_hours=0.5,
+            )
         if not args.json:
             _progress_done()
 
@@ -997,6 +1010,59 @@ def _cmd_sources_ed2k(args: argparse.Namespace) -> int:
         f"ED2K sources CLI completed: hash={result['hash']}, "
         f"sources={result['source_count']}, saved={result['saved_sources']}"
     )
+    return 0
+
+
+def _cmd_servers_failures(args: argparse.Namespace) -> int:
+    state = get_state()
+    state.connect()
+    blacklisted = state.list_blacklisted_servers()
+    tracked = state.list_server_failures()
+    result = {
+        "status": "ok",
+        "blacklisted": blacklisted,
+        "tracked": tracked,
+        "blacklisted_count": len(blacklisted),
+        "tracked_count": len(tracked),
+    }
+    if args.json:
+        _print_json(result)
+    else:
+        lines = [
+            "status      : ok",
+            f"blacklisted : {len(blacklisted)}",
+            f"tracked     : {len(tracked)}",
+        ]
+        for row in blacklisted:
+            lines.append(
+                f"  BANNED {row['ip']}:{row['port']} failures={row['failures']} "
+                f"until={row['blacklisted_until']} ({row['last_error']})"
+            )
+        for row in tracked:
+            lines.append(
+                f"  TRACK {row['ip']}:{row['port']} failures={row['failures']}"
+            )
+        _print_text("Server reliability", lines)
+    log.info(
+        f"Server failures list completed: blacklisted={len(blacklisted)}, "
+        f"tracked={len(tracked)}"
+    )
+    return 0
+
+
+def _cmd_servers_forgive(args: argparse.Namespace) -> int:
+    state = get_state()
+    state.connect()
+    state.record_server_success(args.ip, args.port)
+    result = {"status": "ok", "ip": args.ip, "port": args.port, "forgiven": True}
+    if args.json:
+        _print_json(result)
+    else:
+        _print_text("Server forgiven", [
+            f"status : ok",
+            f"server : {args.ip}:{args.port}",
+        ])
+    log.info(f"Server forgiven: ip={args.ip}, port={args.port}")
     return 0
 
 
@@ -1961,6 +2027,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep the .part files on disk.",
     )
     p_download_cancel.set_defaults(func=_cmd_download_cancel)
+
+    # --- servers ---
+    p_servers = sub.add_parser(
+        "servers",
+        help="Inspect server reliability and the persistent blacklist.",
+        parents=parents,
+    )
+    servers_sub = p_servers.add_subparsers(dest="servers_command", metavar="<action>")
+
+    p_servers_failures = servers_sub.add_parser(
+        "failures",
+        help="List tracked failures and current blacklist.",
+        parents=parents,
+    )
+    p_servers_failures.set_defaults(func=_cmd_servers_failures)
+
+    p_servers_forgive = servers_sub.add_parser(
+        "forgive",
+        help="Clear failure history for one server.",
+        parents=parents,
+    )
+    p_servers_forgive.add_argument("ip", help="Server IPv4 address.")
+    p_servers_forgive.add_argument("port", type=int, help="Server port.")
+    p_servers_forgive.set_defaults(func=_cmd_servers_forgive)
 
     # --- ipfilter ---
     p_ipfilter = sub.add_parser(
