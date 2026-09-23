@@ -1,46 +1,56 @@
-"""eMule TCP obfuscation handshake (DH key exchange + RC4 stream).
+"""eMule TCP obfuscation handshake (DH key exchange + RC4 stream, BASIC client mode).
 
-Client-side implementation of the eMule/Amule DH-based TCP obfuscation
-layer (``EncryptedStreamSocket.cpp`` -- the ``ECS_PENDING_SERVER`` /
-``ONS_BASIC_SERVER_*`` negotiation path).  When a remote peer has
-``CryptLayerRequested=1`` it silently drops a plaintext ``OP_HELLO``; the
-peer only accepts a DH-obfuscated handshake which this module builds and
-parses.
+This module implements the client-side TCP obfuscation layer used by eMule and
+compatible clients (``EncryptedStreamSocket.cpp``).  Two negotiation modes exist
+on the wire; both are handled here:
 
-Wire format of the DH negotiation (all multi-byte integers little-endian
-on the wire unless noted; CryptoPP::Integer encoding is big-endian):
+1. **DH-based server obfuscation** (``ECS_PENDING_SERVER`` / ``ONS_BASIC_SERVER_*``).
+   When the local client connects to an eMule server with ``CryptLayerRequested=1``
+   the peer only accepts a DH-obfuscated handshake which this module builds and
+   parses.  See :func:`build_dh_request`, :func:`parse_dh_response`,
+   :func:`derive_keys`.
 
-    Client -> Server (DH request):
-        byte  0      : semi-random non-protocol marker (see _not_protocol_marker)
-        bytes 1..96  : G^A mod p  (96-byte big-endian CryptoPP::Integer::Encode)
-        byte  97     : padding length n  (n = rand % 16, range 0..15)
-        bytes 98..   : n random padding bytes
+2. **BASIC client obfuscation** (``ECS_PENDING`` / ``ONS_BASIC_CLIENTB_*``).
+   When the local client connects to a *remote peer* (not a server) with a known
+   16-byte user-hash the receiver already holds, no DH exchange is performed.
+   Instead both sides derive RC4 keys directly from ``MD5(target_userhash ||
+   magic || random_key_part)`` and wrap a short ``MAGICVALUE_SYNC`` handshake.
 
-    Server -> Client (DH response):
-        bytes 0..95  : G^B mod p  (96-byte big-endian shared-secret exponent)
-        bytes 96..99 : MAGICVALUE_SYNC  (uint32 0x835E6FC4, little-endian)
-        byte  100    : encryption methods supported  (0x00 = obfuscation)
-        byte  101    : encryption method preferred   (0x00 = obfuscation)
-        byte  102    : padding length m  (m = rand % 16, range 0..15)
-        bytes 103..  : m random padding bytes
+BASIC client wire format (``ECS_PENDING`` path, ``StartNegotiation(true)``):
 
-Key derivation (per ``ONS_BASIC_SERVER_DHANSWER``):
+    Client -> Peer (BASIC request):
+        plaintext bytes 0-4:
+            byte  0      : semi-random non-protocol marker (see _not_protocol_marker)
+            bytes 1..4   : random_key_part as uint32 LE (m_nRandomKeyPart)
+        encrypted bytes 5.. (RC4 send-stream, 1024-byte keystream drop):
+            bytes 5..8   : MAGICVALUE_SYNC as uint32 LE (0x835E6FC4)
+            byte  9      : encryption method supported (0x00 = ENM_OBFUSCATION)
+            byte 10      : encryption method preferred  (0x00)
+            byte 11      : padding length n (0..15)
+            bytes 12..   : n random padding bytes
 
-    shared = pow(G_B, a, p)          # G^(aB) mod p, 96 bytes big-endian
-    send_key = MD5(shared_96be + MAGICVALUE_REQUESTER)   # requester = 34
-    recv_key = MD5(shared_96be + MAGICVALUE_SERVER)      # server = 203
+    Peer -> Client (BASIC response -- fully encrypted under RC4 recv-stream):
+        bytes 0..3       : MAGICVALUE_SYNC as uint32 LE  (validated; mismatch -> error)
+        byte  4          : encryption method selected (must be 0x00)
+        byte  5          : padding length m (0..255)
+        bytes 6..6+m-1   : m random padding bytes (ignored)
 
-The first 1024 bytes of each RC4 keystream are discarded (``RC4CreateKey``
-with the default ``bSkipDiscard=false`` calls ``RC4Crypt(NULL, NULL, 1024, key)``).
+The first 1024 bytes of each RC4 keystream are discarded (``RC4CreateKey`` with
+the default ``bSkipDiscard=false`` calls ``RC4Crypt(NULL, NULL, 1024, key)``).
+
+Key derivation (BASIC, per ``SetConnectionEncryption``):
+
+    send_key = MD5(target_userhash[16] || MAGICVALUE_REQUESTER(34) || u32 random_key_part LE)
+    recv_key = MD5(target_userhash[16] || MAGICVALUE_SERVER(203)   || u32 random_key_part LE)
 
 Diffie-Hellman parameters (from ``EncryptedStreamSocket.cpp``):
 
     g = 2,  p = dh768_p  (768-bit MODP prime, 96 bytes)
 
 src/amuled_v2/core/peer/obfuscation.py
-Version:     0.1.0
+Version:     0.2.0
 Author:      Soror L.'.L'.
-Updated:     2026-09-23
+Updated:     2026-09-24
 
 Patch Notes v0.1.0 (Soror L.'.L'.):
   [+] Added DH obfuscation request builder (build_dh_request).
@@ -48,6 +58,13 @@ Patch Notes v0.1.0 (Soror L.'.L'.):
   [+] Added key derivation (derive_keys) with MD5 chain per CreateKeys.
   [+] Added Rc4Stream with 1024-byte key-drop.
   [+] Added semi-random padding-length helper.
+
+Patch Notes v0.2.0 (Soror L.'.L'.):
+  [+] Added BASIC client TCP obfuscation handshake (derive_basic_keys,
+      build_basic_client_request, parse_basic_client_response).
+  [FIX] Corrected protocol-marker constants to OP_PACKEDPROT=0xD4 and
+      OP_EMULEPROT=0xC5 (opcodes.h); previous values 0xC0/0xED would cause
+      the semi-random marker to collide with valid protocol bytes -- иначе пир не примет.
 """
 
 from __future__ import annotations
@@ -84,10 +101,13 @@ __all__ = [
     "build_dh_request",
     "parse_dh_response",
     "derive_keys",
+    "derive_basic_keys",
     "Rc4Stream",
     "semirandom_padding_length",
     "generate_dh_private_key",
     "compute_dh_public_key",
+    "build_basic_client_request",
+    "parse_basic_client_response",
 ]
 
 
@@ -127,9 +147,9 @@ DH_PRIVATE_KEY_BITS = 128
 DH_PUBKEY_BYTES = 96
 
 # eMule protocol marker bytes that the semi-random marker must NOT collide with.
-PROTOCOL_MARKER_EDONKEY = 0xE3   # OP_EDONKEYPROT -- иначе пир не примет.
-PROTOCOL_MARKER_PACKED = 0xC0     # OP_PACKEDPROT -- иначе пир не примет.
-PROTOCOL_MARKER_EMULE = 0xED      # OP_EMULEPROT  -- иначе пир не примет.
+PROTOCOL_MARKER_EDONKEY = 0xE3   # OP_EDONKEYPROT (opcodes.h) -- иначе пир не примет.
+PROTOCOL_MARKER_PACKED = 0xD4     # OP_PACKEDPROT (opcodes.h) -- иначе пир не примет.
+PROTOCOL_MARKER_EMULE = 0xC5      # OP_EMULEPROT (opcodes.h)  -- иначе пир не примет.
 
 _PROHIBITED_MARKERS = frozenset(
     {PROTOCOL_MARKER_EDONKEY, PROTOCOL_MARKER_PACKED, PROTOCOL_MARKER_EMULE}
@@ -462,6 +482,244 @@ def derive_keys(
 def _md5_digest(data: bytes) -> bytes:
     """Return the 16-byte raw MD5 digest of *data*."""
     return hashlib.md5(data).digest()
+
+
+# ---------------------------------------------------------------------------
+# BASIC client obfuscation (ECS_PENDING / ONS_BASIC_CLIENTB_*)
+# ---------------------------------------------------------------------------
+
+
+def derive_basic_keys(target_userhash: bytes, random_key_part: int) -> NegotiationKeys:
+    """Derive BASIC-mode RC4 keys from the peer's user-hash and random key part.
+
+    Mirrors ``SetConnectionEncryption`` (the ``ECS_PENDING`` branch, lines
+    399-415 of ``EncryptedStreamSocket.cpp``): no DH exchange is performed
+    because the sender already knows the receiver's 16-byte user-hash
+    (``pTargetClientHash`` obtained from KAD source search).
+
+    Key material layout (21 bytes, per the protocol comment)::
+
+        <target_userhash 16><MAGICVALUE_REQUESTER 1><RandomKeyPart 4>  -> send_key
+        <target_userhash 16><MAGICVALUE_SERVER   1><RandomKeyPart 4>  -> recv_key
+
+    Each key is the raw 16-byte MD5 of the 21-byte material.  Both RC4
+    streams discard 1024 leading keystream bytes (``RC4CreateKey`` with
+    ``bSkipDiscard=false``), so ``send_pad_len``/``recv_pad_len`` are set
+    to ``RC4_KEY_DROP_BYTES``.
+
+    Args:
+        target_userhash: 16-byte receiver user-hash (``pTargetClientHash``).
+        random_key_part: 32-bit ``m_nRandomKeyPart`` generated by the
+            sender; written to the wire as a little-endian uint32 and
+            appended to the key material as ``struct.pack('<I', ...)``.
+
+    Raises:
+        ObfuscationError: if *target_userhash* is not exactly 16 bytes, or
+            *random_key_part* is outside ``[0, 0xFFFFFFFF]``.
+    """
+    if not isinstance(target_userhash, (bytes, bytearray)) or len(target_userhash) != 16:
+        raise ObfuscationError(
+            f"target_userhash must be exactly 16 bytes, got {len(target_userhash)}"
+        )
+    if not isinstance(random_key_part, int) or not (0 <= random_key_part <= 0xFFFFFFFF):
+        raise ObfuscationError(
+            f"random_key_part must be in [0, 0xFFFFFFFF], got {random_key_part}"
+        )
+
+    random_key_bytes = struct.pack("<I", random_key_part)
+
+    send_material = bytes(target_userhash) + bytes((MAGICVALUE_REQUESTER,)) + random_key_bytes
+    send_key = _md5_digest(send_material)
+
+    recv_material = bytes(target_userhash) + bytes((MAGICVALUE_SERVER,)) + random_key_bytes
+    recv_key = _md5_digest(recv_material)
+
+    log.debug(
+        "basic keys derived: random_key_part=%u send_key_len=%d recv_key_len=%d drop=%d",
+        random_key_part,
+        len(send_key),
+        len(recv_key),
+        RC4_KEY_DROP_BYTES,
+    )
+    return NegotiationKeys(
+        send_key=send_key,
+        recv_key=recv_key,
+        send_pad_len=RC4_KEY_DROP_BYTES,
+        recv_pad_len=RC4_KEY_DROP_BYTES,
+    )
+
+
+def build_basic_client_request(
+    target_userhash: bytes,
+    *,
+    random_key_part: Optional[int] = None,
+    padding: Optional[bytes] = None,
+) -> Tuple[bytes, NegotiationKeys, int]:
+    """Build the BASIC-mode obfuscation request sent to a remote peer.
+
+    Mirrors the ``ECS_PENDING`` / outgoing branch of ``StartNegotiation``
+    (lines 446-464 of ``EncryptedStreamSocket.cpp``), which calls
+    ``SendNegotiatingData(buf, len, 5)`` -- i.e. only the first 5 plaintext
+    bytes are left unencrypted; everything from byte 5 onward is encrypted
+    under the RC4 send-stream.
+
+    Wire layout::
+
+        byte  0      : semi-random non-protocol marker (see _not_protocol_marker)
+        bytes 1..4   : random_key_part as uint32 LE  (m_nRandomKeyPart)
+        bytes 5..8   : MAGICVALUE_SYNC as uint32 LE  (encrypted)
+        byte  9      : supported method (0x00 = ENM_OBFUSCATION)  (encrypted)
+        byte 10      : preferred method  (0x00)                  (encrypted)
+        byte 11      : padding length n  (0..15)                 (encrypted)
+        bytes 12..   : n random padding bytes                   (encrypted)
+
+    Args:
+        target_userhash: 16-byte receiver user-hash (validates to 16 bytes).
+        random_key_part: optional 32-bit key part for determinism / testing.
+            When ``None`` a fresh value is generated from ``os.urandom(4)``
+            interpreted as a little-endian uint32 (mirrors
+            ``PokeUInt32`` which writes LE).
+        padding: optional fixed padding bytes (length 0..15).  When ``None``
+            a semi-random length (``semirandom_padding_length``) and random
+            bytes (``os.urandom``) are generated.
+
+    Returns:
+        Tuple of ``(request_bytes, keys, random_key_part)`` where
+        *request_bytes* is the full plaintext-then-encrypted payload,
+        *keys* holds the derived :class:`NegotiationKeys`, and
+        *random_key_part* is the (possibly generated) 32-bit value.
+
+    Raises:
+        ObfuscationError: if *target_userhash* is not 16 bytes, or *padding*
+            length (when given) is outside 0..15.
+    """
+    if not isinstance(target_userhash, (bytes, bytearray)) or len(target_userhash) != 16:
+        raise ObfuscationError(
+            f"target_userhash must be exactly 16 bytes, got {len(target_userhash)}"
+        )
+
+    if random_key_part is None:
+        random_key_part = int.from_bytes(os.urandom(4), "little")
+    elif not isinstance(random_key_part, int) or not (0 <= random_key_part <= 0xFFFFFFFF):
+        raise ObfuscationError(
+            f"random_key_part must be in [0, 0xFFFFFFFF], got {random_key_part}"
+        )
+
+    keys = derive_basic_keys(target_userhash, random_key_part)
+
+    # Plaintext header (5 bytes, NOT encrypted): marker + u32 LE random_key_part.
+    marker = _not_protocol_marker()
+    plaintext = bytes((marker,)) + struct.pack("<I", random_key_part)
+
+    # Encrypted body (from byte 5 onward) -- same RC4 send-stream used for
+    # the rest of the session.
+    if padding is not None:
+        pad_len = len(padding)
+        if not 0 <= pad_len < MAX_PADDING_LENGTH:
+            raise ObfuscationError(
+                f"explicit padding length {pad_len} out of range 0..{MAX_PADDING_LENGTH - 1}"
+            )
+        body_padding = bytes(padding)
+    else:
+        pad_len = semirandom_padding_length()
+        body_padding = os.urandom(pad_len)
+
+    encrypted_portion = (
+        struct.pack("<I", MAGICVALUE_SYNC)
+        + bytes((ENM_OBFUSCATION,))
+        + bytes((ENM_OBFUSCATION,))
+        + bytes((pad_len,))
+        + body_padding
+    )
+
+    send_stream = Rc4Stream(keys.send_key, drop=keys.send_pad_len)
+    encrypted_body = send_stream.crypt(encrypted_portion)
+
+    request = plaintext + encrypted_body
+
+    log.debug(
+        "basic request built: marker=0x%02x pad_len=%d random_key_part=%u "
+        "total_len=%d send_key_hex4=%s",
+        marker,
+        pad_len,
+        random_key_part,
+        len(request),
+        keys.send_key[:4].hex(),
+    )
+    return request, keys, random_key_part
+
+
+def parse_basic_client_response(payload: bytes, keys: NegotiationKeys) -> int:
+    """Parse the BASIC-mode responder (peer) reply.
+
+    Mirrors the ``ONS_BASIC_CLIENTB_*`` states in ``Negotiate`` (lines 599-627
+    of ``EncryptedStreamSocket.cpp``).  The *entire* response is encrypted
+    under the RC4 recv-stream, so *payload* must already contain the complete
+    (post-decryption) frame.  Because a TCP stream may deliver the frame
+    across multiple segments, callers are expected to buffer until at least
+    ``6 + peer_pad_len`` bytes are available; the function performs that
+    minimum-length validation here.
+
+    Layout (after RC4 decryption)::
+
+        bytes 0..3 : MAGICVALUE_SYNC as uint32 LE  (validated)
+        byte  4    : encryption method selected (must == ENM_OBFUSCATION)
+        byte  5    : padding length m  (0..255)
+        bytes 6..  : m random padding bytes (ignored)
+
+    Args:
+        payload: the raw encrypted bytes received from the peer (may span
+            one or more TCP segments; the caller must assemble them).
+        keys: the :class:`NegotiationKeys` whose ``recv_key``/``recv_pad_len``
+            describe the receiver-side RC4 stream.
+
+    Returns:
+        The total number of decrypted bytes consumed (6 + peer_pad_len),
+        i.e. the complete frame length.
+
+    Raises:
+        ObfuscationError: if the payload is shorter than the minimum
+            ``MAGICVALUE_SYNC`` (4 bytes), the magic does not match, the
+            negotiated method is unsupported, or the padding is truncated
+            (``"truncated"``).
+    """
+    if len(payload) < 4:
+        raise ObfuscationError("truncated")
+
+    recv_stream = Rc4Stream(keys.recv_key, drop=keys.recv_pad_len)
+    decrypted = recv_stream.crypt(payload)
+
+    if len(decrypted) < 4:
+        raise ObfuscationError("truncated")
+
+    magic = struct.unpack_from("<I", decrypted, 0)[0]
+    if magic != MAGICVALUE_SYNC:
+        raise ObfuscationError(
+            f"wrong magic: got 0x{magic:08X}, expected 0x{MAGICVALUE_SYNC:08X}"
+        )
+
+    if len(decrypted) < 6:
+        raise ObfuscationError("truncated")
+
+    method = decrypted[4]
+    if method != ENM_OBFUSCATION:
+        raise ObfuscationError(
+            f"unsupported encryption method: got 0x{method:02X}, "
+            f"expected 0x{ENM_OBFUSCATION:02X}"
+        )
+
+    peer_pad_len = decrypted[5]
+    total = 6 + peer_pad_len
+    if len(decrypted) < total:
+        raise ObfuscationError("truncated")
+
+    log.debug(
+        "basic response parsed: method=0x%02X pad_len=%d total=%d",
+        method,
+        peer_pad_len,
+        total,
+    )
+    return total
 
 
 # ---------------------------------------------------------------------------
