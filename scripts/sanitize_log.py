@@ -1,0 +1,103 @@
+"""Sanitize a log/text file: flagged lines become asterisks, extensions kept.
+
+Usage:
+    python sanitize_log.py <file> [file2 ...] [-o out.txt]
+
+- Every line is checked with the project content-safety markers
+  (amuled_v2.core.safety.matched_marker -- the same gate as the download
+  queue uses).
+- Flagged lines are REDACTED: every word token is starred, ONLY file
+  extensions survive in the "****.mp4" form.  Nothing flagged is printed
+  to the console -- the console shows counters only, the sanitized text
+  goes to the output file (default: <input>.clean.txt).
+- Clean lines pass through unchanged.
+
+The raw input is never printed by this script, so neither the operator nor
+any assistant reading the console/output sees the flagged content.
+
+scripts/sanitize_log.py
+Version:     0.1.0
+Author:      Soror L.'.L.'.
+Updated:     2026-09-23
+
+Patch Notes v0.1.0 (Soror L.'.L'.):
+  [+] Marker-based line redaction with extension-preserving starring.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from amuled_v2.core.safety import matched_marker  # noqa: E402
+
+# Токены, которые в помеченной строке НЕ звёздочками: расширения файлов и
+# чисто числовые куски (размеры, даты). Всё остальное звёздочки.
+_EXT_RE = re.compile(r"(?:\.[A-Za-z0-9]{1,6})")
+_WORD_RE = re.compile(r"[^\s|,;\"'()\[\]]+")
+
+
+def _sanitize_line(line: str) -> str:
+    """Star every word token, keep file extensions visible."""
+
+    def _star(match: re.Match[str]) -> str:
+        token = match.group(0)
+        ext = _EXT_RE.search(token)
+        if ext and ext.start() >= 1:
+            stars = "*" * min(len(token) - len(ext.group(0)), 12) or "*"
+            return stars + ext.group(0).lower()
+        if token.isdigit():
+            return token
+        return "*" * min(len(token), 12)
+
+    return _WORD_RE.sub(_star, line)
+
+
+def sanitize_file(path: Path, out_path: Path | None = None) -> None:
+    out_path = out_path or path.with_suffix(path.suffix + ".clean.txt")
+    flagged = 0
+    clean = 0
+    by_marker: dict[str, int] = {}
+    with path.open("r", encoding="utf-8", errors="replace") as src, out_path.open(
+        "w", encoding="utf-8"
+    ) as dst:
+        for number, line in enumerate(src, 1):
+            marker = matched_marker(line)
+            if marker is None:
+                dst.write(line)
+                clean += 1
+                continue
+            flagged += 1
+            by_marker[marker] = by_marker.get(marker, 0) + 1
+            dst.write(
+                f"[REDACTED line {number} marker={marker}] "
+                + _sanitize_line(line)
+                + ("\n" if line.endswith("\n") else "")
+            )
+    print(f"file   : {path}")
+    print(f"output : {out_path}")
+    print(f"clean lines  : {clean}")
+    print(f"redacted     : {flagged}")
+    for marker, count in sorted(by_marker.items(), key=lambda kv: -kv[1]):
+        print(f"  marker {marker!r}: {count} line(s)")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Redact flagged content from log/text files."
+    )
+    parser.add_argument("files", nargs="+", help="Input files to sanitize.")
+    parser.add_argument("-o", "--output", help="Output file (single input only).")
+    args = parser.parse_args()
+    if args.output and len(args.files) > 1:
+        parser.error("-o works with a single input file")
+    for name in args.files:
+        sanitize_file(Path(name), Path(args.output) if args.output else None)
+
+
+if __name__ == "__main__":
+    main()
