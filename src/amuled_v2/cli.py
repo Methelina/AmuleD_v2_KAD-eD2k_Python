@@ -1555,9 +1555,22 @@ def _download_queue():
 
 def _cmd_download_add(args: argparse.Namespace) -> int:
     from amuled_v2.core.ed2k import parse_ed2k_file_link
+    from amuled_v2.core.safety import ContentPolicyError, check_name_safe
 
     log.debug(f"Command started: name=download-add, link={args.link!r}")
     parsed = parse_ed2k_file_link(args.link)
+    # Неотключаемый контент-гейт: до создания записи очереди. Ни при каких
+    # флагах файл с маркерами CSAM не попадает в очередь.
+    try:
+        check_name_safe(parsed.name)
+    except ContentPolicyError as exc:
+        log.warning(f"Download add refused: {exc}")
+        result = {"status": "error", "action": "add", "reason": str(exc)}
+        if args.json:
+            _print_json(result)
+        else:
+            _print_text("Download refused", [f"status : error", f"reason : {exc}"])
+        return 2
     queue = _download_queue()
     entry = queue.add(
         file_hash=parsed.file_hash.hex(),
