@@ -522,6 +522,24 @@ _DEFAULT_GLOBAL_SERVER = "176.123.5.89"
 _DEFAULT_GLOBAL_PORT = 4725
 
 
+def _server_is_blacklisted(host: str, port: int) -> bool:
+    """Check the persistent DuckDB blacklist before any TCP server contact."""
+    state = get_state()
+    state.connect()
+    for row in state.list_blacklisted_servers():
+        if row["ip"] == host and int(row["port"]) == port:
+            log.warning(
+                "Server blocked by persistent blacklist: host=%s, port=%d, "
+                "failures=%s, until=%s",
+                host,
+                port,
+                row["failures"],
+                row["blacklisted_until"],
+            )
+            return True
+    return False
+
+
 def _ed2k_login_request() -> "LoginRequest":
     from amuled_v2.core.ed2k import LoginRequest
 
@@ -556,6 +574,22 @@ async def _run_ed2k_search(args: argparse.Namespace) -> dict:
     from amuled_v2.core.ed2k import Ed2kServerClient, SearchResultsBatch
 
     host, port = _parse_server_endpoint(args.server)
+    if _server_is_blacklisted(host, port):
+        return {
+            "status": "server_blacklisted",
+            "channel": getattr(args, "channel", SearchChannel.SERVER.value),
+            "server": args.server,
+            "query": args.query,
+            "session_id": None,
+            "published_files": 0,
+            "results": [],
+            "result_count": 0,
+            "saved_results": 0,
+            "reason": (
+                "server is on the persistent blacklist cooldown; "
+                "run `amuled servers forgive <ip> <port>` to clear it"
+            ),
+        }
     login = _ed2k_login_request()
     client = Ed2kServerClient(
         host,
@@ -669,6 +703,20 @@ def _cmd_search_ed2k(args: argparse.Namespace) -> int:
         f"query={args.query!r}, timeout={args.timeout}, duration={args.duration}"
     )
     result = asyncio.run(_run_ed2k_search(args))
+    if result["status"] != "ok":
+        if args.json:
+            _print_json(result)
+        else:
+            _print_text("Search unavailable", [
+                f"status  : {result['status']}",
+                f"server  : {result['server']}",
+                f"query   : {result['query']}",
+                f"reason  : {result.get('reason', 'unknown')}",
+            ])
+        log.info(
+            f"ED2K server search CLI blocked: status={result['status']}"
+        )
+        return 2
     _print_search_results(result, args.json)
     log.info(f"ED2K server search CLI completed: results={result['result_count']}")
     return 0
@@ -949,6 +997,19 @@ async def _run_ed2k_sources(args: argparse.Namespace) -> dict:
     from amuled_v2.core.ed2k import Ed2kServerClient
 
     host, port = _parse_server_endpoint(args.server)
+    if _server_is_blacklisted(host, port):
+        return {
+            "status": "server_blacklisted",
+            "server": args.server,
+            "hash": args.hash,
+            "source_count": 0,
+            "saved_sources": 0,
+            "sources": [],
+            "reason": (
+                "server is on the persistent blacklist cooldown; "
+                "run `amuled servers forgive <ip> <port>` to clear it"
+            ),
+        }
     file_hash = bytes.fromhex(args.hash)
     login = _ed2k_login_request()
     client = Ed2kServerClient(
@@ -990,6 +1051,20 @@ def _cmd_sources_ed2k(args: argparse.Namespace) -> int:
         f"hash={args.hash}, size={args.size}, save={args.save}"
     )
     result = asyncio.run(_run_ed2k_sources(args))
+    if result["status"] != "ok":
+        if args.json:
+            _print_json(result)
+        else:
+            _print_text("Sources unavailable", [
+                f"status  : {result['status']}",
+                f"server  : {result['server']}",
+                f"hash    : {result['hash']}",
+                f"reason  : {result.get('reason', 'unknown')}",
+            ])
+        log.info(
+            f"ED2K sources CLI blocked: status={result['status']}"
+        )
+        return 2
     if args.json:
         _print_json(result)
     else:
@@ -1375,12 +1450,34 @@ def _cmd_import_servers(args: argparse.Namespace) -> int:
     static = load_static_servers(args.static) if args.static else []
     saved_servers = 0
     saved_static = 0
+    removed_blacklisted = 0
     if args.save:
         from amuled_v2.state import get_state
 
         state = get_state()
         state.connect()
-        saved_servers = state.save_servers(records)
+        blacklisted = {
+            (row["ip"], int(row["port"]))
+            for row in state.list_blacklisted_servers()
+        }
+        kept = []
+        for record in records:
+            key = (record.address, record.port)
+            if key in blacklisted:
+                removed_blacklisted += 1
+                log.info(
+                    "Import skipped blacklisted server: host=%s, port=%d",
+                    record.address,
+                    record.port,
+                )
+                continue
+            kept.append(record)
+        removed_blacklisted_static = sum(
+            1 for row in static if (row.host, row.port) in blacklisted
+        )
+        static = [row for row in static if (row.host, row.port) not in blacklisted]
+        removed_blacklisted += removed_blacklisted_static
+        saved_servers = state.save_servers(kept)
         saved_static = state.save_static_servers(static)
     result = {
         "status": "ok",
@@ -1388,6 +1485,7 @@ def _cmd_import_servers(args: argparse.Namespace) -> int:
         "static_servers": len(static),
         "saved_servers": saved_servers,
         "saved_static_servers": saved_static,
+        "removed_blacklisted": removed_blacklisted,
         "server_met": str(args.server_met),
         "staticservers_dat": str(args.static) if args.static else None,
     }
@@ -1400,6 +1498,7 @@ def _cmd_import_servers(args: argparse.Namespace) -> int:
             f"static_servers  : {result['static_servers']}",
             f"server_met      : {result['server_met']}",
             f"static_list     : {result['staticservers_dat']}",
+            f"removed_blacklisted: {result['removed_blacklisted']}",
         ])
     log.info(f"Server import completed: servers={len(records)}, static={len(static)}")
     return 0
