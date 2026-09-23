@@ -40,6 +40,18 @@ from amuled_v2.core.safety import matched_marker  # noqa: E402
 _EXT_RE = re.compile(r"(?:\.[A-Za-z0-9]{1,6})")
 _WORD_RE = re.compile(r"[^\s|,;\"'()\[\]]+")
 _QUOTED_RE = re.compile(r'"([^"]*)"')
+# Имя файла — мусор всегда (хорошее и плохое одинаково): глушим ЛЮБОЙ
+# токен с файловым расширением из белого списка. Список конечный, чтобы не
+# задеть таймстампы (23.09.2026) и слова с точкой.
+_FILE_TOKEN_RE = re.compile(
+    r"[\w\-]+\.(?P<ext>avi|mp4|mkv|mpg|mpeg|iso|zip|rar|7z|exe|dll|jpg|jpeg|png"
+    r"|gif|flv|divx|mov|wav|mp3|pdf|part|emulecollection)\b",
+    re.IGNORECASE,
+)
+
+
+def _star_file_token(match: re.Match[str]) -> str:
+    return "*" * min(len(match.group(0)), 24) + "." + match.group("ext").lower()
 
 
 def _star_name(name: str) -> str:
@@ -85,7 +97,7 @@ def sanitize_file(path: Path, out_path: Path | None = None) -> None:
             # Имя в кавычках звёздочками ВСЕГДА (нам неважно, что там) --
             # маркер лишь добавляет строке префикс [REDACTED] и счётчик.
             marker = matched_marker(line)
-            line_out = _redact_quoted(line)
+            line_out = _FILE_TOKEN_RE.sub(_star_file_token, _redact_quoted(line))
             if marker is not None:
                 flagged += 1
                 by_marker[marker] = by_marker.get(marker, 0) + 1
