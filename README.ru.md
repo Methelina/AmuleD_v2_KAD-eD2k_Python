@@ -213,8 +213,26 @@ AmuleD распространяется по Apache 2.0. GPL-деревья aMul
 
 ### Реализованные технические слои
 
+Сортировка по статусу: **Проверено живой сетью** → **Реализовано** → **В плане**.
+
 | Слой                                           | Статус                            | Расположение                                               |
 | ---------------------------------------------- | --------------------------------- | ---------------------------------------------------------- |
+| **Проверено живой сетью**                      |                                   |                                                            |
+| KAD keyword-поиск                              | **Живой: 200 результатов/запрос** | `src/amuled_v2/core/kad/search.py`                         |
+| KAD-поиск источников (`SEARCH_SOURCE_REQ`)     | **Живой: источники сохраняются**  | `src/amuled_v2/core/kad/source_search.py`                  |
+| KAD-публикация (keyword/source-записи)         | **Проверено живой сетью**         | `src/amuled_v2/core/kad/publish.py`, `src/amuled_v2/cli.py` |
+| KAD-кодек пакетов (kad2)                       | Проверено живой сетью             | `src/amuled_v2/core/kad/packets.py`                        |
+| KAD-бутстрап (HELLO/PING/BOOT)                 | Проверено живой сетью             | `src/amuled_v2/core/kad/bootstrap.py`                      |
+| KAD UDP-обфускация (RC4)                       | Проверено живой сетью             | `src/amuled_v2/core/kad/obfuscation.py`                    |
+| KAD CLI-команды (`kad search/sources`)         | **Проверено живой сетью**         | `src/amuled_v2/cli.py`                                     |
+| ED2K TCP login                                 | Проверено живой сетью             | `src/amuled_v2/core/ed2k/server_client.py`                 |
+| ED2K SERVER-поиск                              | Проверено живой сетью             | `src/amuled_v2/core/ed2k/server_client.py`                 |
+| `OP_GETSOURCES`                                | Проверено живой сетью             | `src/amuled_v2/core/ed2k/server_client.py`                 |
+| Исходящая TCP-обфускация (BASIC, постоянные стримы) | **Проверено живой сетью**    | `src/amuled_v2/core/peer/obfuscation.py` (v0.3.0), `core/peer/client.py` |
+| DH-обфусцированный handshake (server-mode)     | **Проверено живой сетью** (реальный ED2K-сервер) | `src/amuled_v2/core/peer/obfuscation.py`   |
+| End-to-end обфусцированная закачка (реальный eMule-пир, MD4 сверен) | **Проверено живой сетью** | `src/amuled_v2/core/peer/client.py`, `core/download/runner.py` |
+| Единое ядро (паук+listener+state, один процесс) | **Проверено живой сетью**        | `src/amuled_v2/core/kernel.py`, `core/kernel_control.py`, `core/kad/spider.py` |
+| **Реализовано**                                |                                   |                                                            |
 | Переносимый установщик/лаунчер                 | Реализовано                       | `AmuleD_install.ps1`, `AmuleD_Run.ps1`                     |
 | JSONC-конфигурация                             | Реализовано                       | `src/amuled_v2/config.py`, `jsonc.py`                      |
 | Состояние DuckDB и миграции                    | Реализовано                       | `src/amuled_v2/state.py`                                   |
@@ -224,38 +242,25 @@ AmuleD распространяется по Apache 2.0. GPL-деревья aMul
 | Бинарный/теговый/пакетный кодек                | Реализовано                       | `src/amuled_v2/core/codec`                                 |
 | Хранение списков серверов                      | Реализовано                       | `src/amuled_v2/core/ed2k/server_met.py`                    |
 | Импорт метаданных share-файлов                 | Реализовано                       | `src/amuled_v2/core/sharing/shared_files.py`               |
-| ED2K TCP login                                 | Проверено живой сетью             | `src/amuled_v2/core/ed2k/server_client.py`                 |
 | Модель каналов поиска                          | Реализовано                       | `src/amuled_v2/core/search_channels.py`                    |
-| ED2K SERVER-поиск                              | Проверено живой сетью             | `src/amuled_v2/core/ed2k/server_client.py`                 |
 | ED2K GLOBAL-поиск                              | Реализовано                       | `src/amuled_v2/core/ed2k/`                                 |
-| `OP_GETSOURCES`                                | Проверено живой сетью             | `src/amuled_v2/core/ed2k/server_client.py`                 |
 | Хранение результатов поиска                    | Реализовано                       | `src/amuled_v2/state.py`                                   |
 | IP-фильтр + blacklist серверов                 | Реализовано                       | `src/amuled_v2/core/ipfilter.py`, `server_filter.py`       |
 | Download-стек (очередь/parts/MD4)              | Реализовано                       | `src/amuled_v2/core/download/`, `src/amuled_v2/core/peer/` |
-| KAD-кодек пакетов (kad2)                       | Проверено живой сетью             | `src/amuled_v2/core/kad/packets.py`                        |
 | Парсер nodes.dat                               | Реализовано                       | `src/amuled_v2/core/kad/nodes_dat.py`                      |
-| KAD-бутстрап (HELLO/PING/BOOT)                 | Проверено живой сетью             | `src/amuled_v2/core/kad/bootstrap.py`                      |
 | KAD routing-таблица                            | Реализовано                       | `src/amuled_v2/core/kad/routing.py`                        |
-| KAD UDP-обфускация (RC4)                       | Проверено живой сетью             | `src/amuled_v2/core/kad/obfuscation.py`                    |
-| KAD keyword-поиск                              | **Живой: 200 результатов/запрос** | `src/amuled_v2/core/kad/search.py`                         |
-| KAD-поиск источников (`SEARCH_SOURCE_REQ`)     | **Живой: источники сохраняются**  | `src/amuled_v2/core/kad/source_search.py`                  |
 | KAD-runtime (кеш → routing, bootstrap)         | Реализовано                       | `src/amuled_v2/core/kad/runtime.py`                        |
-| KAD CLI-команды (`kad search/sources`)         | **Проверено живой сетью**         | `src/amuled_v2/cli.py`                                     |
-| KAD-паук (прогрев сети)                        | Реализовано                       | `scripts/kad_spider.py`                                    |
-| Интерактивное консольное меню                  | Реализовано                       | `scripts/amuled_menu.py`                                   |
 | Стратегии выбора (xor/quality/vivaldi/kadabra) | Реализовано                       | `src/amuled_v2/core/kad/strategies.py`                     |
-| KAD-публикация (keyword/source-записи)         | **Проверено живой сетью**         | `src/amuled_v2/core/kad/publish.py`, `src/amuled_v2/cli.py` |
+| KAD-паук (прогрев сети)                        | Реализовано                       | `scripts/kad_spider.py`                                    |
 | Идентичность клиента (userhash/ник/порт)       | Реализовано                       | `src/amuled_v2/core/identity.py`                           |
-| Upload-движок (очередь/слоты/троттлинг)        | Реализовано                       | `src/amuled_v2/core/upload/`                               |
+| Upload-движок (очередь/слоты/троттлинг, credits→priority) | Реализовано           | `src/amuled_v2/core/upload/`                               |
 | Входящий peer-listener (plain)                 | Реализовано                       | `src/amuled_v2/core/peer/listener.py`                      |
 | Serve-демон (раздача файлов)                   | Реализовано                       | `scripts/serve_daemon.py`                                  |
-| Единое ядро (паук+listener+state, один процесс) | **Проверено живой сетью**        | `src/amuled_v2/core/kernel.py`, `core/kernel_control.py`, `core/kad/spider.py` |
 | Журнал клиентских кредитов (учёт по userhash)  | Реализовано                       | `src/amuled_v2/state.py` (миграция 7)                      |
-| Исходящая TCP-обфускация (BASIC, постоянные стримы) | **Проверено живой сетью**    | `src/amuled_v2/core/peer/obfuscation.py` (v0.3.0), `core/peer/client.py` |
-| DH-обфусцированный handshake (server-mode)     | **Проверено живой сетью** (реальный ED2K-сервер) | `src/amuled_v2/core/peer/obfuscation.py`   |
-| End-to-end обфусцированная закачка (реальный eMule-пир, MD4 сверен) | **Проверено живой сетью** | `src/amuled_v2/core/peer/client.py`, `core/download/runner.py` |
 | UPnP IGD + NAT-PMP маппинг портов              | Реализовано                       | `src/amuled_v2/core/nat/upnp.py`                           |
 | known.met импорт/экспорт                       | Реализовано                       | `src/amuled_v2/core/sharing/known_met.py`, `cli.py`        |
+| Интерактивное консольное меню                  | Реализовано                       | `scripts/amuled_menu.py`                                   |
+| **В плане**                                    |                                   |                                                            |
 | Приём обфусцированных входящих                 | В плане (внешняя сессия)          | `docs/roadmap.md`                                          |
 | GeoIP                                          | В плане                           | `docs/roadmap.md`                                          |
 

@@ -213,8 +213,27 @@ Core policy documents:
 
 ### Implemented technical layers
 
+Sorted by status: **Live-validated** (proven against the real eMule network) →
+**Implemented** (tested offline) → **Planned**.
+
 | Layer | Status | Location |
 |---|---|---|
+| **Live-validated** | | |
+| KAD keyword search | **Live: 200 results/query** | `src/amuled_v2/core/kad/search.py` |
+| KAD file-source search (`SEARCH_SOURCE_REQ`) | **Live: sources persisted** | `src/amuled_v2/core/kad/source_search.py` |
+| KAD publish (keyword/source entries) | **Live-validated** | `src/amuled_v2/core/kad/publish.py`, `src/amuled_v2/cli.py` |
+| KAD packet codec (kad2) | Live-validated | `src/amuled_v2/core/kad/packets.py` |
+| KAD bootstrap (HELLO/PING/BOOT) | Live-validated | `src/amuled_v2/core/kad/bootstrap.py` |
+| KAD UDP obfuscation (RC4) | Live-validated | `src/amuled_v2/core/kad/obfuscation.py` |
+| KAD CLI commands (`kad search/sources`) | **Live-validated** | `src/amuled_v2/cli.py` |
+| ED2K TCP login | Live-validated | `src/amuled_v2/core/ed2k/server_client.py` |
+| ED2K SERVER search | Live-validated | `src/amuled_v2/core/ed2k/server_client.py` |
+| `OP_GETSOURCES` | Live-validated | `src/amuled_v2/core/ed2k/server_client.py` |
+| Outgoing TCP obfuscation (BASIC, persistent streams) | **Live-validated** | `src/amuled_v2/core/peer/obfuscation.py` (v0.3.0), `core/peer/client.py` |
+| Server-mode DH obfuscated handshake | **Live-validated** (real ED2K server) | `src/amuled_v2/core/peer/obfuscation.py` |
+| End-to-end obfuscated download (real eMule peer, MD4 verified) | **Live-validated** | `src/amuled_v2/core/peer/client.py`, `core/download/runner.py` |
+| Unified kernel (spider+listener+state, one process) | **Live-validated** | `src/amuled_v2/core/kernel.py`, `core/kernel_control.py`, `core/kad/spider.py` |
+| **Implemented** | | |
 | Portable installer/runner | Implemented | `AmuleD_install.ps1`, `AmuleD_Run.ps1` |
 | JSONC configuration | Implemented | `src/amuled_v2/config.py`, `jsonc.py` |
 | DuckDB state and migrations | Implemented | `src/amuled_v2/state.py` |
@@ -224,38 +243,25 @@ Core policy documents:
 | Binary/tag/packet codec | Implemented | `src/amuled_v2/core/codec` |
 | Server-list persistence | Implemented | `src/amuled_v2/core/ed2k/server_met.py` |
 | Shared metadata import/hashing | Implemented | `src/amuled_v2/core/sharing/shared_files.py` |
-| ED2K TCP login | Live-validated | `src/amuled_v2/core/ed2k/server_client.py` |
 | Search channel model | Implemented | `src/amuled_v2/core/search_channels.py` |
-| ED2K SERVER search | Live-validated | `src/amuled_v2/core/ed2k/server_client.py` |
 | ED2K GLOBAL search | Implemented | `src/amuled_v2/core/ed2k/` |
-| `OP_GETSOURCES` | Live-validated | `src/amuled_v2/core/ed2k/server_client.py` |
 | Result persistence | Implemented | `src/amuled_v2/state.py` |
 | IP filter + server blacklist | Implemented | `src/amuled_v2/core/ipfilter.py`, `server_filter.py` |
 | Download stack (queue/parts/MD4) | Implemented | `src/amuled_v2/core/download/`, `src/amuled_v2/core/peer/` |
-| KAD packet codec (kad2) | Live-validated | `src/amuled_v2/core/kad/packets.py` |
 | KAD nodes.dat parser | Implemented | `src/amuled_v2/core/kad/nodes_dat.py` |
-| KAD bootstrap (HELLO/PING/BOOT) | Live-validated | `src/amuled_v2/core/kad/bootstrap.py` |
 | KAD routing table | Implemented | `src/amuled_v2/core/kad/routing.py` |
-| KAD UDP obfuscation (RC4) | Live-validated | `src/amuled_v2/core/kad/obfuscation.py` |
-| KAD keyword search | **Live: 200 results/query** | `src/amuled_v2/core/kad/search.py` |
-| KAD file-source search (`SEARCH_SOURCE_REQ`) | **Live: sources persisted** | `src/amuled_v2/core/kad/source_search.py` |
 | KAD runtime (cache → routing, bootstrap) | Implemented | `src/amuled_v2/core/kad/runtime.py` |
-| KAD CLI commands (`kad search/sources`) | **Live-validated** | `src/amuled_v2/cli.py` |
-| KAD spider daemon (network warm-up) | Implemented | `scripts/kad_spider.py` |
-| Interactive console menu | Implemented | `scripts/amuled_menu.py` |
 | Selection strategies (xor/quality/vivaldi/kadabra) | Implemented | `src/amuled_v2/core/kad/strategies.py` |
-| KAD publish (keyword/source entries) | **Live-validated** | `src/amuled_v2/core/kad/publish.py`, `src/amuled_v2/cli.py` |
+| KAD spider daemon (network warm-up) | Implemented | `scripts/kad_spider.py` |
 | Client identity (userhash/nick/port) | Implemented | `src/amuled_v2/core/identity.py` |
-| Upload engine (queue/slots/throttle) | Implemented | `src/amuled_v2/core/upload/` |
+| Upload engine (queue/slots/throttle, credits→priority) | Implemented | `src/amuled_v2/core/upload/` |
 | Incoming peer listener (plain) | Implemented | `src/amuled_v2/core/peer/listener.py` |
 | Serve daemon (share files) | Implemented | `scripts/serve_daemon.py` |
-| Unified kernel (spider+listener+state, one process) | **Live-validated** | `src/amuled_v2/core/kernel.py`, `core/kernel_control.py`, `core/kad/spider.py` |
 | Client credits ledger (per-userhash accounting) | Implemented | `src/amuled_v2/state.py` (migration 7) |
-| Outgoing TCP obfuscation (BASIC, persistent streams) | **Live-validated** | `src/amuled_v2/core/peer/obfuscation.py` (v0.3.0), `core/peer/client.py` |
-| Server-mode DH obfuscated handshake | **Live-validated** (real ED2K server) | `src/amuled_v2/core/peer/obfuscation.py` |
-| End-to-end obfuscated download (real eMule peer, MD4 verified) | **Live-validated** | `src/amuled_v2/core/peer/client.py`, `core/download/runner.py` |
 | UPnP IGD + NAT-PMP mapping | Implemented | `src/amuled_v2/core/nat/upnp.py` |
 | known.met import/export | Implemented | `src/amuled_v2/core/sharing/known_met.py`, `cli.py` |
+| Interactive console menu | Implemented | `scripts/amuled_menu.py` |
+| **Planned** | | |
 | Incoming obfuscated accept | Planned (external) | `docs/roadmap.md` |
 | GeoIP | Planned | `docs/roadmap.md` |
 
