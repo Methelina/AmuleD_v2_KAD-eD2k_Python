@@ -1,7 +1,7 @@
 # Continuation prompt — AmuleD v0.5.1 (K:\work\AmuleD_v2)
 
-Updated: 2026-09-25 09:50
-Session state: 8 (no-Claude track; стадии P и S — DONE, live-accepted; следующая — стадия C)
+Updated: 2026-09-25 17:50
+Session state: 8 (no-Claude track; P+S+C DONE, live-accepted; следующая — стадия X)
 
 ---
 
@@ -94,6 +94,29 @@ Wire-оракул: tshark K:\Software\WireShark\WiresharkPortable64\App\Wireshar
 - Незакоммичено: стадия S (identity/serve_daemon/AmuleD_Run/фиксы codec,
   client, listener, state, config) + README-обновление — коммит по
   подтверждению.
+
+## Стадия C — DONE (итог сессии)
+
+- Миграция 7 (`client_credits`, `seen_clients`) + credits-API в StateBackend
+  (record/refund/get/list; DuckDB: в ON CONFLICT DO UPDATE — `now()`, НЕ
+  CURRENT_TIMESTAMP).
+- Учёт: listener traffic_recorder → uploaded (на transfer_complete и на
+  transport-error: клиент рвёт соединение, получив всё); PeerClient.
+  traffic_sink → DownloadRunner → CLI download run → downloaded;
+  serve_daemon подключает recorder.
+- SecureIdent-адаптер: core/security/ (sign/verify — заглушки, evaluate →
+  unverified/bonus 1.0, `# WIP by external developer`).
+- LIVE: loopback-раздача через демона, клиенту начислено
+  uploaded=5 406 084 (файл 5.9 МБ, MD4 сверен).
+- Фиксы по пути: transfer() считал раунды пакетами → дедлок с
+  саб-пакетизацией; теперь байтовый учёт раунда. служебный регресс
+  отступов в transfer-цикле пойман трассировкой dbg_flow.py.
+- Offline suite: 288 passed, 6 skipped; compileall 0.
+- Грабли: паук держит DuckDB подолгу — recorder/connect ретраит 20x1s;
+  тесты на ledger — герметичные (in-memory recorder, уникальные userhash).
+
+Следующая — стадия X (ротация узлов паука, upload status CLI,
+MISCOPTIONS-сверка, GeoIP, UPnP).
 
 ## Быстрый старт (обязательный порядок)
 

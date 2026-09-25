@@ -74,15 +74,28 @@ docs\continuation-prompt.md. Этот файл — рабочий план no-Cl
   COMPRESSEDPART-саб-пакеты теперь пересобираются клиентом (chunk +
   total-size, CreatePackedPackets-семантика); DuckDB lock retry 20x1s.
 
-## Стадия C — Credits/SecureIdent-каркас (крипто — мок) [TODO]
+## Стадия C — Credits/SecureIdent-каркас [DONE]
 
-- [ ] DuckDB-миграция 7: `client_credits` (user_hash PK, uploaded,
-      downloaded, last_seen) + `seen_clients`.
-- [ ] API: credit(view/add/refund) по user_hash; интеграция точек:
-      upload queue enqueue (учёт отданных байтов), download (учёт
-      полученных) — начисления уже работают без крипты.
-- [ ] SecureIdent-интерфейс-адаптер с пометкой
-      `# WIP by external developer` (подписи/проверка — внешний трек).
+- [x] DuckDB-миграция 7: `client_credits` (user_hash PK, uploaded,
+      downloaded, last_seen) + `seen_clients` (first/last_seen, hellos).
+      Нюанс DuckDB: в ON CONFLICT DO UPDATE — `now()`, не CURRENT_TIMESTAMP.
+- [x] API: record_traffic / refund_traffic (клампит в 0) / get_credits /
+      list_credits / list_seen_clients / see_client в StateBackend.
+- [x] Интеграция: upload — listener `traffic_recorder` начисляет
+      stats.bytes_sent на transfer_complete И на transport-error (клиент
+      рвёт соединение, получив всё); download — PeerClient.traffic_sink →
+      DownloadRunner → CLI download run → record_traffic(downloaded).
+      serve_daemon подключает recorder (открыл/записал/закрыл DuckDB).
+- [x] SecureIdent-адаптер: core/security/secure_ident.py (SecureIdentState
+      = CSecureIdentState, evaluate → unverified/bonus 1.0; sign/verify
+      кидают SecureIdentError, `# WIP by external developer`).
+- [x] LIVE: loopback-раздача через демона — начислено uploaded=5 406 084
+      байт клиенту (5.9 МБ файл, 33 блока, MD4 сверен).
+- [x] Тесты: tests/test_credits.py (миграция, ledger, clamp, порядок,
+      SecureIdent-мок, listener-интеграция).
+- Попутный фикс: PeerClient.transfer считал раунды пакетами (3/раунд) —
+  дедлок с саб-пакетизацией движка; теперь байтовый учёт раунда
+  (expected_bytes = сумма длин диапазонов).
 
 ## Стадия X — Прочее без внешних зависимостей [TODO]
 
@@ -108,7 +121,7 @@ docs\continuation-prompt.md. Этот файл — рабочий план no-Cl
 
 1. P: наш файл находится KAD-поиском с чужих узлов; перепубликация работает. [DONE]
 2. S: listener живёт как демон, порт опубликован, self-test loopback зелёный. [DONE]
-3. C: credits пишутся при отдаче/получении; миграция 7 применена.
+3. C: credits пишутся при отдаче/получении; миграция 7 применена. [DONE]
 4. Полный offline suite зелёный; worktree закоммичен по подтверждению
    пользователя; roadmap/continuation-prompt синхронизированы.
 
