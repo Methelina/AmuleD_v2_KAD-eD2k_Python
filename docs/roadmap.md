@@ -653,7 +653,50 @@ Commits f4b9065, c01a9c5 (после f79492a). Состояние:
 - Commit f79492a. Wire oracle pcap: tmp/emule_wire.pcapng, dump in
   tmp/wire_dump.txt (eMule KAD UDP port 8089, count=0x0B observed).
 
-## 11e. Session 7 (2026-09-24): TCP-obfuscation client dial [WIP — один блокер остался]
+## 11f. Session 8 (2026-09-24): upload engine stage C [DONE — очередь + движок отдачи; интеграция — стадия D]
+
+Принято решение: обфускационный дозвон (блокер 11e) не является блокером остального
+стека — он вынесен во внешнюю сессию (docs\Cloud_Prompt_Help_Plz.md), всё зависящее
+от wire-транспорта мокается с пометкой `# WIP by external developer: ...`.
+
+Реализовано (незакоммичено):
+- **core/upload/queue.py** — очередь ожидания по правилам eMuleAI UploadQueue.cpp:
+  приоритет PR_LOW/NORMAL/HIGH → FIFO, 1-based rank, max_slots=4, TTL слота 600 с,
+  dedupe по (user_hash, requested_hash).
+- **core/upload/engine.py** — UploadSession поверх инъецируемого UploadTransport:
+  REQUESTFILENAME→REQFILENAMEANSWER, HASHSETREQUEST→HASHSETANSWER (без chunk-хешей →
+  END_OF_DOWNLOAD), REQUESTPARTS(_I64)→SENDINGPART/COMPRESSEDPART. Семантика
+  сверена с UploadDiskIOThread.cpp CreateStandardPackets/CreatePackedPackets:
+  саб-пакеты ≤13000 байт (10240 при остатке), семейство I64 выбирается по
+  endpos > UINT32_MAX на саб-пакет, COMPRESSEDPART несёт BLOCK start + total
+  comp size. UploadThrottle (байт/с), BlockSource (PARTSIZE-чанки).
+- **core/peer/codec.py v0.2.0** — builder-ы ответной стороны: QUEUERANK,
+  ACCEPTUPLOADREQ, END_OF_DOWNLOAD, SENDINGPART_I64, COMPRESSEDPART_I64,
+  REQFILENAMEANSWER, FILESTATUS.
+- Все точки контакта с wire-транспортом помечены
+  `# WIP by external developer: encrypted transport (BASIC obfuscation / DH)`.
+- Offline suite: **266 passed, 2 skipped** (+71 тест tests/test_upload.py).
+
+REAL-DATA VALIDATION (стадия C/D, 2026-09-25):
+- Зарегистрирована реальная раздаваемая папка Incoming установленного
+  eMuleAI (79 файлов, ~469 МБ) через `share scan --json` — пути сохранены
+  в DuckDB.
+- Известная проблема: до scan все импортированные v1-строки имели path=NULL.
+- **Хеш-валидация против реального клиента:** our ED2K-хеши 79/79 совпали с
+  `config\known.met` eMuleAI (парсер формата: [u8 0x0F][u32 count]; запись =
+  [u32 date][hash16][u16 part_count][parts×16][u32 tagcount][tags]; теги:
+  0x02-строки с u16-len именем/значением, 0x03 u32, 0x0B u64, 0x11..0x30 STRn
+  фиксированной длины). Хеширование байт-в-байт совместимо с реальным клиентом.
+- Listener-tests 5/5 (HELLO, полный upload-flow, QUEUERANK при занятых слотах,
+  END_OF_DOWNLOAD на неизвестный хеш, EMULEINFO). Semantics fixed vs
+  UploadDiskIOThread.cpp: SENDINGPART family per sub-packet (endpos > u32max),
+  answers to REQUESTFILENAME/HASHSETREQUEST immediate, accept via engine hook.
+
+Следующие шаги: стадия D (входящий peer-listener, маршрутизация STARTUPLOADREQ →
+queue + UploadSession; transport = мок до вердикта внешней сессии), KAD publish,
+SecureIdent-каркас (крипто — мок), ротация узлов паука.
+
+## 11e. Session 7 (2026-09-24): TCP-obfuscation client dial [WIP — передано внешней сессии]
 
 Реализовано и проверено:
 1. **BASIC client obfuscation** (src\amuled_v2\core\peer\obfuscation.py v0.2.0):

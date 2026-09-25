@@ -1,7 +1,7 @@
 # Continuation prompt — AmuleD v0.5.1 (K:\work\AmuleD_v2)
 
-Updated: 2026-09-24 02:10
-Session state: 7 (TCP-obfuscation client dial: handshake SOLVED, остался один блокер — мгновенный FIN после HELLO)
+Updated: 2026-09-25 04:05
+Session state: 8 (no-Claude track; стадия P — KAD publish — DONE, live-accepted; следующая — стадия S)
 
 ---
 
@@ -39,6 +39,28 @@ Wire-оракул: tshark K:\Software\WireShark\WiresharkPortable64\App\Wireshar
 Дальше по стеку: KAD publish (PUBLISH_KEY/SOURCE_REQ), входящий peer-listener (стадия D), upload-движок (C), SecureIdent (E). Диск C: не трогать. Все диагностические сообщения — tagged logging (amuled_v2.logging_setup, LogTags). Автор во всех файлах только Soror L.'.L.'. Никаких AI/co-author упоминаний. Абсолютные пути в отчётах. Отвечай по-русски, кратко и по делу.
 
 ---
+
+## Сессия 8 (no-Claude track): стадия P — KAD publish [DONE]
+
+- Статус: publish.py отревьюлен vs Search.cpp:832-934/935-991, девиэйшены
+  устранены, wire-баг count-байта тег-листа найден и исправлен
+  (packets._build_tag_list считал count = len(байт); теперь count — явный
+  параметр; publish builders возвращают (body, tag_count)).
+- LIVE-acceptance зелёная: `publish keywords --limit 1` → 5 accepts/10;
+  `search kad <полное имя тестового PDF из Incoming>` находит наш файл из
+  сети (hash/size см. локально);
+  `publish sources --limit 1` → 4 accepts; `kad sources <hash>` возвращает
+  нас (source_id = наш own_id (redacted), type 1, dialable).
+- CLI: `amuled publish keywords|sources [--limit N] [--tcp-port P]
+  [--loop-interval H]` — петля перепубликации (~24ч ротация store).
+- Публикация идёт под identity own_id (KadID = userhash для standalone);
+  стадия S введёт LocalIdentity из конфига (Prefs GetClientHash = userhash).
+- Грабли: DuckDB паук держит/блокирует db — CLI-publish ретраить до 10x8s;
+  `--limit 0` = все файлы; поиск по полному имени файла (keyword hash =
+  MD4 имени), слова-корни не найдут запись.
+- Offline suite: 280 passed (+9 tests/test_publish.py); compileall 0.
+- Незакоммичено: publish.py, packets.py (count-фикс), cli.py (publish),
+  listener.py, upload/, test_publish.py и др. — коммит по подтверждению.
 
 ## Быстрый старт (обязательный порядок)
 
