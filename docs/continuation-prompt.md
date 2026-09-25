@@ -1,7 +1,7 @@
 # Continuation prompt — AmuleD v0.5.1 (K:\work\AmuleD_v2)
 
-Updated: 2026-09-25 17:50
-Session state: 8 (no-Claude track; P+S+C DONE, live-accepted; следующая — стадия X)
+Updated: 2026-09-25 18:35
+Session state: 8 (no-Claude track; P+S+C DONE; стадия U фаза 1 — DONE, фаза 2 TODO: паук внутрь ядра)
 
 ---
 

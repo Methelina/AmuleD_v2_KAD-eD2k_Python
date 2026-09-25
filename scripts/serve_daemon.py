@@ -55,6 +55,11 @@ configure_logging(
 
 from amuled_v2.config import load_config
 from amuled_v2.core.identity import load_identity
+from amuled_v2.core.kernel import (
+    KERNEL_STATUS_PATH,
+    KernelControlServer,
+    _write_json_atomic,
+)
 from amuled_v2.core.kad.publish import SourcePublisher
 from amuled_v2.core.kad.runtime import (
     bootstrap_runtime,
@@ -246,6 +251,32 @@ async def _run(args: argparse.Namespace) -> int:
             # Windows fallback: KeyboardInterrupt in asyncio.run.
             pass
 
+    # Kernel control server (stage U phase 1): CLI routes status/credits
+    # queries here instead of fighting the spider for the DuckDB lock.
+    def _ctl_status() -> dict[str, Any]:
+        return {
+            "port": bound_port,
+            "active_connections": server.active_connections,
+            "uptime_s": int(time.time() - started_at),
+            "republish": dict(publish_box) if publish_box else None,
+        }
+
+    def _ctl_credits_list() -> dict[str, Any]:
+        state = get_state()
+        state.connect()
+        try:
+            return {"credits": state.list_credits(limit=100)}
+        finally:
+            state.close()
+
+    control = KernelControlServer(
+        {
+            "status": _ctl_status,
+            "credits.list": _ctl_credits_list,
+        }
+    )
+    await control.start()
+
     started_at = time.time()
     publish_box: dict[str, Any] = {}
 
@@ -266,7 +297,7 @@ async def _run(args: argparse.Namespace) -> int:
     async def _status_loop() -> None:
         while not stop.is_set():
             status = {
-                "version": 1,
+                "version": 2,
                 "pid": os.getpid(),
                 "running": True,
                 "started_at": time.strftime(
@@ -275,6 +306,7 @@ async def _run(args: argparse.Namespace) -> int:
                 "uptime_s": int(time.time() - started_at),
                 "host": bind_host,
                 "port": bound_port,
+                "control_port": control.port,
                 "nick": identity.nickname,
                 "max_sessions": max_sessions,
                 "upload_slots": upload_slots,
@@ -284,8 +316,17 @@ async def _run(args: argparse.Namespace) -> int:
             }
             try:
                 _write_status(status)
+                _write_json_atomic(
+                    KERNEL_STATUS_PATH,
+                    {
+                        "running": True,
+                        "pid": os.getpid(),
+                        "serve_port": bound_port,
+                        "control_port": control.port,
+                    },
+                )
             except OSError as exc:
-                log.warning("serve_status write failed: %s", exc)
+                log.warning("status write failed: %s", exc)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=STATUS_INTERVAL_S)
             except asyncio.TimeoutError:
@@ -312,9 +353,14 @@ async def _run(args: argparse.Namespace) -> int:
         stop.set()
         status_task.cancel()
         republish_task.cancel()
+        await control.close()
+        try:
+            KERNEL_STATUS_PATH.unlink()
+        except OSError:
+            pass
         await server.close()
         final = {
-            "version": 1,
+            "version": 2,
             "pid": os.getpid(),
             "running": False,
             "started_at": time.strftime(

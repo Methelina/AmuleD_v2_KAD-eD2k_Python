@@ -1539,6 +1539,65 @@ async def _run_publish(args: argparse.Namespace) -> dict:
     }
 
 
+def _kernel_control(request: dict) -> dict | None:
+    """Route a control request to the live kernel, or None if it is down."""
+    from amuled_v2.core.kernel import control_request_sync, read_kernel_status
+
+    status = read_kernel_status()
+    if status is None:
+        return None
+    try:
+        return control_request_sync(int(status["control_port"]), request)
+    except (OSError, ConnectionError, TimeoutError, ValueError) as exc:
+        log.debug(f"kernel control unavailable: {exc}")
+        return None
+
+
+def _cmd_credits(args: argparse.Namespace) -> int:
+    """Client credit ledger (stage C): view uploaded/downloaded per userhash.
+
+    Queries the running kernel over IPC when it is alive (no DuckDB lock
+    contention with the spider); falls back to direct DuckDB access.
+    """
+    if args.credits_command == "get":
+        request = {"command": "credits.get", "user_hash": args.user_hash}
+        response = _kernel_control(request)
+        if response is None:
+            state = get_state()
+            state.connect()
+            try:
+                row = state.get_credits(args.user_hash)
+            finally:
+                state.close()
+            response = {"status": "ok", "credits": row}
+        rows = [response["credits"]] if response.get("credits") else []
+    else:
+        limit = getattr(args, "limit", 100)
+        response = _kernel_control({"command": "credits.list"})
+        if response is None:
+            state = get_state()
+            state.connect()
+            try:
+                rows = state.list_credits(limit=limit)
+            finally:
+                state.close()
+        else:
+            rows = response.get("credits", [])
+
+    if getattr(args, "json", False):
+        _print_json({"status": "ok", "credits": rows})
+    else:
+        lines = [f"clients    : {len(rows)}"]
+        for row in rows:
+            lines.append(
+                f"  {row['user_hash']}  up={row['uploaded']}  "
+                f"down={row['downloaded']}"
+            )
+        _print_text("Client credits", lines)
+    log.info(f"Credits listed: rows={len(rows)}")
+    return 0
+
+
 def _cmd_servers_failures(args: argparse.Namespace) -> int:
     state = get_state()
     state.connect()
@@ -2648,6 +2707,28 @@ def build_parser() -> argparse.ArgumentParser:
         "Publish ourselves as a source for shared file hashes "
         "(KADEMLIA2_PUBLISH_SOURCE_REQ).",
     )
+
+    # --- credits ---
+    p_credits = sub.add_parser(
+        "credits",
+        help="Client credit ledger (uploads/downloads per userhash).",
+        parents=parents,
+    )
+    credits_sub = p_credits.add_subparsers(
+        dest="credits_command", metavar="<action>"
+    )
+    p_credits_list = credits_sub.add_parser(
+        "list", help="List credit rows (largest traffic first).", parents=parents
+    )
+    p_credits_list.add_argument(
+        "--limit", type=int, default=100, help="Max rows to show."
+    )
+    p_credits_list.set_defaults(func=_cmd_credits)
+    p_credits_get = credits_sub.add_parser(
+        "get", help="Show one client's credit row by userhash.", parents=parents
+    )
+    p_credits_get.add_argument("user_hash", help="32-hex client userhash.")
+    p_credits_get.set_defaults(func=_cmd_credits)
 
     # --- download ---
     p_download = sub.add_parser(

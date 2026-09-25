@@ -74,6 +74,25 @@ docs\continuation-prompt.md. Этот файл — рабочий план no-Cl
   COMPRESSEDPART-саб-пакеты теперь пересобираются клиентом (chunk +
   total-size, CreatePackedPackets-семантика); DuckDB lock retry 20x1s.
 
+## Стадия U — Единое ядро (объединение процессов) [WIP — фаза 1 DONE]
+
+Мотивация: паук/демон/CLI — отдельные процессы, дерущиеся за эксклюзивный
+rw-лок DuckDB (у eMule всё в одном процессе — потоки с общими объектами).
+
+- [x] Фаза 1: `core/kernel.py` — KernelControlServer (JSON-lines IPC на
+      127.0.0.1, эфемерный порт), `db/kernel_status.json` (pid, serve_port,
+      control_port), `control_request[_sync]` клиент; serve_daemon стал
+      ядром-фазой-1 (listener + republish + control-хендлеры
+      status/credits.list); CLI `credits list|get` идёт через IPC, fallback
+      — прямой DuckDB. LIVE: IPC-roundtrip 0.01 c.
+- [x] Тесты: tests/test_kernel.py (roundtrip, unknown command,
+      kernel_status снапшот). Suite 290 passed.
+- [ ] Фаза 2: цикл паука переезжает в ядро (kad_spider → модуль), ядро
+      держит ОДИН постоянный DuckDB-коннект; скриптовые процессы и лок-
+      ретраи уходят; CLI полностью через IPC (share scan, publish, search).
+- [ ] Фаза 3: `amuled daemon start|stop|status` (daemon.py stub → реальный
+      диспетчер ядра через IPC; guard от дублей).
+
 ## Стадия C — Credits/SecureIdent-каркас [DONE]
 
 - [x] DuckDB-миграция 7: `client_credits` (user_hash PK, uploaded,
