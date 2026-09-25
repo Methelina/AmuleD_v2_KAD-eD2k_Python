@@ -29,7 +29,7 @@ The client is fully portable: it installs into its own folder with a single scri
 
 ### Current status (honestly)
 
-This is an early but live client: search (including KAD), incoming sources, KAD publishing of your own files, and file sharing to others (serve daemon with an upload queue) already work against the real eMule network, and outgoing peer connections use the mandatory TCP obfuscation handshake. Still in development: accepting obfuscated incoming connections (pending external protocol review — plain-protocol listeners are answered today), completing transfers from KAD sources end to end, and SecureIdent/credits. Follow the progress in the roadmap (sections tagged DONE/WIP/PLANNED).
+This is an early but live client: search (including KAD), incoming sources, KAD publishing of your own files, and file sharing to others (serve daemon with an upload queue) already work against the real eMule network, and outgoing peer connections use the mandatory TCP obfuscation handshake (live-verified end to end: AmuleD downloaded a real file from a real eMule client over the obfuscated channel with a matching MD4; a live DH-obfuscated session with a real ED2K server was also established). Still in development: accepting obfuscated incoming connections (pending external protocol review — plain-protocol listeners are answered today), transfers sourced straight from the kernel's KAD source pool, GeoIP, and SecureIdent/credits crypto. Follow the progress in the roadmap (sections tagged DONE/WIP/PLANNED).
 
 ### Requirements
 
@@ -251,8 +251,13 @@ Core policy documents:
 | Serve daemon (share files) | Implemented | `scripts/serve_daemon.py` |
 | Unified kernel (spider+listener+state, one process) | **Live-validated** | `src/amuled_v2/core/kernel.py`, `core/kernel_control.py`, `core/kad/spider.py` |
 | Client credits ledger (per-userhash accounting) | Implemented | `src/amuled_v2/state.py` (migration 7) |
+| Outgoing TCP obfuscation (BASIC, persistent streams) | **Live-validated** | `src/amuled_v2/core/peer/obfuscation.py` (v0.3.0), `core/peer/client.py` |
+| Server-mode DH obfuscated handshake | **Live-validated** (real ED2K server) | `src/amuled_v2/core/peer/obfuscation.py` |
+| End-to-end obfuscated download (real eMule peer, MD4 verified) | **Live-validated** | `src/amuled_v2/core/peer/client.py`, `core/download/runner.py` |
+| UPnP IGD + NAT-PMP mapping | Implemented | `src/amuled_v2/core/nat/upnp.py` |
+| known.met import/export | Implemented | `src/amuled_v2/core/sharing/known_met.py`, `cli.py` |
 | Incoming obfuscated accept | Planned (external) | `docs/roadmap.md` |
-| GeoIP / UPnP-NAT-PMP | Planned | `docs/roadmap.md` |
+| GeoIP | Planned | `docs/roadmap.md` |
 
 ### KAD engine notes
 
