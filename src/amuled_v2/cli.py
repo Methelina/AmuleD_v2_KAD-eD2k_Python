@@ -1541,7 +1541,10 @@ async def _run_publish(args: argparse.Namespace) -> dict:
 
 def _kernel_control(request: dict) -> dict | None:
     """Route a control request to the live kernel, or None if it is down."""
-    from amuled_v2.core.kernel import control_request_sync, read_kernel_status
+    from amuled_v2.core.kernel_control import (
+        control_request_sync,
+        read_kernel_status,
+    )
 
     status = read_kernel_status()
     if status is None:
@@ -1595,6 +1598,51 @@ def _cmd_credits(args: argparse.Namespace) -> int:
             )
         _print_text("Client credits", lines)
     log.info(f"Credits listed: rows={len(rows)}")
+    return 0
+
+
+def _cmd_daemon(args: argparse.Namespace) -> int:
+    """Kernel lifecycle commands (stage U): status / stop via IPC."""
+    status = _kernel_control({"command": "status"})
+    if args.daemon_command == "stop":
+        if status is None:
+            if getattr(args, "json", False):
+                _print_json({"status": "error", "reason": "kernel is not running"})
+            else:
+                _print_text("Daemon stop", ["status : kernel is not running"])
+            return 2
+        response = _kernel_control({"command": "stop"})
+        body = response or {"status": "error", "reason": "no response"}
+        if getattr(args, "json", False):
+            _print_json(body)
+        else:
+            _print_text("Daemon stop", [f"status  : {body.get('status')}"])
+        log.info(f"Daemon stop requested: response={body.get('status')}")
+        return 0 if (response or {}).get("status") == "ok" else 2
+
+    # status
+    if status is None:
+        if getattr(args, "json", False):
+            _print_json({"status": "ok", "running": False})
+        else:
+            _print_text("Daemon status", ["running : no"])
+        return 0
+    if getattr(args, "json", False):
+        _print_json({"status": "ok", "running": True, **status})
+    else:
+        lines = [
+            f"running      : yes",
+            f"serve_port   : {status.get('serve_port')}",
+            f"connections  : {status.get('active_connections')}",
+            f"uptime_s     : {status.get('uptime_s')}",
+        ]
+        spider = status.get("spider") or {}
+        lines.append(
+            f"spider       : pool={spider.get('pool_size', 0)} "
+            f"alive={spider.get('alive_estimate', 0)} "
+            f"cycles={spider.get('uptime_cycles', 0)}"
+        )
+        _print_text("Daemon status", lines)
     return 0
 
 
@@ -2730,6 +2778,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_credits_get.add_argument("user_hash", help="32-hex client userhash.")
     p_credits_get.set_defaults(func=_cmd_credits)
 
+    # --- daemon ---
+    p_daemon = sub.add_parser(
+        "daemon",
+        help="Unified kernel lifecycle (status/stop) via IPC.",
+        parents=parents,
+    )
+    daemon_sub = p_daemon.add_subparsers(dest="daemon_command", metavar="<action>")
+    for action, help_text in (
+        ("status", "Show kernel status (ports, spider pool, uptime)."),
+        ("stop", "Ask the running kernel to shut down gracefully."),
+    ):
+        p_d = daemon_sub.add_parser(action, help=help_text, parents=parents)
+        p_d.set_defaults(func=_cmd_daemon)
+
     # --- download ---
     p_download = sub.add_parser(
         "download",
@@ -2859,14 +2921,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ipfilter_test.add_argument("ip", help="IPv4 address to test.")
     p_ipfilter_test.set_defaults(func=_cmd_ipfilter_test)
-
-    # --- daemon ---
-    p_daemon = sub.add_parser("daemon", help="Daemon lifecycle (M2 stub).", parents=parents)
-    d_sub = p_daemon.add_subparsers(dest="daemon_command", metavar="<action>")
-    p_d_start = d_sub.add_parser("start", help="Start daemon (stub).", parents=parents)
-    p_d_start.set_defaults(func=_cmd_daemon_start)
-    p_d_stop = d_sub.add_parser("stop", help="Stop daemon (stub).", parents=parents)
-    p_d_stop.set_defaults(func=_cmd_daemon_stop)
 
     return parser
 

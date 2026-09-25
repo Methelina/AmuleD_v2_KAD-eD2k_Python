@@ -1,7 +1,7 @@
 # Continuation prompt — AmuleD v0.5.1 (K:\work\AmuleD_v2)
 
-Updated: 2026-09-25 18:35
-Session state: 8 (no-Claude track; P+S+C DONE; стадия U фаза 1 — DONE, фаза 2 TODO: паук внутрь ядра)
+Updated: 2026-09-25 20:35
+Session state: 8 (no-Claude track; P+S+C DONE; стадия U фазы 1-2 DONE — ядро владеет DuckDB монопольно; см. «Стадия U» ниже)
 
 ---
 
@@ -117,6 +117,29 @@ Wire-оракул: tshark K:\Software\WireShark\WiresharkPortable64\App\Wireshar
 
 Следующая — стадия X (ротация узлов паука, upload status CLI,
 MISCOPTIONS-сверка, GeoIP, UPnP).
+
+## Стадия U фаза 2 — ядро владеет DuckDB [КЛЮЧЕВОЕ ИЗМЕНЕНИЕ АРХИТЕКТУРЫ]
+
+- `amuled serve` (AmuleD_Run.ps1 serve) = **единое ядро**: SpiderEngine
+  (core/kad/spider.py, порт kad_spider) + listener + republish + IPC
+  (core/kernel_control.py) в ОДНОМ процессе с ОДНИМ постоянным DuckDB-
+  коннектом. `amuled daemon status|stop` — через IPC.
+- **СЛЕДСТВИЕ (спроектированное)**: пока ядро работает, НИКАКИЙ другой
+  процесс не откроет db/amuled.db (rw-лок). Старый `AmuleD_Run.ps1 spider`
+  больше не запускать параллельно. CLI-команды с прямым DuckDB-доступом
+  (share, search results, servers, download, publish, ipfilter) под живым
+  ядром упадут — пользоваться после `amuled daemon stop` либо расширять
+  IPC-роутинг (credits/daemon/share.list/share.count уже работают).
+- kernel_status.json — источник правды (serve_port, control_port);
+  serve_status.json больше не пишется.
+- **pytest запускать при ОСТАНОВЛЕННОМ ядре** (ядро держит rw-лок — все
+  DB-тесты падают иначе).
+- LIVE: раздача 5 916 774 байт через ядро (MD4 сверен), кредит по IPC
+  мгновенно, daemon status 0.56 c, lock-ретраев ноль. Suite 294 passed.
+- Пуш стадии U НЕ делался — только по явной команде.
+
+Следующая — стадия X; до неё: фаза 3 (IPC-роутинг остальных CLI-команд
+или явно задокументированный stop-workflow).
 
 ## Быстрый старт (обязательный порядок)
 
