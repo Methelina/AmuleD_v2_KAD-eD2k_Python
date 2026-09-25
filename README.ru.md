@@ -29,7 +29,7 @@ AmuleD — клиент для децентрализованного обмен
 
 ### Текущий статус (честно)
 
-Это ранний, но живой клиент: поиск (включая KAD), приём источников, публикация ваших файлов в KAD и раздача файлов другим (serve-демон с upload-очередью) уже работают против реальной сети eMule, а исходящие пиринговые соединения используют обязательную TCP-обфускацию. Ещё в разработке: приём обфусцированных входящих соединений (ожидает внешнего protocol review — сегодня отвечаем на plain-протокол), завершение закачек от KAD-источников end-to-end, SecureIdent/кредиты. Следить за прогрессом можно в roadmap (секции помечены DONE/WIP/PLANNED).
+Это ранний, но живой клиент: поиск (включая KAD), приём источников, публикация ваших файлов в KAD и раздача файлов другим (serve-демон с upload-очередью) уже работают против реальной сети eMule, а исходящие пиринговые соединения используют обязательную TCP-обфускацию (проверено live end-to-end: AmuleD скачал реальный файл с реального eMule-клиента по обфусцированному каналу с совпавшим MD4; также установлена live DH-обфусцированная сессия с реальным ED2K-сервером). Ещё в разработке: приём обфусцированных входящих соединений (ожидает внешнего protocol review — сегодня отвечаем на plain-протокол), закачки напрямую из пула KAD-источников ядра, GeoIP, крипта SecureIdent/кредитов. Следить за прогрессом можно в roadmap (секции помечены DONE/WIP/PLANNED).
 
 ### Требования
 
@@ -251,8 +251,13 @@ AmuleD распространяется по Apache 2.0. GPL-деревья aMul
 | Serve-демон (раздача файлов)                   | Реализовано                       | `scripts/serve_daemon.py`                                  |
 | Единое ядро (паук+listener+state, один процесс) | **Проверено живой сетью**        | `src/amuled_v2/core/kernel.py`, `core/kernel_control.py`, `core/kad/spider.py` |
 | Журнал клиентских кредитов (учёт по userhash)  | Реализовано                       | `src/amuled_v2/state.py` (миграция 7)                      |
+| Исходящая TCP-обфускация (BASIC, постоянные стримы) | **Проверено живой сетью**    | `src/amuled_v2/core/peer/obfuscation.py` (v0.3.0), `core/peer/client.py` |
+| DH-обфусцированный handshake (server-mode)     | **Проверено живой сетью** (реальный ED2K-сервер) | `src/amuled_v2/core/peer/obfuscation.py`   |
+| End-to-end обфусцированная закачка (реальный eMule-пир, MD4 сверен) | **Проверено живой сетью** | `src/amuled_v2/core/peer/client.py`, `core/download/runner.py` |
+| UPnP IGD + NAT-PMP маппинг портов              | Реализовано                       | `src/amuled_v2/core/nat/upnp.py`                           |
+| known.met импорт/экспорт                       | Реализовано                       | `src/amuled_v2/core/sharing/known_met.py`, `cli.py`        |
 | Приём обфусцированных входящих                 | В плане (внешняя сессия)          | `docs/roadmap.md`                                          |
-| GeoIP / UPnP-NAT-PMP                           | В плане                           | `docs/roadmap.md`                                          |
+| GeoIP                                          | В плане                           | `docs/roadmap.md`                                          |
 
 ### Заметки о KAD-движке
 
@@ -362,19 +367,21 @@ JSONL-записи фильтруются напрямую по полю `tag`.
 - Движок Kademlia (бутстрап, routing, обфускация, keyword-поиск) - **DONE** (живой: 200 результатов/запрос)
 - KAD-поиск источников с сохранением в DuckDB - **DONE** (живой: источники из реальной сети)
 - KAD CLI-команды (`kad search/sources`), паук-демон, интерактивное меню - **DONE**
-- Клиентский дозвон через TCP-обфускацию - **DONE** (handshake подтверждён живой сетью)
+- Клиентский дозвон через TCP-обфускацию - **DONE** (live: HELLOANSWER + полная закачка с реального eMuleAI, MD4 сверен)
+- Live DH-сессия с реальным ED2K-сервером (server-mode) - **DONE** (magic сверён)
 - KAD-публикация (keywords + sources) с петлёй перепубликации - **DONE** (живо подтверждено)
 - Upload-движок, входящий listener, serve-демон, единая идентичность - **DONE** (loopback-самотест: MD4 сверен)
-- Журнал клиентских кредитов по userhash (учёт upload/download) - **DONE**
-- Единое ядро: паук + listener + состояние DuckDB в одном процессе, CLI по IPC - **DONE** (ноль конкуренции за лок, живо подтверждено)
+- Журнал клиентских кредитов по userhash (учёт upload/download, credits→priority) - **DONE**
+- Единое ядро: паук + listener + состояние DuckDB в одном процессе, весь read-only CLI и меню по IPC - **DONE** (ноль конкуренции за лок, живо подтверждено)
+- Паритет раздачи: periodic QUEUERANK, slot rotation, known.met импорт/экспорт, UPnP/NAT-PMP - **DONE**
 
 Активные / следующие станции (WIP/PLANNED):
 
-1. Загрузки от KAD-источников end-to-end (верификация MD4) - **WIP**
+1. Закачки напрямую из пула KAD-источников ядра (infra готова, нужен live-прогон) - **WIP**
 2. Приём обфусцированных входящих (внешний protocol review) - **WIP**
-3. IPC-роутинг остальных CLI-команд (share/search/servers/download) - **PLANNED**
-4. Каркас Credits / SecureIdent - **PLANNED** (крипта — внешняя сессия)
-5. GeoIP / UPnP-NAT-PMP - **PLANNED**
+3. GeoIP (assets/v1/GeoIP.dat) - **PLANNED**
+4. Каркас SecureIdent / крипта кредитов - **PLANNED** (крипта — внешняя сессия)
+5. Source exchange как отвечающая сторона, AICH, disk-space checks - **PLANNED**
 
 Заметки ранних сессий хранятся для контекста в docs/roadmap.md - каждая секция там помечена DONE/SOLVED/WIP/DEPRECATED/TODO; живое состояние - в секциях 11a-11f. Отдельный скрипт паука упразднён — паук живёт внутри ядра (`core/kad/spider.py`).
 
