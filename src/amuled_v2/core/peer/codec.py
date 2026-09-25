@@ -53,6 +53,7 @@ Patch Notes v0.2.0 (Soror L.'.L'.):
 
 from __future__ import annotations
 
+import struct
 import zlib
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -124,6 +125,8 @@ class C2CTCP:
     QUEUERANK = 0x5C
     END_OF_DOWNLOAD = 0x49
     FILESTATUS = 0x50
+    FILEREQANSNOFIL = 0x39  # OP_FILEREQANSNOFIL (opcodes.h 0.50a): no such file
+    OUTOFPARTREQS = 0x57  # OP_OUTOFPARTREQS: source has no parts right now
     REQUESTPARTS = 0x47
     REQUESTPARTS_I64 = 0xA3
     SENDINGPART = 0x46
@@ -182,12 +185,20 @@ def _build_hello_tags(nickname: str, version: int = 0x3C, client_port: int = 0) 
         | (cap_multipacket << 1)
         | (0 << 0)   # preview (нет)
     )
+    # TCP-криптослой: клиентская обфускация У НАС ЕСТЬ (obfuscation.py,
+    # client v0.3.0), поэтому честно заявляем Supports+Requests (биты 7/8);
+    # Requires (бит 9) не ставим — plain-пиров не отвергаем на этапе битов.
+    cap_crypt_supports = 1
+    cap_crypt_requests = 1
+    cap_crypt_requires = 0
     miso2 = (
         (cap_file_identifiers << 13)
         | (0 << 12)  # direct UDP callback (нет)
         | (0 << 11)  # captcha (нет)
         | (0 << 10)  # source exchange v2 (не отвечаем)
-        | (0 << 9) | (0 << 8) | (0 << 7)  # TCP-криптослой (не реализован)
+        | (cap_crypt_requires << 9)
+        | (cap_crypt_requests << 8)
+        | (cap_crypt_supports << 7)
         | (0 << 6)   # reserved (mod bit)
         | (cap_ext_multipacket << 5)
         | (cap_large_files << 4)
@@ -196,15 +207,55 @@ def _build_hello_tags(nickname: str, version: int = 0x3C, client_port: int = 0) 
     # Версия, под которой нас видят пиры: (major << 17) | (minor << 10) |
     # (update << 7) = eMule 0.50a. Держать синхронно с build_emuleinfo_payload.
     emule_version_tag = (0 << 17) | (50 << 10) | (0 << 7)
+    # Vanilla tag order (SendHelloTypePacket, BaseClient.cpp:1853):
+    # NAME, VERSION, UDPPORTS, MISCOPTIONS1, MISCOPTIONS2, EMULE_VERSION.
+    # The eMuleAI Shield flags PR_WRONGTAGORDER otherwise.
     tags: list[Ed2kTag] = [
         Ed2kTag(name_id=0x01, type=STRING, value=nickname),           # имя
         Ed2kTag(name_id=0x11, type=UINT32, value=version),            # ed2k version
         Ed2kTag(name_id=0xF9, type=UINT32, value=udports),            # udp ports
         Ed2kTag(name_id=0xFA, type=UINT32, value=miso1),              # misc options 1
-        Ed2kTag(name_id=0xFB, type=UINT32, value=emule_version_tag),  # emule version
         Ed2kTag(name_id=0xFE, type=UINT32, value=miso2),              # misc options 2
+        Ed2kTag(name_id=0xFB, type=UINT32, value=emule_version_tag),  # emule version
     ]
     return tags
+
+
+def _write_hello_tag(tag: Ed2kTag, writer: BinaryWriter) -> None:
+    """Write one HELLO tag in the OLD CTag::WriteTagToFile format
+    (Packets.cpp:676-716), the only form real clients send in HELLO:
+
+        [type u8][u16 namelen = 1][u8 name_id][value]
+
+    Integers are always TAGTYPE_UINT32 (0x03) with a u32 value; strings
+    are TAGTYPE_STRING (0x02) with a u16 length.  The compact 0x80|type
+    short form (write_new_tag) is parser-compatible but no real client
+    emits it here — the eMuleAI Shield flags PR_WRONGTAGFORMAT.
+    """
+    name = tag.name if tag.name is not None else tag.name_id
+    if name is None:
+        raise PeerCodecError("HELLO tag needs a name or name_id")
+    if isinstance(tag.value, str):
+        raw = tag.value.encode("utf-8")
+        writer.write_u8(0x02)
+        writer.write_u16(1)
+        writer.write_u8(int(name))
+        writer.write_u16(len(raw))
+        writer.write_bytes(raw)
+        return
+    if isinstance(tag.value, int) and not isinstance(tag.value, bool):
+        if not 0 <= tag.value <= 0xFFFFFFFF:
+            raise PeerCodecError(
+                f"HELLO uint tag value out of UInt32 range: {tag.value}"
+            )
+        writer.write_u8(0x03)
+        writer.write_u16(1)
+        writer.write_u8(int(name))
+        writer.write_u32(tag.value)
+        return
+    raise PeerCodecError(
+        f"unsupported HELLO tag value type: {type(tag.value).__name__}"
+    )
 
 
 def _write_hello_body(
@@ -236,10 +287,7 @@ def _write_hello_body(
     tags = _build_hello_tags(nickname, version, client_port)
     writer.write_u32(len(tags))
     for tag in tags:
-        try:
-            write_new_tag(tag, writer)
-        except TagError as exc:
-            raise PeerCodecError(f"cannot encode HELLO tag: {exc}") from exc
+        _write_hello_tag(tag, writer)
     # Хвост HELLO/HELLOANSWER одинаков: server_ip u32 + server_port u16
     # (SendHelloTypePacket, BaseClient.cpp:2212-2217). Без этих 6 байт
     # приёмник читает за концом буфера и рвёт соединение мгновенно.
@@ -302,23 +350,44 @@ def build_hello_payload(
     return payload
 
 
+def _parse_hello_body(payload: bytes, label: str) -> tuple[BinaryReader, bytes, int, int, tuple[Ed2kTag, ...], int, int]:
+    """Parse shared HELLO/HELLOANSWER fields.
+
+    Canonical form: [hashlen u8 = 16][hash 16][client_id u32][port u16]
+    [tagcount u32][tags][server_ip u32][server_port u16].
+
+    The eMuleAI 1.6.0 fork writes HELLOANSWER WITHOUT the leading length
+    byte (verified live 2026-09-26: payload starts directly with the
+    16-byte userhash, followed by client_id whose low bytes match the
+    advertised client id and the real 8089 listen port).  When the first
+    byte is not 16, the length-less fork form is accepted.
+    """
+    reader = BinaryReader(payload)
+    hash_len = reader.read_u8()
+    if hash_len == _HASH16_SIZE:
+        user_hash = reader.read_hash16()
+    else:
+        # Fork form: the first byte is already part of the hash.
+        reader = BinaryReader(payload)
+        user_hash = reader.read_bytes(_HASH16_SIZE)
+    client_id = reader.read_u32()
+    client_port = reader.read_u16()
+    tags = parse_hello_tags(reader)
+    server_ip = reader.read_u32()
+    server_port = reader.read_u16()
+    if reader.remaining:
+        raise PeerCodecError(f"{label} has {reader.remaining} trailing bytes")
+    return reader, user_hash, client_id, client_port, tags, server_ip, server_port
+
+
 def parse_hello(payload: bytes) -> Hello:
     """Parse an ``OP_HELLO`` payload into a :class:`Hello`."""
-    reader = BinaryReader(payload)
     try:
-        hash_len = reader.read_u8()
-        if hash_len != _HASH16_SIZE:
-            raise PeerCodecError(f"HELLO hash length must be {_HASH16_SIZE}, got {hash_len}")
-        user_hash = reader.read_hash16()
-        client_id = reader.read_u32()
-        client_port = reader.read_u16()
-        tags = parse_hello_tags(reader)
-        server_ip = reader.read_u32()
-        server_port = reader.read_u16()
+        _, user_hash, client_id, client_port, tags, _, _ = _parse_hello_body(
+            payload, "OP_HELLO"
+        )
     except CodecError as exc:
         raise PeerCodecError(f"malformed OP_HELLO: {exc}") from exc
-    if reader.remaining:
-        raise PeerCodecError(f"OP_HELLO has {reader.remaining} trailing bytes")
     nickname = ""
     version = 0
     for tag in tags:
@@ -405,21 +474,12 @@ def build_hello_answer_payload(
 
 def parse_hello_answer(payload: bytes) -> HelloAnswer:
     """Parse an ``OP_HELLOANSWER`` payload into a :class:`HelloAnswer`."""
-    reader = BinaryReader(payload)
     try:
-        hash_len = reader.read_u8()
-        if hash_len != _HASH16_SIZE:
-            raise PeerCodecError(f"HELLOANSWER hash length must be {_HASH16_SIZE}, got {hash_len}")
-        user_hash = reader.read_hash16()
-        client_id = reader.read_u32()
-        client_port = reader.read_u16()
-        tags = parse_hello_tags(reader)
-        server_ip = reader.read_u32()
-        server_port = reader.read_u16()
+        _, user_hash, client_id, client_port, tags, server_ip, server_port = (
+            _parse_hello_body(payload, "OP_HELLOANSWER")
+        )
     except CodecError as exc:
         raise PeerCodecError(f"malformed OP_HELLOANSWER: {exc}") from exc
-    if reader.remaining:
-        raise PeerCodecError(f"OP_HELLOANSWER has {reader.remaining} trailing bytes")
     nickname = ""
     version = 0
     for tag in tags:
@@ -515,19 +575,39 @@ class HashSetAnswer:
 
 
 def parse_hashset_answer(payload: bytes) -> HashSetAnswer:
-    """Parse an ``OP_HASHSETANSWER`` payload into a :class:`HashSetAnswer`."""
-    reader = BinaryReader(payload)
-    try:
-        count = reader.read_u16()
-        hashes: list[bytes] = []
-        for _ in range(count):
-            hashes.append(reader.read_hash16())
-    except CodecError as exc:
-        raise PeerCodecError(f"malformed OP_HASHSETANSWER: {exc}") from exc
-    if reader.remaining:
-        raise PeerCodecError(f"OP_HASHSETANSWER has {reader.remaining} trailing bytes")
+    """Parse an ``OP_HASHSETANSWER`` payload into a :class:`HashSetAnswer`.
+
+    Canonical form: [count u16][count x hash16] where hashes[0] is the
+    file hash and the rest are part hashes.
+
+    The eMuleAI 1.6.0 fork sends the layout INVERTED for single-part
+    files: [file hash 16][count u16] (verified live 2026-09-26: an
+    18-byte answer ``e4ba...a560000`` for a one-part file).  When the
+    canonical parse does not fit, the inverted form is accepted and the
+    trailing counter (0 or the hash count) is ignored.
+    """
+    def _canonical(data: bytes) -> list[bytes] | None:
+        if len(data) < 2:
+            return None
+        (count,) = struct.unpack_from("<H", data, 0)
+        if count > 0 and len(data) == 2 + _HASH16_SIZE * count:
+            hashes = [data[2 + i * _HASH16_SIZE:2 + (i + 1) * _HASH16_SIZE]
+                      for i in range(count)]
+            return hashes
+        return None
+
+    hashes: list[bytes] | None = _canonical(payload)
+    if hashes is None and len(payload) == _HASH16_SIZE + 2:
+        # eMuleAI fork form: [file hash 16][count u16] (count ignored).
+        hashes = [payload[:_HASH16_SIZE]]
+        log.debug(
+            "HASHSETANSWER: eMuleAI fork layout detected "
+            "(hash first, trailing counter)"
+        )
     if not hashes:
-        raise PeerCodecError("OP_HASHSETANSWER has zero hashes")
+        raise PeerCodecError(
+            f"malformed OP_HASHSETANSWER: length {len(payload)} fits no known layout"
+        )
     result = HashSetAnswer(file_hash=hashes[0], chunk_hashes=tuple(hashes[1:]))
     log.debug(
         "HASHSETANSWER parsed: file_hash=%s, chunk_count=%d",

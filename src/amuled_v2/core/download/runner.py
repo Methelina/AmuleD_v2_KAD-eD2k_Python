@@ -74,6 +74,7 @@ class DownloadRunner:
         queue_wait_timeout: float = 60.0,
         traffic_sink: "Callable[[str, int], None] | None" = None,
         source_provider: "Callable[[str, int], list[dict]] | None" = None,
+        plain_dial_ok: bool = False,
     ) -> None:
         self.queue = queue
         self.local_client_id = local_client_id
@@ -89,28 +90,51 @@ class DownloadRunner:
         # Stage U: when the kernel owns the db, sources arrive over IPC via
         # this provider instead of a direct state query.
         self.source_provider = source_provider
+        # Plain dial for rows WITHOUT a KAD userhash.  On the real network
+        # plain is dead (instant FIN) so the default is False; loopback
+        # self-tests against our own plain-only listener set it True.
+        self.plain_dial_ok = plain_dial_ok
 
-    def resolve_sources(self, file_hash: str, *, limit: int = 20) -> list[tuple[str, int]]:
+    def resolve_sources(
+        self, file_hash: str, *, limit: int = 20
+    ) -> list[tuple[str, int, bytes | None]]:
+        """High-id endpoints for a hash: (ip, port, user_hash | None).
+
+        The user_hash (KAD source_id) enables the BASIC-obfuscated dial;
+        rows without it cannot be dialed safely (plain is dead), so they
+        are skipped for the attempt list.
+        """
         if self.source_provider is not None:
             rows = self.source_provider(file_hash, limit)
         else:
             rows = self.queue.state.list_file_sources(file_hash, limit=limit)
         seen: set[tuple[str, int]] = set()
-        endpoints: list[tuple[str, int]] = []
+        endpoints: list[tuple[str, int, bytes | None]] = []
         skipped = 0
         for row in rows:
             client_id = row["client_id"]
             if client_id < _HIGH_ID_THRESHOLD:
                 skipped += 1
                 continue
+            raw_hash = row.get("user_hash")
+            user_hash: bytes | None = None
+            if raw_hash:
+                try:
+                    user_hash = bytes.fromhex(str(raw_hash))
+                except ValueError:
+                    user_hash = None
+            if user_hash is None:
+                if not self.plain_dial_ok:
+                    skipped += 1
+                    continue
             endpoint = (_client_id_to_ip(client_id), row["client_port"])
             if endpoint in seen:
                 continue
             seen.add(endpoint)
-            endpoints.append(endpoint)
+            endpoints.append((endpoint[0], endpoint[1], user_hash))
         if skipped:
             log.debug(
-                "DOWNLOAD skipped low-id sources: hash=%s, skipped=%d",
+                "DOWNLOAD skipped undialable sources: hash=%s, skipped=%d",
                 file_hash,
                 skipped,
             )
@@ -118,7 +142,7 @@ class DownloadRunner:
 
     async def _attempt_peer(
         self,
-        endpoint: tuple[str, int],
+        endpoint: tuple[str, int, bytes | None],
         file_hash: str,
         size: int,
         file_hash_bytes: bytes,
@@ -126,7 +150,7 @@ class DownloadRunner:
     ) -> dict:
         """Drive one peer through the full download ladder; return an
         outcome dict (never raises — failures become outcome dicts)."""
-        host, port = endpoint
+        host, port, user_hash = endpoint
         outcome: "DownloadOutcome | None" = None
         client = None
         try:
@@ -142,6 +166,7 @@ class DownloadRunner:
                 response_timeout=self.peer_response_timeout,
                 queue_wait_timeout=self.queue_wait_timeout,
                 traffic_sink=self.traffic_sink,
+                target_userhash=user_hash,
             )
             await client.connect()
             await client.handshake()

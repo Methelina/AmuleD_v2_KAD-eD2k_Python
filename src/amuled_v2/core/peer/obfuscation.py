@@ -47,10 +47,24 @@ Diffie-Hellman parameters (from ``EncryptedStreamSocket.cpp``):
 
     g = 2,  p = dh768_p  (768-bit MODP prime, 96 bytes)
 
+Keystream continuity (the invariant behind the post-handshake FIN blocker):
+
+    Each direction has exactly ONE RC4 stream for the whole connection.  The
+    1024-byte drop happens once, when the stream is created; the handshake
+    body, the handshake padding and every later application byte continue on
+    that same stream (``SendNegotiatingData`` and ``CryptPrepareSendData`` both
+    use ``m_pRC4SendKey``).  After the handshake the send stream sits at offset
+    ``7 + pad_len`` and the recv stream at ``6 + peer_pad_len``.  Re-creating a
+    stream from :class:`NegotiationKeys` for the first OP_HELLO restarts the
+    keystream at offset 0: the peer then decrypts garbage, fails the protocol
+    byte check (``CEMSocket::OnReceive`` -> ``ERR_WRONGHEADER``) and closes the
+    socket without sending anything.  Use :class:`BasicObfuscationSession` (or
+    :func:`negotiate_basic_client`) for real connections.
+
 src/amuled_v2/core/peer/obfuscation.py
-Version:     0.2.0
+Version:     0.3.0
 Author:      Soror L.'.L'.
-Updated:     2026-09-24
+Updated:     2026-09-26
 
 Patch Notes v0.1.0 (Soror L.'.L'.):
   [+] Added DH obfuscation request builder (build_dh_request).
@@ -65,10 +79,20 @@ Patch Notes v0.2.0 (Soror L.'.L'.):
   [FIX] Corrected protocol-marker constants to OP_PACKEDPROT=0xD4 and
       OP_EMULEPROT=0xC5 (opcodes.h); previous values 0xC0/0xED would cause
       the semi-random marker to collide with valid protocol bytes -- иначе пир не примет.
+
+Patch Notes v0.3.0 (Soror L.'.L'.):
+  [+] Added BasicObfuscationSession: one live send + one live recv RC4
+      stream per connection, incremental response parsing, leftover bytes.
+  [+] Added negotiate_basic_client (asyncio reader/writer helper).
+  [+] Rc4Stream.offset -- keystream bytes consumed after the drop.
+  [FIX] Documented keystream continuity; NegotiationKeys no longer suggests
+      re-applying the 1024-byte drop "before use" (that restarts the stream
+      and makes the peer FIN on the first encrypted packet).
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import random
@@ -108,6 +132,8 @@ __all__ = [
     "compute_dh_public_key",
     "build_basic_client_request",
     "parse_basic_client_response",
+    "BasicObfuscationSession",
+    "negotiate_basic_client",
 ]
 
 
@@ -190,12 +216,17 @@ class ObfuscationError(Exception):
 
 @dataclass(frozen=True)
 class NegotiationKeys:
-    """Keys and RC4 keystream-drop lengths produced by the DH handshake.
+    """Keys and RC4 keystream-drop lengths produced by the handshake.
 
     ``send_key`` encrypts data the client writes to the peer; ``recv_key``
-    decrypts data the peer writes back.  Each RC4 stream must discard
-    ``send_pad_len`` / ``recv_pad_len`` leading keystream bytes before use
-    (always ``RC4_KEY_DROP_BYTES`` per eMule's ``RC4CreateKey``).
+    decrypts data the peer writes back.  ``send_pad_len`` / ``recv_pad_len``
+    (always ``RC4_KEY_DROP_BYTES`` per eMule's ``RC4CreateKey``) are dropped
+    ONCE, when the stream is created at connection start.
+
+    These are key material, not stream state: never build a second
+    :class:`Rc4Stream` from them in the middle of a connection -- the
+    handshake has already advanced the live stream (see module docstring,
+    "Keystream continuity").
     """
 
     send_key: bytes
@@ -589,64 +620,26 @@ def build_basic_client_request(
         *keys* holds the derived :class:`NegotiationKeys`, and
         *random_key_part* is the (possibly generated) 32-bit value.
 
+    Warning:
+        Handshake-only helper.  The send stream that encrypted the request
+        is discarded, so the returned *keys* cannot encrypt the OP_HELLO that
+        follows (a fresh stream restarts at keystream offset 0 instead of
+        ``7 + pad_len``).  For a real connection use
+        :class:`BasicObfuscationSession`.
+
     Raises:
         ObfuscationError: if *target_userhash* is not 16 bytes, or *padding*
             length (when given) is outside 0..15.
     """
-    if not isinstance(target_userhash, (bytes, bytearray)) or len(target_userhash) != 16:
+    if padding is not None and not 0 <= len(padding) < MAX_PADDING_LENGTH:
         raise ObfuscationError(
-            f"target_userhash must be exactly 16 bytes, got {len(target_userhash)}"
+            f"explicit padding length {len(padding)} out of range 0..{MAX_PADDING_LENGTH - 1}"
         )
-
-    if random_key_part is None:
-        random_key_part = int.from_bytes(os.urandom(4), "little")
-    elif not isinstance(random_key_part, int) or not (0 <= random_key_part <= 0xFFFFFFFF):
-        raise ObfuscationError(
-            f"random_key_part must be in [0, 0xFFFFFFFF], got {random_key_part}"
-        )
-
-    keys = derive_basic_keys(target_userhash, random_key_part)
-
-    # Plaintext header (5 bytes, NOT encrypted): marker + u32 LE random_key_part.
-    marker = _not_protocol_marker()
-    plaintext = bytes((marker,)) + struct.pack("<I", random_key_part)
-
-    # Encrypted body (from byte 5 onward) -- same RC4 send-stream used for
-    # the rest of the session.
-    if padding is not None:
-        pad_len = len(padding)
-        if not 0 <= pad_len < MAX_PADDING_LENGTH:
-            raise ObfuscationError(
-                f"explicit padding length {pad_len} out of range 0..{MAX_PADDING_LENGTH - 1}"
-            )
-        body_padding = bytes(padding)
-    else:
-        pad_len = semirandom_padding_length()
-        body_padding = os.urandom(pad_len)
-
-    encrypted_portion = (
-        struct.pack("<I", MAGICVALUE_SYNC)
-        + bytes((ENM_OBFUSCATION,))
-        + bytes((ENM_OBFUSCATION,))
-        + bytes((pad_len,))
-        + body_padding
+    session = BasicObfuscationSession(
+        target_userhash, random_key_part=random_key_part, padding=padding
     )
-
-    send_stream = Rc4Stream(keys.send_key, drop=keys.send_pad_len)
-    encrypted_body = send_stream.crypt(encrypted_portion)
-
-    request = plaintext + encrypted_body
-
-    log.debug(
-        "basic request built: marker=0x%02x pad_len=%d random_key_part=%u "
-        "total_len=%d send_key_hex4=%s",
-        marker,
-        pad_len,
-        random_key_part,
-        len(request),
-        keys.send_key[:4].hex(),
-    )
-    return request, keys, random_key_part
+    request = session.build_request()
+    return request, session.keys, session.random_key_part
 
 
 def parse_basic_client_response(payload: bytes, keys: NegotiationKeys) -> int:
@@ -676,6 +669,11 @@ def parse_basic_client_response(payload: bytes, keys: NegotiationKeys) -> int:
     Returns:
         The total number of decrypted bytes consumed (6 + peer_pad_len),
         i.e. the complete frame length.
+
+    Warning:
+        Handshake-only helper: its recv stream is discarded, so it cannot
+        decrypt OP_HELLOANSWER.  Use :meth:`BasicObfuscationSession.feed_response`
+        on a live connection.
 
     Raises:
         ObfuscationError: if the payload is shorter than the minimum
@@ -739,7 +737,7 @@ class Rc4Stream:
     and decryption on the client and server side.
     """
 
-    __slots__ = ("_cipher",)
+    __slots__ = ("_cipher", "_offset")
 
     def __init__(self, key: bytes, drop: int = RC4_KEY_DROP_BYTES) -> None:
         if not isinstance(key, (bytes, bytearray)):
@@ -747,11 +745,275 @@ class Rc4Stream:
         if drop < 0:
             raise ObfuscationError(f"drop must be non-negative, got {drop}")
         self._cipher = ARC4.new(key)
+        self._offset = 0
         if drop:
             # Discard `drop` keystream bytes by encrypting null bytes.
             self._cipher.encrypt(b"\x00" * drop)
         log.debug("Rc4Stream initialised: key_len=%d drop=%d", len(key), drop)
 
+    @property
+    def offset(self) -> int:
+        """Keystream bytes consumed since the drop (diagnostics / tests)."""
+        return self._offset
+
     def crypt(self, data: bytes) -> bytes:
         """Encrypt or decrypt *data* (same operation for RC4)."""
+        self._offset += len(data)
         return self._cipher.encrypt(data)
+
+
+# ---------------------------------------------------------------------------
+# BASIC client session (live streams for one outgoing connection)
+# ---------------------------------------------------------------------------
+
+_BASIC_STATE_PENDING = "pending"          # ECS_PENDING: request not sent yet
+_BASIC_STATE_NEGOTIATING = "negotiating"  # ECS_NEGOTIATING: waiting for response
+_BASIC_STATE_ENCRYPTING = "encrypting"    # ECS_ENCRYPTING: payload may flow
+_BASIC_STATE_FAILED = "failed"
+
+# Response header after decryption: MAGICVALUE_SYNC u32 + method u8 + padlen u8.
+_BASIC_RESPONSE_HEADER = 6
+
+
+class BasicObfuscationSession:
+    """Live BASIC-obfuscation state of ONE outgoing TCP connection.
+
+    Mirrors the dialer side of ``CEncryptedStreamSocket``: the keys are made
+    in ``SetConnectionEncryption`` (``EncryptedStreamSocket.cpp:399-415``), the
+    request is sent by ``StartNegotiation(true)`` (``:446-464``), the response
+    is consumed by ``Negotiate`` ``ONS_BASIC_CLIENTB_*`` (``:599-627``), and
+    afterwards every packet goes through ``CryptPrepareSendData`` /
+    ``Receive`` ``ECS_ENCRYPTING`` (``:199-215``, ``:380-383``) on the SAME two
+    RC4 streams.
+
+    Usage::
+
+        session = BasicObfuscationSession(target_userhash)
+        writer.write(session.build_request())
+        leftover = None
+        while leftover is None:
+            leftover = session.feed_response(await reader.read(4096))
+        # leftover: already-decrypted payload that followed the handshake
+        writer.write(session.encrypt(hello_frame))
+        plain = session.decrypt(await reader.read(4096))
+
+    Every byte received from the peer must pass through :meth:`feed_response`
+    or :meth:`decrypt` exactly once and in order; every byte sent after the
+    request must pass through :meth:`encrypt`.
+    """
+
+    __slots__ = (
+        "_keys",
+        "_random_key_part",
+        "_padding",
+        "_send",
+        "_recv",
+        "_state",
+        "_rx",
+        "_peer_pad_len",
+    )
+
+    def __init__(
+        self,
+        target_userhash: bytes,
+        *,
+        random_key_part: Optional[int] = None,
+        padding: Optional[bytes] = None,
+    ) -> None:
+        if not isinstance(target_userhash, (bytes, bytearray)) or len(target_userhash) != 16:
+            raise ObfuscationError(
+                f"target_userhash must be exactly 16 bytes, got {len(target_userhash)}"
+            )
+        if random_key_part is None:
+            random_key_part = int.from_bytes(os.urandom(4), "little")
+        elif not isinstance(random_key_part, int) or not (0 <= random_key_part <= 0xFFFFFFFF):
+            raise ObfuscationError(
+                f"random_key_part must be in [0, 0xFFFFFFFF], got {random_key_part}"
+            )
+        if padding is not None and len(padding) > 0xFF:
+            # padlen is a single byte on the wire (eMule itself pads up to
+            # CryptTCPPaddingLength, default 128, max 254).
+            raise ObfuscationError(f"padding length {len(padding)} exceeds 255")
+
+        self._keys = derive_basic_keys(bytes(target_userhash), random_key_part)
+        self._random_key_part = random_key_part
+        self._padding = None if padding is None else bytes(padding)
+        # Один поток на направление на всё соединение: drop 1024 — ровно один
+        # раз, здесь. Пересоздание потока после handshake = FIN от пира.
+        self._send = Rc4Stream(self._keys.send_key, drop=self._keys.send_pad_len)
+        self._recv = Rc4Stream(self._keys.recv_key, drop=self._keys.recv_pad_len)
+        self._state = _BASIC_STATE_PENDING
+        self._rx = bytearray()
+        self._peer_pad_len: Optional[int] = None
+
+    # -- introspection -----------------------------------------------------
+
+    @property
+    def keys(self) -> NegotiationKeys:
+        return self._keys
+
+    @property
+    def random_key_part(self) -> int:
+        return self._random_key_part
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def is_established(self) -> bool:
+        return self._state == _BASIC_STATE_ENCRYPTING
+
+    @property
+    def send_offset(self) -> int:
+        """Send keystream bytes used since the drop (7 + pad_len after the request)."""
+        return self._send.offset
+
+    @property
+    def recv_offset(self) -> int:
+        """Recv keystream bytes used since the drop."""
+        return self._recv.offset
+
+    # -- handshake -----------------------------------------------------------
+
+    def build_request(self) -> bytes:
+        """Return the handshake request; callable once, before any payload.
+
+        ``[marker][keypart u32 LE] || RC4_send(MAGIC u32 LE | 0x00 | 0x00 |
+        padlen | pad)`` -- only bytes 5.. are encrypted
+        (``SendNegotiatingData(buf, len, 5)``).
+        """
+        if self._state != _BASIC_STATE_PENDING:
+            raise ObfuscationError(f"build_request called in state {self._state}")
+        if self._padding is not None:
+            pad = self._padding
+        else:
+            pad = os.urandom(semirandom_padding_length())
+        marker = _not_protocol_marker()
+        plaintext = bytes((marker,)) + struct.pack("<I", self._random_key_part)
+        body = (
+            struct.pack("<I", MAGICVALUE_SYNC)
+            + bytes((ENM_OBFUSCATION, ENM_OBFUSCATION, len(pad)))
+            + pad
+        )
+        request = plaintext + self._send.crypt(body)
+        self._state = _BASIC_STATE_NEGOTIATING
+        log.debug(
+            "basic request built: marker=0x%02x pad_len=%d random_key_part=%u "
+            "total_len=%d send_offset=%d",
+            marker,
+            len(pad),
+            self._random_key_part,
+            len(request),
+            self._send.offset,
+        )
+        return request
+
+    def feed_response(self, data: bytes) -> Optional[bytes]:
+        """Consume raw bytes of the peer's handshake response.
+
+        Bytes are decrypted on arrival (RC4 is order-preserving, so bytes that
+        follow the handshake are decrypted correctly too).  Returns ``None``
+        while the response is incomplete; once complete, switches to the
+        encrypting state and returns the decrypted bytes that followed the
+        handshake in *data* (normally ``b""``).
+
+        Raises:
+            ObfuscationError: wrong magic, unsupported method, or wrong state.
+        """
+        if self._state != _BASIC_STATE_NEGOTIATING:
+            raise ObfuscationError(f"feed_response called in state {self._state}")
+        if not data:
+            return None
+        self._rx += self._recv.crypt(bytes(data))
+
+        if self._peer_pad_len is None:
+            if len(self._rx) >= 4:
+                magic = struct.unpack_from("<I", self._rx, 0)[0]
+                if magic != MAGICVALUE_SYNC:
+                    self._state = _BASIC_STATE_FAILED
+                    raise ObfuscationError(
+                        f"wrong magic: got 0x{magic:08X}, expected 0x{MAGICVALUE_SYNC:08X}"
+                    )
+            if len(self._rx) < _BASIC_RESPONSE_HEADER:
+                return None
+            method = self._rx[4]
+            if method != ENM_OBFUSCATION:
+                self._state = _BASIC_STATE_FAILED
+                raise ObfuscationError(
+                    f"unsupported encryption method: got 0x{method:02X}, "
+                    f"expected 0x{ENM_OBFUSCATION:02X}"
+                )
+            self._peer_pad_len = self._rx[5]
+
+        total = _BASIC_RESPONSE_HEADER + self._peer_pad_len
+        if len(self._rx) < total:
+            return None
+        leftover = bytes(self._rx[total:])
+        self._rx = bytearray()
+        self._state = _BASIC_STATE_ENCRYPTING
+        log.debug(
+            "basic handshake complete: peer_pad_len=%d leftover=%d "
+            "send_offset=%d recv_offset=%d",
+            self._peer_pad_len,
+            len(leftover),
+            self._send.offset,
+            self._recv.offset - len(leftover),
+        )
+        return leftover
+
+    # -- payload -------------------------------------------------------------
+
+    def encrypt(self, data: bytes) -> bytes:
+        """Encrypt outgoing payload (continues the handshake send stream)."""
+        if self._state != _BASIC_STATE_ENCRYPTING:
+            raise ObfuscationError(f"encrypt called in state {self._state}")
+        return self._send.crypt(bytes(data))
+
+    def decrypt(self, data: bytes) -> bytes:
+        """Decrypt incoming payload (continues the handshake recv stream)."""
+        if self._state != _BASIC_STATE_ENCRYPTING:
+            raise ObfuscationError(f"decrypt called in state {self._state}")
+        return self._recv.crypt(bytes(data))
+
+
+async def negotiate_basic_client(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    target_userhash: bytes,
+    *,
+    timeout: float = 10.0,
+    random_key_part: Optional[int] = None,
+    padding: Optional[bytes] = None,
+) -> Tuple[BasicObfuscationSession, bytes]:
+    """Run the BASIC handshake on a connected stream.
+
+    Sends the request, waits for the full response and returns
+    ``(session, leftover)``.  Nothing else is written before the response is
+    complete: on the accepting side any byte beyond the handshake in the same
+    ``recv()`` is fatal (``EncryptedStreamSocket.cpp:311-318``, "sent more data
+    then expected while negotiating").
+
+    Raises:
+        ObfuscationError: peer closed, timed out, or answered with a bad frame.
+    """
+    session = BasicObfuscationSession(
+        target_userhash, random_key_part=random_key_part, padding=padding
+    )
+    writer.write(session.build_request())
+    await writer.drain()
+
+    async def _read_response() -> bytes:
+        while True:
+            chunk = await reader.read(4096)
+            if not chunk:
+                raise ObfuscationError("peer closed the connection during BASIC handshake")
+            leftover = session.feed_response(chunk)
+            if leftover is not None:
+                return leftover
+
+    try:
+        leftover = await asyncio.wait_for(_read_response(), timeout)
+    except asyncio.TimeoutError as exc:
+        raise ObfuscationError(f"BASIC handshake timed out after {timeout:.1f}s") from exc
+    return session, leftover

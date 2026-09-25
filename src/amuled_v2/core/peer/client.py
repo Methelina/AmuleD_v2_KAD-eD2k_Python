@@ -14,9 +14,18 @@ Implements the eMule-compatible download flow against one remote client:
    or the peer sends ``OP_END_OF_DOWNLOAD``.
 
 src/amuled_v2/core/peer/client.py
-Version:     0.1.0
+Version:     0.3.0
 Author:      Soror L.'.L.'.
-Updated:     2026-09-23
+Updated:     2026-09-26
+
+Patch Notes v0.3.0 (Soror L'.L'.):
+  [+] BASIC-obfuscation session wired into the transport (block 11e #6,
+      Cloud fix): with a known target userhash, connect() negotiates the
+      obfuscation handshake on ONE persistent RC4 stream per direction
+      (BasicObfuscationSession) and every frame is encrypted/decrypted on
+      that stream afterwards.  No plaintext fallback: the plain protocol
+      is dead on today's network (instant FIN).  Response leftovers are
+      buffered in _rx_plain and consumed exactly once.
 
 Patch Notes v0.1.0 (Soror L.'.L'.):
   [+] Added asyncio peer session with bounded framing and idle timeouts.
@@ -58,6 +67,11 @@ from amuled_v2.core.peer.codec import (
     parse_sending_part,
     parse_sending_part_i64,
 )
+from amuled_v2.core.peer.obfuscation import (
+    BasicObfuscationSession,
+    ObfuscationError,
+    negotiate_basic_client,
+)
 from amuled_v2.logging_setup import LogTags, get_tagged_logger
 
 log = get_tagged_logger(LogTags.PEER, "core.peer.client")
@@ -86,6 +100,12 @@ class C2CEMULE:
     QUEUERANKING = 0x60
     REQUESTPARTS_A4 = 0xA4
     COMPRESSEDPART_A4 = 0xA4
+
+
+# OP_OUTOFPARTREQS retry policy: the source needs a moment to read the
+# file into its upload buffer after granting the slot.
+_OUTOFPART_MAX_RETRIES = 5
+_OUTOFPART_RETRY_DELAY = 3.0
 
 
 class PeerSessionError(RuntimeError):
@@ -193,6 +213,8 @@ class PeerClient:
         response_timeout: float = 20.0,
         queue_wait_timeout: float = 120.0,
         traffic_sink: Optional[Callable[[str, int], None]] = None,
+        target_userhash: Optional[bytes] = None,
+        local_userhash: Optional[bytes] = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -202,6 +224,14 @@ class PeerClient:
         self.connect_timeout = connect_timeout
         self.response_timeout = response_timeout
         self.queue_wait_timeout = queue_wait_timeout
+        # BASIC-obfuscation target (KAD source_id == peer userhash).  When
+        # set, connect() performs the encrypted handshake and every frame
+        # afterwards travels over the session's persistent RC4 streams.
+        self.target_userhash = bytes(target_userhash) if target_userhash else None
+        self._obf: Optional[BasicObfuscationSession] = None
+        # Already-decrypted bytes that arrived together with the handshake
+        # response; consumed exactly once by _read_exact().
+        self._rx_plain = bytearray()
         # Stage C credit accounting: called once per finished transfer with
         # (peer_user_hash_hex, downloaded_bytes); exceptions are swallowed —
         # credit bookkeeping must never break a download.
@@ -212,7 +242,20 @@ class PeerClient:
         self.peer_info: Optional[PeerInfo] = None
         import os
 
-        self.user_hash = os.urandom(16)
+        # eMule marks every generated userhash with SO_EMULE markers
+        # (Preferences.cpp::CreateUserHash: hash[5]=14, hash[14]=111);
+        # GetHashType uses them to classify the client.  A plain random
+        # hash classifies as SO_UNKNOWN and eMuleAI's shield PUNISHES it
+        # as "Bad user hash" (verified live 2026-09-26).  The hash must
+        # also be STABLE across dials from one IP: eMuleAI tracks clients
+        # and bans "Userhash changed" (verified live 2026-09-26).
+        raw = bytes(local_userhash) if local_userhash else os.urandom(16)
+        if len(raw) != 16:
+            raise PeerSessionError("local_userhash must be exactly 16 bytes")
+        marked = bytearray(raw)
+        marked[5] = 14
+        marked[14] = 111
+        self.user_hash = bytes(marked)
 
     @property
     def is_connected(self) -> bool:
@@ -238,8 +281,37 @@ class PeerClient:
             raise PeerSessionError(
                 f"cannot connect to peer {self.host}:{self.port}: {exc}"
             ) from exc
+        # BASIC-obfuscation negotiation BEFORE anything else is sent: the
+        # peer never sees plaintext, and no app bytes precede the response.
+        if self.target_userhash is not None:
+            try:
+                self._obf, leftover = await negotiate_basic_client(
+                    self._reader,
+                    self._writer,
+                    self.target_userhash,
+                    timeout=self.connect_timeout,
+                )
+            except ObfuscationError as exc:
+                await self.close()
+                raise PeerSessionError(
+                    f"obfuscation handshake failed with "
+                    f"{self.host}:{self.port}: {exc}"
+                ) from exc
+            self._rx_plain = bytearray(leftover)
+            log.info(
+                "PEER obfuscation established: host=%s, port=%d, "
+                "leftover=%d",
+                self.host,
+                self.port,
+                len(leftover),
+            )
         self.connected = True
-        log.info("PEER connected: host=%s, port=%d", self.host, self.port)
+        log.info(
+            "PEER connected: host=%s, port=%d, obfuscated=%s",
+            self.host,
+            self.port,
+            self._obf is not None,
+        )
 
     async def close(self) -> None:
         if self._writer is not None:
@@ -247,6 +319,8 @@ class PeerClient:
             self._writer = None
             self._reader = None
             self.connected = False
+            self._obf = None
+            self._rx_plain.clear()
             writer.close()
             try:
                 await writer.wait_closed()
@@ -274,6 +348,10 @@ class PeerClient:
             + bytes([opcode])
             + payload
         )
+        # One live RC4 stream per direction: after the handshake the session
+        # continues exactly where the response padding ended (block 11e #6).
+        if self._obf is not None:
+            wire = self._obf.encrypt(wire)
         writer.write(wire)
         try:
             await writer.drain()
@@ -287,6 +365,22 @@ class PeerClient:
             len(payload),
         )
 
+    async def _read_exact(self, n: int, timeout: float) -> bytes:
+        """Read exactly n WIRE bytes, decrypting at the point of
+        consumption.  Already-decrypted leftovers are consumed only after
+        the read succeeds, and never decrypted twice."""
+        reader = self._reader
+        assert reader is not None
+        take = min(n, len(self._rx_plain))
+        raw = b""
+        if n > take:
+            raw = await asyncio.wait_for(reader.readexactly(n - take), timeout)
+        head = bytes(self._rx_plain[:take])
+        del self._rx_plain[:take]
+        if self._obf is not None:
+            return head + self._obf.decrypt(raw)
+        return head + raw
+
     async def _receive(
         self,
         *,
@@ -299,9 +393,7 @@ class PeerClient:
         if reader is None or not self.connected:
             raise PeerSessionError("peer session is not connected")
         try:
-            header = await asyncio.wait_for(
-                reader.readexactly(_HEADER_SIZE), timeout=effective
-            )
+            header = await self._read_exact(_HEADER_SIZE, effective)
             packet_length = struct.unpack("<I", header[1:5])[0]
             if packet_length < 1:
                 raise PeerSessionError(f"peer packet length below one: {packet_length}")
@@ -313,9 +405,7 @@ class PeerClient:
             payload = (
                 b""
                 if payload_size == 0
-                else await asyncio.wait_for(
-                    reader.readexactly(payload_size), timeout=effective
-                )
+                else await self._read_exact(payload_size, effective)
             )
         except asyncio.IncompleteReadError as exc:
             await self.close()
@@ -333,6 +423,17 @@ class PeerClient:
         return header[0], header[5], payload
 
     # -- handshake -----------------------------------------------------------
+
+    async def raw_peek_last_frame(self) -> Optional[bytes]:
+        """Debug helper: peek the pending decrypted bytes without consuming
+        them (probe diagnostics only; never used in the transfer path)."""
+        if self._reader is None:
+            return None
+        try:
+            pending = bytes(self._rx_plain)
+        except Exception:
+            pending = b""
+        return pending or None
 
     async def handshake(self) -> PeerInfo:
         """Run HELLO and EMULEINFO exchange; returns learned peer info."""
@@ -603,6 +704,7 @@ class PeerClient:
         # Chunks are concatenated until the declared total is reached and
         # only then decompressed.
         pending_compressed: dict[tuple[int, int], dict[str, Any]] = {}
+        outofpart_retries = 0
 
         while blocks < max_blocks:
             if received >= total_size:
@@ -734,16 +836,34 @@ class PeerClient:
                     expected_bytes = 0
                     break
                 elif opcode == C2CTCP.OUTOFPARTREQS:
-                    self._maybe_credit_downloaded(received)
-                    outcome = DownloadOutcome(
-                        file_hash=file_hash.hex().upper(),
-                        bytes_received=received,
-                        blocks_received=blocks,
-                        complete=received >= total_size,
-                        elapsed=time.monotonic() - started,
-                        detail="peer has no more parts",
+                    # The source accepted us but has no upload blocks
+                    # prepared yet (it reads the file lazily after the
+                    # slot grant).  Real clients re-request after a short
+                    # pause instead of dropping the slot.
+                    outofpart_retries += 1
+                    if outofpart_retries > _OUTOFPART_MAX_RETRIES:
+                        self._maybe_credit_downloaded(received)
+                        outcome = DownloadOutcome(
+                            file_hash=file_hash.hex().upper(),
+                            bytes_received=received,
+                            blocks_received=blocks,
+                            complete=received >= total_size,
+                            elapsed=time.monotonic() - started,
+                            detail="peer has no more parts",
+                        )
+                        return outcome
+                    log.info(
+                        "PEER out of parts (retry %d/%d): host=%s:%d",
+                        outofpart_retries,
+                        _OUTOFPART_MAX_RETRIES,
+                        self.host,
+                        self.port,
                     )
-                    return outcome
+                    await asyncio.sleep(_OUTOFPART_RETRY_DELAY)
+                    # Escape the receive loop: the outer while re-issues
+                    # REQUESTPARTS for the same range.
+                    expected_bytes = 0
+                    break
                 elif opcode == C2CTCP.QUEUERANK:
                     log.info(
                         "PEER requeued during transfer: rank=%d",
