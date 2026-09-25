@@ -96,6 +96,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "username": None,
         "password": None,
     },
+    "identity": {
+        "user_hash": None,
+        "nick": "AmuleD",
+        "tcp_port": 0,
+        "client_id": 0,
+    },
+    "serve": {
+        "bind_host": "0.0.0.0",
+        "max_sessions": 64,
+        "upload_slots": 4,
+        "throttle_bytes_per_sec": 0,
+        "republish_hours": 6.0,
+        "publish_limit": 0,
+    },
     "storage": {
         "backend": "duckdb",
     },

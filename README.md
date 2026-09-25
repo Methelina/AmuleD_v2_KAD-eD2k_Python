@@ -2,7 +2,7 @@
 
 AmuleD is a portable, console-first ED2K/Kademlia client written in Python 3.12. It is an independent clean-room implementation of the public ED2K and Kademlia protocols, not a binary wrapper around aMule/eMule and not a GPL source port.
 
-The current milestone provides a fully working **Kademlia (KAD) engine against the live eMule network** — keyword search (200 real results for a "video" query in about one second) and file-source discovery (KADEMLIA2_SEARCH_SOURCE_REQ, sources persisted to DuckDB) — plus a live-validated ED2K TCP server session with search, a complete download stack (queue, part files, MD4 verification), a peer protocol layer with client-side **TCP obfuscation dialing** (the modern network requires it; the obfuscated handshake is live-verified against real eMule peers), IP filter and server blacklisting, a searchable DuckDB-backed result store, a permanent KAD spider daemon that keeps the network warm, and an interactive console menu.
+The current milestone provides a fully working **Kademlia (KAD) engine against the live eMule network** — keyword search (200 real results for a "video" query in about one second), file-source discovery (KADEMLIA2_SEARCH_SOURCE_REQ, sources persisted to DuckDB), and **publishing of your own shared files into the KAD index** (keyword and source entries, live-accepted: files published by AmuleD are found by network searches and AmuleD itself shows up as a source) — plus a live-validated ED2K TCP server session with search, a complete download stack (queue, part files, MD4 verification), a peer protocol layer with client-side **TCP obfuscation dialing** (the modern network requires it; the obfuscated handshake is live-verified against real eMule peers), an **incoming peer listener with an upload engine** (queue, slots, throttling; a serve daemon shares real files and the loopback self-test verifies the MD4 of a served file), a unified client identity, IP filter and server blacklisting, a searchable DuckDB-backed result store, a permanent KAD spider daemon that keeps the network warm, and an interactive console menu.
 
 **Author:** Soror L.'.L.'. &nbsp;|&nbsp; **Version:** 0.5.1 &nbsp;|&nbsp; **License:** Apache 2.0
 
@@ -29,7 +29,7 @@ The client is fully portable: it installs into its own folder with a single scri
 
 ### Current status (honestly)
 
-This is an early but live client: search (including KAD) and incoming sources already work against the real eMule network, and peer connections use the mandatory TCP obfuscation handshake. Still in development: completing transfers from KAD sources end-to-end, sharing files back to others (upload), publishing your own files into the KAD network, and incoming connections. Follow the progress in the roadmap (sections tagged DONE/WIP/PLANNED).
+This is an early but live client: search (including KAD), incoming sources, KAD publishing of your own files, and file sharing to others (serve daemon with an upload queue) already work against the real eMule network, and outgoing peer connections use the mandatory TCP obfuscation handshake. Still in development: accepting obfuscated incoming connections (pending external protocol review — plain-protocol listeners are answered today), completing transfers from KAD sources end to end, and SecureIdent/credits. Follow the progress in the roadmap (sections tagged DONE/WIP/PLANNED).
 
 ### Requirements
 
@@ -55,6 +55,7 @@ The project has exactly two launchers: the installer and the single runtime. `Am
 ```powershell
 .\AmuleD_Run.ps1                      # interactive console menu (Server / KAD / Share / Search / Downloads)
 .\AmuleD_Run.ps1 spider               # KAD spider daemon: keeps the network warm (verbose, Ctrl+C to stop)
+.\AmuleD_Run.ps1 serve                # incoming peer listener + upload engine: shares your files (Ctrl+C to stop)
 .\AmuleD_Run.ps1 -NoPause --help      # CLI passthrough
 .\AmuleD_Run.ps1 -NoPause status --json
 ```
@@ -98,6 +99,29 @@ Discover peers sharing a file directly through Kademlia and persist them into th
 ```
 
 Each source carries its eMule source type (1 = high-ID, 3/5 = firewalled with buddy, 6 = direct callback), a dialability flag, and the publisher's KadID. Entries with reserved/multicast addresses or invalid ports are filtered out (`IsGoodIPPort` rule).
+
+### Publish your files to KAD
+
+Register your shared files in the KAD distributed index so other clients can find and download them:
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause publish keywords --limit 5 --json   # keyword entries (file names -> KAD index)
+.\AmuleD_Run.ps1 -NoPause publish sources --limit 0 --json    # yourself as a source for every shared file
+```
+
+The publish client performs the same iterative closest-node lookup as eMule (`KADEMLIA2_PUBLISH_KEY_REQ`/`_SOURCE_REQ` → `PUBLISH_RES`, with `PUBLISH_RES_ACK` when requested), accepts the top responders, and stops at eMule's store totals. The serve daemon (below) republishes automatically every few hours, because KAD store entries expire after about a day. Live-validated: a file published by AmuleD is found by `kad search` from the network, and `kad sources` returns AmuleD itself as a dialable source.
+
+### Share files to others (serve daemon)
+
+`serve` runs the incoming peer listener as a service: it accepts eD2K client-to-client connections, performs the HELLO/HELLOANSWER handshake, resolves requested hashes against your shared files, queues peers (priority, slots, TTL, dedupe), and serves file parts with per-session throttling:
+
+```powershell
+.\AmuleD_Run.ps1 serve                      # listener + hourly-repeated KAD republication
+.\AmuleD_Run.ps1 serve --publish-limit 10   # cap files per republication pass
+.\AmuleD_Run.ps1 serve --no-publish         # listener only
+```
+
+The daemon advertises its actual bound port inside KAD source entries, writes a status snapshot to `db\serve_status.json` (pid, port, active connections), enforces `serve.max_sessions`, and shuts down gracefully on Ctrl+C. The client identity (userhash, nickname, TCP port) lives in the `identity` section of `config\amuled.jsonc` — the same userhash backs the HELLO handshake and the KAD source publish, matching eMule's `GetClientHash = GetUserHash` model; a userhash is generated and persisted on first run. Loopback self-test: AmuleD's own downloader fetches a real shared file from the daemon and the reassembled MD4 matches.
 
 ### Sources and downloads
 
@@ -209,8 +233,12 @@ Core policy documents:
 | KAD spider daemon (network warm-up) | Implemented | `scripts/kad_spider.py` |
 | Interactive console menu | Implemented | `scripts/amuled_menu.py` |
 | Selection strategies (xor/quality/vivaldi/kadabra) | Implemented | `src/amuled_v2/core/kad/strategies.py` |
-| Upload engine | Planned | `docs/roadmap.md` |
-| Incoming KAD listener | Planned | `docs/roadmap.md` |
+| KAD publish (keyword/source entries) | **Live-validated** | `src/amuled_v2/core/kad/publish.py`, `src/amuled_v2/cli.py` |
+| Client identity (userhash/nick/port) | Implemented | `src/amuled_v2/core/identity.py` |
+| Upload engine (queue/slots/throttle) | Implemented | `src/amuled_v2/core/upload/` |
+| Incoming peer listener (plain) | Implemented | `src/amuled_v2/core/peer/listener.py` |
+| Serve daemon (share files) | Implemented | `scripts/serve_daemon.py` |
+| Incoming obfuscated accept | Planned (external) | `docs/roadmap.md` |
 | GeoIP / UPnP-NAT-PMP | Planned | `docs/roadmap.md` |
 
 ### KAD engine notes
@@ -224,7 +252,7 @@ Core policy documents:
 ```text
 AmuleD_v2/
 ├── AmuleD_install.ps1         # Idempotent portable installer
-├── AmuleD_Run.ps1             # Single runtime dispatcher: menu / spider / CLI
+├── AmuleD_Run.ps1             # Single runtime dispatcher: menu / spider / serve / CLI
 ├── pyproject.toml             # Package metadata and dependencies
 ├── requirements.txt           # Locked dependency groups
 ├── AGENTS.md                  # Project-local development rules
@@ -237,9 +265,12 @@ AmuleD_v2/
 ├── temp/                      # Partial downloads
 ├── shared/                    # Default shared storage
 ├── docs/                      # Specification, roadmap, protocol matrix
-├── scripts/                   # KAD spider daemon, interactive menu, warm-up and diagnostic scripts
+├── scripts/                   # KAD spider, serve daemon, interactive menu, warm-up and diagnostic scripts
 ├── src/amuled_v2/             # Python implementation
-│   └── core/kad/              # KAD engine (packets, bootstrap, routing, search, obfuscation, strategies)
+│   ├── core/kad/              # KAD engine (packets, bootstrap, routing, search, publish, obfuscation, strategies)
+│   ├── core/peer/             # Peer protocol (client, listener, codec, obfuscation)
+│   ├── core/upload/           # Upload engine (queue, slots, throttled block transfer)
+│   └── core/identity.py       # Unified client identity (userhash/nick/port)
 └── tests/                     # Unit, codec, state, and protocol tests
 ```
 
@@ -274,7 +305,7 @@ Run all commands from `AmuleD_v2` using the project-local interpreter:
 Current full offline-suite status:
 
 ```text
-192 passed, 2 skipped
+281 passed, 6 skipped
 ```
 
 ### Tagged diagnostics
@@ -318,16 +349,19 @@ Completed development stations:
 - Kademlia engine (bootstrap, routing, obfuscation, keyword search) - **DONE** (live: 200 results/query)
 - KAD file-source search with DuckDB persistence - **DONE** (live: sources from the real network)
 - KAD CLI commands (`kad search/sources`), spider daemon, interactive menu - **DONE**
+- Client-side TCP obfuscation dialing - **DONE** (handshake live-verified)
+- KAD publish (keywords + sources) with republication loop - **DONE** (live-accepted)
+- Upload engine, incoming listener, serve daemon, unified identity - **DONE** (loopback self-test: MD4-verified)
 
 Active / next stations (WIP/PLANNED):
 
-1. Downloads fed from KAD sources end to end (MD4-verified) - **WIP** (peer handshake wire-verification in progress)
-2. Spider daemon stale-node rotation and incoming KAD listener - **WIP**
-3. Search tactics (quality/kadabra) as CLI flags - **PLANNED**
-4. Upload slots and queues - **PLANNED**
+1. Downloads fed from KAD sources end to end (MD4-verified) - **WIP**
+2. Incoming obfuscated accept (external protocol review) - **WIP**
+3. Credits / SecureIdent skeleton - **PLANNED**
+4. Spider daemon stale-node rotation, search tactics as CLI flags - **PLANNED**
 5. GeoIP / UPnP-NAT-PMP - **PLANNED**
 
-Deprecated early-session notes are kept for context in docs/roadmap.md - every section there is tagged DONE/SOLVED/WIP/DEPRECATED/TODO; the live state is in sections 11a-11d.
+Deprecated early-session notes are kept for context in docs/roadmap.md - every section there is tagged DONE/SOLVED/WIP/DEPRECATED/TODO; the live state is in sections 11a-11f.
 
 ---
 

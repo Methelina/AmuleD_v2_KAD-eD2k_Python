@@ -188,7 +188,7 @@ def _migrate_v4(con: Any) -> None:
     )
 
 
-def _open_duckdb_with_retry(database: Path, *, attempts: int = 5, delay: float = 0.5) -> Any:
+def _open_duckdb_with_retry(database: Path, *, attempts: int = 20, delay: float = 1.0) -> Any:
     """Open DuckDB, retrying briefly when another process still holds the lock.
 
     Killed CLI runs can leave the database file locked for a few seconds on

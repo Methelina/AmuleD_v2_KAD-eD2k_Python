@@ -31,8 +31,9 @@ from __future__ import annotations
 import asyncio
 import struct
 import time
+import zlib
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from amuled_v2.core.codec.constants import EDONKEY
 from amuled_v2.core.codec.tags import Ed2kTag, write_new_tag
@@ -46,6 +47,8 @@ from amuled_v2.core.peer.codec import (
     build_request_parts_i64_payload,
     build_request_parts_payload,
     parse_compressed_part,
+    parse_compressed_part_chunk,
+    parse_compressed_part_chunk_i64,
     parse_compressed_part_i64,
     parse_file_hash_payload,
     parse_filename_answer,
@@ -360,7 +363,8 @@ class PeerClient:
                     client_id=parsed.client_id,
                     client_port=parsed.client_port,
                     nickname=parsed.nickname,
-                    version=getattr(parsed, "version", None),
+                    server_ip=getattr(parsed, "server_ip", None),
+                    server_port=getattr(parsed, "server_port", None),
                 )
                 hello_seen = True
                 log.info(
@@ -552,7 +556,12 @@ class PeerClient:
         blocks)`` fires after each block.
         """
         started = time.monotonic()
-        await self._send(EDONKEY, C2CTCP.ACCEPTUPLOADREQ)
+        # ВАЖНО (на это уже нарывались): OP_ACCEPTUPLOADREQ — серверный
+        # опкод (сервер → клиент при выдаче слота). Клиент в transfer() его
+        # НЕ шлёт: слот уже выдан, wait_upload_slot съел ACCEPTUPLOADREQ,
+        # и движок отдачи (UploadSession) приёме ACCEPTUPLOADREQ от клиента
+        # завершает сессию — живой приём обрывается после первого батча
+        # блоков (WinError 10053 / "peer closed connection").
         received = 0
         blocks = 0
         compressed = self.peer_info.compression if self.peer_info else False
@@ -563,6 +572,13 @@ class PeerClient:
             except Exception:
                 return []
             return [(0, min(remaining, total_size))] if remaining > 0 else []
+
+        # COMPRESSEDPART reassembly buffer: eMule splits a compressed block
+        # into sub-packets where every sub-packet repeats the BLOCK start and
+        # the TOTAL compressed size (UploadDiskIOThread CreatePackedPackets).
+        # Chunks are concatenated until the declared total is reached and
+        # only then decompressed.
+        pending_compressed: dict[tuple[int, int], dict[str, Any]] = {}
 
         while blocks < max_blocks:
             if received >= total_size:
@@ -638,9 +654,43 @@ class PeerClient:
                 elif opcode == C2CTCP.SENDINGPART_I64:
                     part = parse_sending_part_i64(payload)
                 elif opcode == C2CTCP.COMPRESSEDPART:
-                    part = parse_compressed_part(payload)
+                    h, s, total, chunk = parse_compressed_part_chunk(payload)
+                    key = (s, total)
+                    slot = pending_compressed.setdefault(
+                        key, {"hash": h, "buf": bytearray(), "i64": False}
+                    )
+                    slot["buf"] += chunk
+                    if len(slot["buf"]) < total:
+                        continue  # more sub-packets pending
+                    del pending_compressed[key]
+                    try:
+                        data = zlib.decompress(bytes(slot["buf"]))
+                    except zlib.error as exc:
+                        raise PeerSessionError(
+                            f"compressed part reassembly failed: {exc}"
+                        ) from exc
+                    part = SendingPart(
+                        file_hash=slot["hash"], start=s, end=s + len(data), data=data
+                    )
                 elif opcode == C2CTCP.COMPRESSEDPART_I64:
-                    part = parse_compressed_part_i64(payload)
+                    h, s, total, chunk = parse_compressed_part_chunk_i64(payload)
+                    key = (s, total)
+                    slot = pending_compressed.setdefault(
+                        key, {"hash": h, "buf": bytearray(), "i64": True}
+                    )
+                    slot["buf"] += chunk
+                    if len(slot["buf"]) < total:
+                        continue  # more sub-packets pending
+                    del pending_compressed[key]
+                    try:
+                        data = zlib.decompress(bytes(slot["buf"]))
+                    except zlib.error as exc:
+                        raise PeerSessionError(
+                            f"compressed part reassembly failed: {exc}"
+                        ) from exc
+                    part = SendingPart(
+                        file_hash=slot["hash"], start=s, end=s + len(data), data=data
+                    )
                 elif opcode == C2CTCP.END_OF_DOWNLOAD:
                     log.info(
                         "PEER end of download: host=%s:%d, received=%d/%d",

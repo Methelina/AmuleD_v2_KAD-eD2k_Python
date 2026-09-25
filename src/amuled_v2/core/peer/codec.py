@@ -595,8 +595,11 @@ def _validate_starts_ends(starts: tuple[int, int, int], ends: tuple[int, int, in
     _validate_three_tuple(starts, "starts")
     _validate_three_tuple(ends, "ends")
     for start, end in zip(starts, ends):
-        if start >= end:
-            raise PeerCodecError(f"start {start} must be less than end {end}")
+        # eMule pads unused REQUESTPARTS slots with (0, 0) and tolerates
+        # start == end as an empty range (UploadDiskIOThread drops them);
+        # only start > end is a protocol error.
+        if start > end:
+            raise PeerCodecError(f"start {start} must not exceed end {end}")
 
 
 def build_request_parts_payload(
@@ -640,9 +643,12 @@ def parse_request_parts(payload: bytes) -> RequestParts:
         raise PeerCodecError(f"malformed OP_REQUESTPARTS: {exc}") from exc
     if reader.remaining:
         raise PeerCodecError(f"OP_REQUESTPARTS has {reader.remaining} trailing bytes")
+    # eMule pads unused slots with (0, 0); start == end is an empty range
+    # and is dropped by the receiver (UploadDiskIOThread).  Only start > end
+    # is a protocol error.
     for start, end in zip(starts, ends):
-        if start >= end:
-            raise PeerCodecError(f"start {start} must be less than end {end}")
+        if start > end:
+            raise PeerCodecError(f"start {start} must not exceed end {end}")
     result = RequestParts(file_hash=file_hash, starts=starts, ends=ends)
     log.debug("REQUESTPARTS parsed: hash=%s, starts=%s, ends=%s", file_hash.hex().upper(), starts, ends)
     return result
@@ -689,9 +695,12 @@ def parse_request_parts_i64(payload: bytes) -> RequestParts:
         raise PeerCodecError(f"malformed OP_REQUESTPARTS_I64: {exc}") from exc
     if reader.remaining:
         raise PeerCodecError(f"OP_REQUESTPARTS_I64 has {reader.remaining} trailing bytes")
+    # eMule pads unused slots with (0, 0); start == end is an empty range
+    # and is dropped by the receiver (UploadDiskIOThread).  Only start > end
+    # is a protocol error.
     for start, end in zip(starts, ends):
-        if start >= end:
-            raise PeerCodecError(f"start {start} must be less than end {end}")
+        if start > end:
+            raise PeerCodecError(f"start {start} must not exceed end {end}")
     result = RequestParts(file_hash=file_hash, starts=starts, ends=ends)
     log.debug("REQUESTPARTS_I64 parsed: hash=%s, starts=%s, ends=%s", file_hash.hex().upper(), starts, ends)
     return result
@@ -770,6 +779,50 @@ def parse_sending_part_i64(payload: bytes) -> SendingPart:
         len(data),
     )
     return result
+
+
+def parse_compressed_part_chunk(
+    payload: bytes,
+) -> tuple[bytes, int, int, bytes]:
+    """Parse ONE sub-packet of a (possibly split) ``OP_COMPRESSEDPART``.
+
+    Per UploadDiskIOThread.cpp ``CreatePackedPackets`` (507-557) a
+    compressed block is split into sub-packets of at most 13000 bytes
+    (10240 when more remains); EVERY sub-packet carries the BLOCK start
+    offset and the TOTAL compressed size, plus only its own chunk.  The
+    caller must concatenate chunks until ``len == total_size`` and only
+    then zlib-decompress the whole.
+
+    Returns ``(file_hash, start, total_compressed_size, chunk)``.
+    """
+    reader = BinaryReader(payload)
+    try:
+        file_hash = reader.read_hash16()
+        start = reader.read_u32()
+        total_size = reader.read_u32()
+        chunk = reader.read_bytes(reader.remaining)
+    except CodecError as exc:
+        raise PeerCodecError(f"malformed OP_COMPRESSEDPART chunk: {exc}") from exc
+    if not chunk:
+        raise PeerCodecError("OP_COMPRESSEDPART chunk is empty")
+    return file_hash, start, total_size, chunk
+
+
+def parse_compressed_part_chunk_i64(
+    payload: bytes,
+) -> tuple[bytes, int, int, bytes]:
+    """I64 variant of :func:`parse_compressed_part_chunk` (u64 start)."""
+    reader = BinaryReader(payload)
+    try:
+        file_hash = reader.read_hash16()
+        start = reader.read_u64()
+        total_size = reader.read_u32()
+        chunk = reader.read_bytes(reader.remaining)
+    except CodecError as exc:
+        raise PeerCodecError(f"malformed OP_COMPRESSEDPART_I64 chunk: {exc}") from exc
+    if not chunk:
+        raise PeerCodecError("OP_COMPRESSEDPART_I64 chunk is empty")
+    return file_hash, start, total_size, chunk
 
 
 def parse_compressed_part(payload: bytes) -> SendingPart:

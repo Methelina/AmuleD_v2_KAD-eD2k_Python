@@ -840,6 +840,7 @@ class IncomingPeerServer:
         throttle: UploadThrottle | None = None,
         allow_compression: bool = True,
         idle_timeout: float | None = 300.0,
+        max_connections: int = 64,
     ) -> None:
         self._identity = identity
         self._resolver = resolver
@@ -849,6 +850,9 @@ class IncomingPeerServer:
         self._throttle = throttle
         self._allow_compression = allow_compression
         self._idle_timeout = idle_timeout
+        if max_connections < 1:
+            raise ListenerError(f"max_connections must be >= 1, got {max_connections}")
+        self._max_connections = max_connections
         self._server: asyncio.AbstractServer | None = None
         self._connections: set[IncomingPeerSession] = set()
 
@@ -897,6 +901,15 @@ class IncomingPeerServer:
         writer: asyncio.StreamWriter,
     ) -> None:
         peer_name = _format_peer(writer)
+        if len(self._connections) >= self._max_connections:
+            log.warning(
+                "Incoming C2C connection rejected: peer=%s, active=%d, max=%d",
+                peer_name,
+                len(self._connections),
+                self._max_connections,
+            )
+            writer.close()
+            return
         log.info("Incoming C2C connection: peer=%s", peer_name)
         session = IncomingPeerSession(
             reader,

@@ -1,9 +1,16 @@
 # ==========================================================
 # AmuleD v0.5.1 Portable Runtime (PowerShell Version)
 # ==========================================================
-# Version: 2.0.0
+# Version: 2.1.0
 # Author:  Soror L.'.L.'.
-# Updated: 2026-09-23
+# Updated: 2026-09-25
+#
+# Patchnote v2.1.0 (By Soror L.'.L.'.):
+#   [+] Added `serve` mode: incoming peer serve daemon (scripts\serve_daemon.py),
+#       refuses a second instance unless -Force.  The daemon binds an
+#       (optionally ephemeral) TCP port, writes db\serve_status.json and
+#       periodically republishes KAD source entries advertising the bound
+#       port (stage S).
 #
 # Patchnote v2.0.0 (By Soror L.'.L.'.):
 #   [+] PROJECT DOCTRINE: exactly two launchers exist -- the installer
@@ -183,6 +190,9 @@ if (-not $ClientArgs -or $ClientArgs.Count -eq 0) {
 } elseif ($ClientArgs[0] -eq "spider") {
     $Mode = "spider"
     $ClientArgs = @($ClientArgs | Select-Object -Skip 1)
+} elseif ($ClientArgs[0] -eq "serve") {
+    $Mode = "serve"
+    $ClientArgs = @($ClientArgs | Select-Object -Skip 1)
 }
 
 # The source tree is placed first on PYTHONPATH so the portable runtime works
@@ -273,6 +283,72 @@ if ($Mode -eq "spider") {
         Write-Host "[RUNNER] [ERROR] KAD spider exited with code $exitCode" -ForegroundColor Red
     } else {
         Write-Host "[RUNNER] [INFO] KAD spider stopped cleanly." -ForegroundColor Green
+    }
+    if (-not $NoPause) {
+        Write-Host ""
+        Write-Host "Press any key to exit..." -ForegroundColor Gray
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    }
+    exit $exitCode
+}
+
+if ($Mode -eq "serve") {
+    $ServeScript = Join-Path $ProjectRoot "scripts\serve_daemon.py"
+    $ServeStatusFile = Join-Path $DbDir "serve_status.json"
+    if (-not (Test-Path $ServeScript)) {
+        Write-Host "[RUNNER] [ERROR] Serve daemon script not found: $ServeScript" -ForegroundColor Red
+        if (-not $NoPause) {
+            Write-Host "Press any key to exit..." -ForegroundColor Gray
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        exit 1
+    }
+    $ExistingServe = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -match '^python' -and
+            $_.CommandLine -and
+            $_.CommandLine -like '*serve_daemon.py*'
+        }
+    # The venv python.exe is a shim that spawns the real uv-managed
+    # interpreter: one logical daemon shows up as a parent/child pair.
+    if ($ExistingServe) {
+        $matchedIds = $ExistingServe | ForEach-Object { $_.ProcessId }
+        $ExistingServe = $ExistingServe | Where-Object { $matchedIds -notcontains $_.ParentProcessId }
+    }
+    if ($ExistingServe) {
+        foreach ($daemon in $ExistingServe) {
+            Write-Host "[RUNNER] [WARN] Serve daemon is already running: pid=$($daemon.ProcessId)" -ForegroundColor Yellow
+        }
+        if (Test-Path $ServeStatusFile) {
+            try {
+                $status = Get-Content $ServeStatusFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                Write-Host "[RUNNER] [INFO] Last status: port=$($status.port) active=$($status.active_connections) uptime_s=$($status.uptime_s) running=$($status.running)" -ForegroundColor Cyan
+            } catch {
+                Write-Host "[RUNNER] [WARN] Status file unreadable: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+        if (-not $Force) {
+            Write-Host "[RUNNER] [ERROR] Refusing to start a second serve daemon. Stop the running one or re-run with -Force." -ForegroundColor Red
+            if (-not $NoPause) {
+                Write-Host "Press any key to exit..." -ForegroundColor Gray
+                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            }
+            exit 1
+        }
+        Write-Host "[RUNNER] [WARN] -Force passed: starting a second serve daemon anyway." -ForegroundColor Yellow
+    }
+    Write-Host "[RUNNER] [INFO] Starting serve daemon (Ctrl+C to stop)..." -ForegroundColor Green
+    try {
+        & $VenvPython -s -W ignore::FutureWarning $ServeScript @ClientArgs
+        $exitCode = $LASTEXITCODE
+    } catch {
+        Write-Host "[RUNNER] [ERROR] Serve launcher exception: $($_.Exception.Message)" -ForegroundColor Red
+        $exitCode = 1
+    }
+    if ($exitCode -ne 0) {
+        Write-Host "[RUNNER] [ERROR] Serve daemon exited with code $exitCode" -ForegroundColor Red
+    } else {
+        Write-Host "[RUNNER] [INFO] Serve daemon stopped cleanly." -ForegroundColor Green
     }
     if (-not $NoPause) {
         Write-Host ""
