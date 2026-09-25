@@ -1,13 +1,70 @@
-# Continuation prompt — AmuleD v0.5.1 (K:\work\AmuleD_v2)
+# Continuation prompt — AmuleD (K:\work\AmuleD_v2)
 
-Updated: 2026-09-25 20:35
-Session state: 8 (no-Claude track; P+S+C DONE; стадия U фазы 1-2 DONE — ядро владеет DuckDB монопольно; см. «Стадия U» ниже)
+Updated: 2026-09-26 01:15
+Session state: 10 (no-Claude track; v0.6.0: релизная гигиена + audit_checklist + U фаза 3 IPC-роутинг — DONE, live-принято; suite 295 passed, 3 skipped; НЕЗАПУШЕНО: всё из сессии 10 + сессии 9)
+
+---
+
+## Праймер-промпт (скопировать новой сессии целиком; канонический текст — в чате сессии 9)
+
+Ты продолжаешь разработку standalone-проекта AmuleD v0.5.1 в репозитарии K:\work\AmuleD_v2 — трек БЕЗ внешней LLM-сессии (обфускационный accept входящих / SecureIdent-крипта — BLOCKED-EXTERNAL; моки в коде помечены `# WIP by external developer` — не трогать и не «чинить»).
+
+Прочитай по порядку:
+
+K:\work\AmuleD_v2\AGENTS.md — среда, tagged logging, temp-политика, правила версии/имён.
+K:\work\AmuleD_v2\docs\roadmap.md — канонический roadmap (секции 11a–11f, REAL-DATA VALIDATION).
+Приложенный docs\roadmap.without_Claude.md — твой план: стадии P/S/C/U/X + Definition of done; работай строго по ним сверху вниз.
+K:\work\AmuleD_v2\docs\continuation-prompt.md — живые грабли сети/Windows и этот праймер (актуальны и для этого трека).
+Эталоны протокола (eMuleAI 1.6.0 — первичный оракул; читать ТОЛЬКО эти файлы, диск не сканировать):
+
+O:\Work\Coding\eMuleAI\srchybrid\kademlia\kademlia\Search.cpp — STOREKEYWORD/STOREFILE StorePacket; SearchManager.cpp — ProcessPublishResult.
+...\kademlia\kademlia\Kademlia.cpp — KadGetKeywordHash, Defines.h — SEARCHSTORE*_TOTAL.
+...\kademlia\net\KademliaUDP.cpp, KademliaUDPListener.cpp — PUBLISH_RES (0x4B), ACK (0x4C), SendPublishSourcePacket.
+...\kademlia\kademlia\Prefs.cpp — GetClientHash() = GetUserHash.
+O:\Work\Coding\eMuleAI\srchybrid\UploadDiskIOThread.cpp — CreateStandardPackets/CreatePackedPackets; UploadClient.cpp, UploadQueue.cpp.
+...\KnownFile.cpp, KnownFileList.cpp, FileIdentifier.cpp — known.met (готовый парсер: tmp\validate_known_met.py).
+...\BaseClient.cpp, ListenSocket.cpp — HELLO/HELLOANSWER, ProcessPacket; EncryptedStreamSocket.cpp — только понимать WIP-точки, НЕ реализовывать.
+
+Состояние: offline suite 294 passed, 6 skipped (запускать ТОЛЬКО при остановленном ядре), compileall 0. Стадии P (KAD publish), S (serve/identity/listener), C (credits + SecureIdent-каркас), U фазы 1–2 (единое ядро) — DONE и live-приняты. Архитектура (НЕ переписывать): `AmuleD_Run.ps1 serve` = единое ядро (`core/kernel.py::AmuleDKernel`) — один процесс, ОДИН постоянный DuckDB-коннект, внутри SpiderEngine (`core/kad/spider.py`), listener раздачи, KAD-перепубликация, IPC-сервер (`core/kernel_control.py`, JSON-lines 127.0.0.1, порт в db\kernel_status.json). CLI `credits list|get`, `daemon status|stop` — через IPC. СЛЕДСТВИЯ (by design): под живым ядром прямые DuckDB-команды CLI падают; `AmuleD_Run.ps1 spider` упразднён (паук внутри ядра). НЕЗАПУШЕНО: коммит 94373b1 (ядро) + README-правки.
+
+Текущая задача (выбор из «Остаток до паритета eMuleAI» ниже):
+1) Релизная гигиена: bump `__version__` 0.5.1 → 0.6.0 + docs\audit_checklist.md.
+2) Фаза 3 стадии U: IPC-handlers (search.results, sources.get, download.list/add, servers.failures, ipfilter.status) + scripts\amuled_menu.py через IPC + deprecation-предупреждение для spider-режима в AmuleD_Run.ps1.
+3) Далее по списку: загрузки end-to-end от KAD-источников; стадия X (MISCOPTIONS-сверка, upload status, GeoIP, UPnP/NAT-PMP); паритет раздачи (QUEUERANK-переодика, slot rotation, credits→priority, known.met import/export).
+
+Среда: $env:PYTHONPATH='K:\work\AmuleD_v2\src'; $env:AMULED_ROOT='K:\work\AmuleD_v2'; только K:\work\AmuleD_v2\.venv\Scripts\python.exe (никакого activate); долгие прогоны — background_process; после прогонов убивать утечки python-процессов AmuleD; socket-операции в тестах — только под asyncio.wait_for (образец: tests\test_listener.py). Git — безопасно (без reset/amend/force-push без разрешения), коммит — только по явной команде, push — только спросив. Приватные файлы (docs*.md, config, assets\v1\shared_files.json, db, logs, tmp, userhash) не коммитить без санитизации. Никогда не упоминать локацию пользователя и имена/пути чужих файлов из known.met. Субагенты: 1 файл = 1 субагент, абсолютные пути, запрет запускать python/pytest/git и трогать файлы вне списка, отчёт START/END/DEVIATIONS; тесты пишет только оркестратор.
+
+Отвечай по-русски, кратко, абсолютные пути в отчётах.
+
+## Остаток до паритета eMuleAI — АКТУАЛЬНО после сессии 11 (cloud-трек ЗАКРЫТ)
+
+**Блокер #6 (FIN после HELLO) СНЯТ live**: причина — RC4 send-стрим
+пересоздавался для HELLO (v0.2.0); фикс клауда v0.3.0 (BasicObfuscationSession)
+вживлён в PeerClient. Живые успехи: obf HELLOANSWER от eMuleAI, live DH
+с реальным сервером 176.123.5.89:4725, end-to-end загрузка с реального
+eMuleAI с MD4-верификацией (детали — roadmap.md секция 11h).
+
+ОСТАЛОСЬ (порядок работ):
+
+1. **download.run ядра с реальными KAD-источниками**: runner уже дозванивается
+   по obf (target_userhash из KAD source_id) — прогнать полный цикл:
+   kernel serve -> поиск -> источники с userhash -> download run -> MD4.
+2. **GeoIP**: подключить assets/v1/GeoIP.dat к ipfilter/статистике.
+3. **X-хвосты**: ротация узлов паука; source exchange как отвечающая
+   сторона; AICH; disk-space checks.
+4. **Коммит/пуш сессии 11** — по команде.
+
+Только cloud-трек: обфускационный accept входящих (наш listener по-прежнему
+plain-only; клиента это не касается — мы всегда дозваниваемся сами).
+
+Definition of done (трек): kernel download.run принят live от KAD-источника;
+GeoIP подключён; коммит запушен.
 
 ---
 
 ## Copy-paste prompt (start of a new session)
 
-Ты продолжаешь разработку standalone-проекта AmuleD v0.5.1 в репозитарии K:\work\AmuleD_v2. Сначала прочитай AGENTS.md (K:\work\AmuleD_v2\AGENTS.md), актуальный roadmap: K:\work\AmuleD_v2\docs\roadmap.md (секции помечены [DONE]/[SOLVED]/[WIP]/[DEPRECATED]/[TODO]; живое состояние — секция 11e, сессия 7) и детальное состояние сессии: K:\work\AmuleD_v2\docs\continuation-prompt.md (этот файл).
+Ты продолжаешь разработку standalone-проекта AmuleD v0.6.0 в репозитарии K:\work\AmuleD_v2. Сначала прочитай AGENTS.md (K:\work\AmuleD_v2\AGENTS.md), актуальный roadmap: K:\work\AmuleD_v2\docs\roadmap.md (секции помечены [DONE]/[SOLVED]/[WIP]/[DEPRECATED]/[TODO]; живое состояние — секция 11g, сессия 10) и детальное состояние сессии: K:\work\AmuleD_v2\docs\continuation-prompt.md (этот файл).
 
 Работай только с K-runtime: K:\work\AmuleD_v2\.venv\Scripts\python.exe и K:\work\AmuleD_v2\bin\uv.exe. O-runtime и legacy-репозитарий O:\Work\Coding\Paradise_Lost_KAD_SA не использовать (только чтение эталонов). Эталоны: eMuleAI 1.6.0 — НОВЫЙ ПЕРВИЧНЫЙ ОРАКУЛ: O:\Work\Coding\eMuleAI\srchybrid\ (репо https://github.com/eMuleAI/eMuleAI), eMule 0.50a — O:\Work\Coding\eMule_0.50a\srchybrid\. aMule (O:\Work\Coding\aMule-2.3.3) — только вторичная сверка. Установленный билд eMuleAI: K:\Software\eMuleAI_v1.6.0_x64\ (verbose-логи K:\Software\eMuleAI_v1.6.0_x64\logs\ — кодировка UTF-16 LE, читать через FileShare ReadWrite). Его конфиг: config\preferences.dat (userhash = первые 16 байт: 1415AF07…(redacted)), config\preferencesKad.dat (KadID на offset 6).
 
@@ -34,9 +91,42 @@ Wire-оракул: tshark K:\Software\WireShark\WiresharkPortable64\App\Wireshar
 8. Event-driven pipeline (tmp\pipeline_dl.py): KAD source search в процессе + хук на parse_search_res_source_entries → мгновенный дозвон каждого источника + полный download ladder + MD4. Механика готова, ждать решения блокера. Долгие прогоны — только через background_process.
 9. GETSOURCES через сервер работает: `amuled sources ed2k --server 176.123.5.89:4725 --hash H --size S` (в выдаче мусор 10.x/224+ — фильтровать). Серверные источники БЕЗ userhash → plain невозможен → для них нужен userhash из KAD или другой путь.
 
-ЗАДАЧА №1 следующей сессии: снять блокер №6. Пути: (a) задать внешний LLM (промпт в чате сессии 7, репо https://github.com/eMuleAI/eMuleAI — файлы EncryptedStreamSocket.cpp, BaseClient.cpp, packets.cpp, ListenSocket.cpp CClientReqSocket::ProcessPacket) — что происходит между завершением basic handshake и HELLOANSWER, что может вызвать тихий мгновенный FIN; (b) перехват-расшифровка живого дозвона eMuleAI (см. №7) и байт-diff его HELLO с нашим; (c) после решения — подключить obfuscation к PeerClient + download runner, скачать файл ≤10 МБ end-to-end (MD4 сходится), коммит.
+ЗАДАЧА №1 (историческая, сессия 7) — снять блокер №6 — передана внешней cloud-сессии (см. docs/Cloud_Prompt_Help_Plz.md) и ИСКЛЮЧЕНА из этого трека. Этот трек продолжает работу из раздела «Остаток до паритета eMuleAI» выше.
 
 Дальше по стеку: KAD publish (PUBLISH_KEY/SOURCE_REQ), входящий peer-listener (стадия D), upload-движок (C), SecureIdent (E). Диск C: не трогать. Все диагностические сообщения — tagged logging (amuled_v2.logging_setup, LogTags). Автор во всех файлах только Soror L.'.L.'. Никаких AI/co-author упоминаний. Абсолютные пути в отчётах. Отвечай по-русски, кратко и по делу.
+
+---
+
+## Сессия 10 (2026-09-26, no-Claude track): v0.6.0 — IPC + загрузки в ядре + стадия X + паритет [DONE]
+
+Suite **303 passed, 3 skipped**; compileall 0. Live под ядром: read-only CLI
+(664 результата search через IPC), download add/cancel, daemon status.
+
+1. Версия 0.6.0 (init/pyproject/README/лаунчеры/тесты/AGENTS.md синк);
+   docs/audit_checklist.md создан.
+2. Фаза 3 U: 15+ kernel handlers; CLI-роутинг через `_kernel_control` с
+   fallback на прямую БД; FIX readline-лимит IPC 64 KiB → 64 MiB
+   (kernel_control.py; большие ответы рвались — пойман live).
+3. Загрузки: runner v0.2.0 — параллельная гонка пиров; `download run`
+   выполняется в ядре (владеет DuckDB), CLI поллит `download.status`;
+   e2e-тест: ядро качает у своего listener, MD4 сверен.
+4. X: честные MISCOPTIONS1/2 + EMULEINFO (codec.py/client.py, cap-
+   константы: только compression/large files/unicode/kad2); `upload
+   status` CLI; core/nat/upnp.py (SSDP+SOAP+NAT-PMP, map/unmap в ядре,
+   `nat.enabled`).
+5. Паритет раздачи: periodic QUEUERANK с удержанием соединения и промоцией
+   (listener.py, `queue_rank_period`); slot rotation loop в ядре;
+   credits→priority (queue.py v0.2.0, бонус = up/down, cap 10).
+6. known.met: core/sharing/known_met.py — парсер сверен с реальным
+   eMuleAI known.met (904/904) + writer; CLI `import known-met` /
+   `export known-met`; tests/test_known_met.py.
+7. Меню: kernel_status.json + `daemon status` по IPC; AmuleD_Run.ps1
+   v2.1.1 — spider-режим DEPRECATED-предупреждение.
+8. Грабли: статус-ключ очереди перетирал "ok" в download.add/lifecycle —
+   вынесен в ключ "queue"; тестовые part-файлы и DB в тестах ядра —
+   герметизация через monkeypatch DB_FILE/TEMP_DIR.
+
+Незакоммичено: ВСЯ пачка сессий 9–10 (коммит/пуш — только по явной команде).
 
 ---
 
@@ -143,18 +233,11 @@ MISCOPTIONS-сверка, GeoIP, UPnP).
 
 ## Быстрый старт (обязательный порядок)
 
-0. **Паук-демон должен быть поднят ДО любой KAD-работы.** Холодная сеть = 0 результатов
-   (главная грабля сессий 6-7). Проверка и запуск — только через AmuleD_Run.ps1 (доктрина
-   проекта: ровно 2 пусковика — AmuleD_install.ps1 и AmuleD_Run.ps1, который диспетчер):
+0. **Ядро должно быть поднято ДО любой KAD-работы** (`K:\work\AmuleD_v2\AmuleD_Run.ps1 serve` — guard от дублей встроен; статус: `amuled daemon status`). Холодная сеть = 0 результатов. Прогрев после старта: ~5-10 мин до первых источников, полный — 20+ мин. Ядро держит DuckDB монопольно: CLI с прямой базой и pytest — только при остановленном ядре.
    ```powershell
-   # статус паука: жив ли процесс и тёпла ли сеть
-   Get-Content K:\work\AmuleD_v2\db\kad_status.json -Raw   # uptime_s растёт, pool_size > 300
-   # запуск (guard от дублей встроен; если процесс уже жив — просто повторит статус)
-   K:\work\AmuleD_v2\AmuleD_Run.ps1 spider
+   K:\work\AmuleD_v2\AmuleD_Run.ps1 serve            # ядро: паук + listener + publish + IPC
+   .\.venv\Scripts\python.exe -m amuled_v2 daemon status --json
    ```
-   Прогрев после холодного старта: ~5-10 мин до первых источников, полный — 20+ мин.
-   Порт 4672 с фолбэком ephemeral; DuckDB паук открывает/закрывает на каждый save
-   (CLI должен мочь писать одновременно — не держи соединение).
 1. Тесты:
    ```powershell
    $env:PYTHONPATH='K:\work\AmuleD_v2\src'; $env:AMULED_ROOT='K:\work\AmuleD_v2'
@@ -173,8 +256,9 @@ MISCOPTIONS-сверка, GeoIP, UPnP).
    процесс вместе с недописанным логом), лог писать в файл и поллить.
 5. Интерактив/CLI: `.\AmuleD_Run.ps1` (меню), `.\AmuleD_Run.ps1 <cli-команда>`.
 6. `scripts\legacy\` — устаревшие скрипты (kad_warmup.py, kad_node_collector.py,
-   live_ed2k_login.py, check_db.py), перекрыты пауком/CLI; НЕ использовать и не
-   упоминать как актуальные. Актуальные: kad_spider.py, amuled_menu.py,
+   live_ed2k_login.py, check_db.py, kad_spider.py — паук теперь внутри ядра,
+   core/kad/spider.py), перекрыты ядром/CLI; НЕ использовать и не упоминать
+   как актуальные. Актуальные: serve_daemon.py (лаунчер ядра), amuled_menu.py,
    sanitize_log.py, live_ed2k_search.py, kad_warmup_vivaldi.py (сайд-проект).
 
 ---

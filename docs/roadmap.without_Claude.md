@@ -1,4 +1,4 @@
-# AmuleD v0.5.1 — Roadmap WITHOUT external LLM (no-Claude track)
+# AmuleD v0.6.0 — Roadmap WITHOUT external LLM (no-Claude track)
 
 Автор: Soror L.'.L.'.
 Обновлён: 2026-09-25
@@ -95,9 +95,22 @@ rw-лок DuckDB (у eMule всё в одном процессе — поток�
 - [x] CLI `daemon status|stop` через IPC (start — через AmuleD_Run serve).
 - [x] Тесты: test_kernel.py (roundtrip, снапшот, SpiderEngine-юниты,
       вертикальный срез «закачка → кредит по IPC»). Suite 294 passed.
-- [ ] Фаза 3 (остаток): перевести оставшиеся CLI-команды (share, search
-      results, servers, download) на IPC-роутинг либо объявить их
-      stop-ядро-использованием; AmuleD_Run spider-режим → предупреждение.
+- [x] Фаза 3 [DONE, сессия 10]: полный IPC-роутинг — search.results.*,
+      sources.list, download.list/add/pause/resume/start/cancel/run/status,
+      servers.failures, ipfilter.status, upload.status; меню работает под
+      живым ядром; AmuleD_Run spider -> DEPRECATED-предупреждение (v2.1.1).
+      FIX: readline-лимит IPC 64 KiB -> 64 MiB (большие ответы рвались).
+
+## Стадия D2 — загрузки end-to-end [DONE (в ядре), live-приёмка — осталось]
+
+- [x] DownloadRunner v0.2.0: параллельная гонка до max_peers пиров,
+      первый полный результат побеждает, остальные отменяются.
+- [x] `download run` ВНУТРИ ядра (владеет DuckDB); CLI стартует и поллит
+      `download.status`; источники через IPC `sources.list`.
+- [x] E2E-тест: ядро качает у собственного listener по loopback, MD4 сверен
+      (tests/test_kernel.py::test_kernel_ipc_download_run_end_to_end).
+- [ ] live: скачать реальный файл с реального чужого пира (клиентский
+      obf-dial жив; inbound accept — BLOCKED-EXTERNAL).
 
 ## Стадия C — Credits/SecureIdent-каркас [DONE]
 
@@ -122,16 +135,19 @@ rw-лок DuckDB (у eMule всё в одном процессе — поток�
   дедлок с саб-пакетизацией движка; теперь байтовый учёт раунда
   (expected_bytes = сумма длин диапазонов).
 
-## Стадия X — Прочее без внешних зависимостей [TODO]
+## Стадия X — Прочее без внешних зависимостей [PARTLY — сессия 10]
 
 - [ ] Ротация протухших узлов паука (11d хвост).
 - [ ] Sources без userhash: дозвон только после KAD userhash-lookup.
-- [ ] `upload status` CLI (snapshot очереди через именованный канал/файл
-      kad_status-стиля).
-- [ ] Сверка MISCOPTIONS1/2-битов HELLO с реально поддерживаемым
-      (source exchange, AICH-ответы) — не заявлять то, чего нет.
+- [x] `upload status` CLI (через kernel IPC, `upload.status`).
+- [x] Сверка MISCOPTIONS1/2-битов HELLO + EMULEINFO с реально
+      поддерживаемым: заявляем только compression/large files/unicode/
+      kad2; AICH, source exchange, multipacket, extended requests,
+      aux-UDP честно обнулены (codec.py cap-константы).
 - [ ] GeoIP: подключить assets/v1/GeoIP.dat к ipfilter/статистике.
-- [ ] UPnP/NAT-PMP (уменьшает lowid; без внешних зависимостей).
+- [x] UPnP/NAT-PMP: core/nat/upnp.py (SSDP+SOAP AddPortMapping,
+      NAT-PMP fallback), map при старте ядра / unmap при остановке,
+      `nat.enabled` в конфиге.
 - [ ] WEB-EDONKEY канал — опционально, по запросу.
 
 ## Заблокировано внешней сессией [BLOCKED-EXTERNAL]
@@ -142,11 +158,33 @@ rw-лок DuckDB (у eMule всё в одном процессе — поток�
 - После разблокировки: live-приёмка — реальный eMuleAI качает реальный
   файл из Incoming через наш listener, MD4 у получателя сходится.
 
+## Паритет раздачи [DONE, сессия 10]
+
+- [x] Periodic QUEUERANK: клиент в очереди держит соединение, ранг
+      обновляется по таймеру, при освобождении слота — промоция и
+      ACCEPTUPLOADREQ по тому же соединению (listener.py).
+- [x] Slot rotation по таймеру в ядре (expired slots -> release).
+- [x] credits→priority в upload-очереди (бонус = uploaded/downloaded,
+      cap 10; queue.py v0.2.0).
+- [x] known.met import/export: core/sharing/known_met.py (парсер сверен
+      с реальным eMuleAI known.met: 904/904) + CLI
+      `import known-met` / `export known-met`.
+
 ## Definition of done трека (без внешней сессии)
 
 1. P: наш файл находится KAD-поиском с чужих узлов; перепубликация работает. [DONE]
 2. S: listener живёт как демон, порт опубликован, self-test loopback зелёный. [DONE]
 3. C: credits пишутся при отдаче/получении; миграция 7 применена. [DONE]
-4. Полный offline suite зелёный; worktree закоммичен по подтверждению
-   пользователя; roadmap/continuation-prompt синхронизированы.
+4. U: единое ядро; весь read-only CLI и меню работают под живым ядром; загрузки end-to-end в ядре. [DONE]
+5. X/паритет: upload status, честные MISCOPTIONS, UPnP/NAT-PMP, known.met import/export, periodic QUEUERANK, credits→priority. [DONE]
+6. Полный offline suite зелёный (303 passed); worktree закоммичен по подтверждению
+   пользователя; roadmap/continuation-prompt синхронизированы. [suite DONE; коммит — по команде]
+
+ОСТАВШЕЕСЯ в этом треке (не блокер, а хвосты):
+- live-приёмка скачивания с реального чужого пира;
+- GeoIP-подключение;
+- ротация узлов паука; sources без userhash.
+
+Всё остальное — только cloud-трек: обфускационный accept входящих,
+SecureIdent-крипта, UDP-обфускация/DH.
 

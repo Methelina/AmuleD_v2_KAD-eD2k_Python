@@ -364,7 +364,7 @@ Next work:
 
 Relevant state implementation: [state.py](file:///K:/work/AmuleD_v2/src/amuled_v2/state.py).
 
-## 8. Next major milestones [8.1-8.3 DONE; 8.4-8.5 TODO/WIP]
+## 8. Next major milestones [8.1-8.3 DONE; 8.4 BLOCKED-EXTERNAL частично; 8.5 PARTLY]
 
 ### 8.1 Unified search-result model [DONE]
 
@@ -384,48 +384,50 @@ Create a stable internal result object shared by SERVER, GLOBAL, and KAD:
 
 This should become the input model for future download queue additions.
 
-### 8.2 Download queue [DONE — стек есть; TODO: скачивание с KAD-источников]
+### 8.2 Download queue [DONE — стек + запуск в ядре; live-приёмка от чужого пира — осталось]
 
 After unified results, implement:
 
-1. Download queue state in DuckDB.
-2. Native `.part` file format.
-3. Chunk bitmap and gap list.
-4. Source scheduling.
-5. Block request pipeline.
-6. Hashset request and verification.
-7. AICH recovery data.
-8. Final assembly into `incoming`.
-9. Pause/resume/cancel.
-10. Disk-space checks.
+1. Download queue state in DuckDB. [DONE]
+2. Native `.part` file format. [DONE]
+3. Chunk bitmap and gap list. [DONE]
+4. Source scheduling. [DONE — runner v0.2.0: параллельная гонка до max_peers пиров, первый полный результат побеждает]
+5. Block request pipeline. [DONE]
+6. Hashset request and verification. [DONE]
+7. AICH recovery data. [TODO]
+8. Final assembly into `incoming`. [DONE — finalize с MD4-верификацией]
+9. Pause/resume/cancel. [DONE — через kernel IPC]
+10. Disk-space checks. [TODO]
+
+Session 10 (2026-09-26): `download run` выполняется ВНУТРИ ядра (владеет DuckDB), CLI стартует задачу и поллит `download.status` по IPC; источники — через `sources.list` IPC. E2E-тест: ядро скачивает у собственного listener, MD4 сверен (tests/test_kernel.py).
 
 This is milestone M8 in the broader plan and should not start before source lifecycle is stable.
 
-### 8.3 Peer protocol [DONE — eD2K handshake; TODO: KAD-источники в download]
+### 8.3 Peer protocol [DONE — полный клиентский и серверный стек; source exchange как отдельная фича TODO]
 
 Required after download queue:
 
-1. Client hello.
-2. File request.
-3. Hashset request.
-4. Queue rank.
-5. Block request/response.
-6. Compressed blocks.
-7. Peer source exchange.
-8. Dead source handling.
-9. Upload slots and queues.
-10. Bandwidth throttling.
+1. Client hello. [DONE]
+2. File request. [DONE]
+3. Hashset request. [DONE]
+4. Queue rank. [DONE — periodic QUEUERANK с удержанием соединения, промоция слота (стадия X, сессия 10)]
+5. Block request/response. [DONE]
+6. Compressed blocks. [DONE]
+7. Peer source exchange. [TODO — мы не отвечаем на запросы источников; биты в HELLO честно обнулены]
+8. Dead source handling. [PARTLY — low-id фильтр, prune/forget]
+9. Upload slots and queues. [DONE — credits→priority, slot rotation, TTL]
+10. Bandwidth throttling. [DONE]
 
-### 8.4 Security [WIP — obfuscation/SecureIdent частично]
+### 8.4 Security [WIP — credits DONE; obf-accept/SecureIdent — BLOCKED-EXTERNAL]
 
 Implement only after stable transfer behavior:
 
-1. TCP obfuscation.
-2. UDP obfuscation.
-3. DH handshake.
-4. Secure identification.
-5. Client credits.
-6. Crypto key persistence.
+1. TCP obfuscation. [PARTLY — клиентский dial LIVE; серверный accept — внешняя сессия]
+2. UDP obfuscation. [TODO — внешняя сессия]
+3. DH handshake. [TODO — внешняя сессия]
+4. Secure identification. [Каркас DONE, крипта — внешняя сессия]
+5. Client credits. [DONE — учёт в обе стороны, credits→priority]
+6. Crypto key persistence. [TODO — внешняя сессия]
 
 Reference sources:
 
@@ -434,16 +436,16 @@ Reference sources:
 - [aMule RC4Encrypt.cpp](file:///O:/Work/Coding/aMule-2.3.3/src/RC4Encrypt.cpp)
 - [eMule ServerSocket.cpp](file:///O:/Work/Coding/eMule_0.50a/srchybrid/ServerSocket.cpp)
 
-### 8.5 IP filter, GeoIP, UPnP/NAT-PMP [WIP — ipfilter/blacklist DONE, GeoIP/UPnP TODO]
+### 8.5 IP filter, GeoIP, UPnP/NAT-PMP [PARTLY — ipfilter+UPnP/NAT-PMP DONE, GeoIP TODO]
 
 After live transfer:
 
-1. Parse bundled IP filters.
-2. Apply filter levels to peers and servers.
-3. Use bundled [GeoIP.dat](file:///K:/work/AmuleD_v2/assets/v1/GeoIP.dat).
-4. Add NAT diagnostics.
-5. Add UPnP/NAT-PMP port mapping.
-6. Improve lowid diagnosis.
+1. Parse bundled IP filters. [DONE]
+2. Apply filter levels to peers and servers. [DONE]
+3. Use bundled [GeoIP.dat](file:///K:/work/AmuleD_v2/assets/v1/GeoIP.dat). [TODO]
+4. Add NAT diagnostics. [DONE — nat-результат в ядре]
+5. Add UPnP/NAT-PMP port mapping. [DONE — core/nat/upnp.py: SSDP+SOAP+NAT-PMP, map/unmap в ядре, сессия 10]
+6. Improve lowid diagnosis. [PARTLY]
 
 ## 9. Test policy [DONE — действующая политика]
 
@@ -760,3 +762,87 @@ SecureIdent-каркас (крипто — мок), ротация узлов п
    userhash → decrypt → байт-diff его HELLO с нашим.
 3. После решения: подключить obfuscation к PeerClient + download runner,
    скачать файл ≤10 МБ end-to-end (MD4), коммит.
+
+## 11g. Session 10 (2026-09-26): v0.6.0 — IPC-роутинг + загрузки в ядре + стадия X + паритет раздачи [DONE — кроме live-приёмок и BLOCKED-EXTERNAL]
+
+Версия: `AmuleD v0.6.0` (bump 0.5.1 -> 0.6.0; AGENTS.md синхронизирован).
+Suite: **303 passed, 3 skipped**; compileall 0. Live-проверено под живым ядром:
+все read-only CLI (664 результата search через IPC), download add/cancel,
+`daemon status`.
+
+Сделано:
+
+1. **Стадия U фаза 3 — полный IPC-роутинг**: 15+ handlers в
+   core/kernel.py (search.results.*, sources.list, download.list/add/
+   pause/resume/start/cancel/run/status, servers.failures, ipfilter.status,
+   upload.status). Весь read-only CLI и меню работают ПОД живым ядром.
+   FIX: readline-лимит IPC-клиента 64 KiB -> 64 MiB (большие ответы рвались).
+2. **Загрузки end-to-end**: DownloadRunner v0.2.0 — параллельная гонка
+   пиров (первый полный результат побеждает, остальные отменяются);
+   `download run` выполняется внутри ядра (оно владеет DuckDB), CLI
+   поллит прогресс. E2E-тест: ядро скачивает у собственного listener,
+   MD4 сверен.
+3. **Стадия X**: честные MISCOPTIONS1/2 + EMULEINFO (заявляем только
+   compression/large files/unicode/kad2 — обработчиков AICH/source
+   exchange/multipacket нет); `upload status` CLI; UPnP IGD + NAT-PMP
+   (core/nat/upnp.py, map при старте ядра / unmap при остановке).
+4. **Паритет раздачи**: periodic QUEUERANK с удержанием соединения и
+   промоцией по тому же соединению (eMule-модель); slot rotation по
+   таймеру; credits->priority (бонус = uploaded/downloaded, cap 10).
+5. **known.met**: core/sharing/known_met.py (парсер сверен с реальным
+   eMuleAI known.met: 904/904 записей) + CLI `import known-met` /
+   `export known-met`. docs/audit_checklist.md создан.
+6. Меню: KAD status читает kernel_status.json + daemon status по IPC.
+   AmuleD_Run.ps1: spider-режим помечен DEPRECATED (v2.1.1).
+
+Остаток (порядок работ):
+1. live-приёмка `download run` от реального чужого пира (клиентский
+   obf-dial жив с сессии 7; inbound accept — BLOCKED-EXTERNAL).
+2. GeoIP: подключить assets/v1/GeoIP.dat к ipfilter/статистике.
+3. Стадия X-хвосты: ротация протухших узлов паука; sources без userhash
+   (дозвон после KAD userhash-lookup); source exchange как отвечающая
+   сторона; AICH; disk-space checks.
+4. Коммит/пуш версии 0.6.0 — по явной команде пользователя.
+
+## 11h. Session 11 (2026-09-26): BLOCKER #6 RESOLVED — live obfuscation, DH, download [DONE - LIVE]
+
+Cloud answer integrated (docs/recon/From_Cloude/): obfuscation.py v0.3.0
+(BasicObfuscationSession - one persistent RC4 stream per direction; the
+v0.2.0 bug was HELLO encrypted on a RESTARTED stream) wired into PeerClient
+(client.py v0.3.0: encrypt/decrypt at consumption, no plaintext fallback,
+rx-leftover buffer consumed exactly once).
+
+ЖИВЫЕ ИСПЫТАНИЯ (не синтетика), все против реальных узлов сети:
+
+1. Obf HELLOANSWER от реального eMuleAI 1.6.0 (127.0.0.1:8089):
+   negotiate -> HELLO на продолженном send-стриме (send_offset 18 -> 109)
+   -> HELLOANSWER 0x4C на продолженном recv-стриме. SUCCESS.
+2. Live DH-сессия с реальным ED2K-сервером (176.123.5.89:4725):
+   plaintext DH request [marker][g^a 96B][pad] -> g^B 96B -> RC4-ключи из
+   shared-секрета -> расшифрован [magic 0x835E6FC4|methods|padlen] сервера.
+   SUCCESS ("proper magic after DH-Agreement").
+3. End-to-end загрузка с реального eMuleAI: полный ladder (HELLO ->
+   filename/hashset -> STARTUPLOADREQ -> ACCEPTUPLOADREQ -> REQUESTPARTS ->
+   SENDINGPART) -> 1237/1237 байт -> MD4 сверен (e4ba0be1...). SUCCESS.
+
+Попутные находки (live-отладка):
+- userhash eMuleAI в preferences.dat на offset 1, а не 0 (ведущий байт);
+  идентифицируется маркерами h[5]=14, h[14]=111.
+- HELLOANSWER форка пишется БЕЗ ведущего байта длины хэша (codec.py
+  толерантен к обеим формам).
+- HASHSETANSWER форка инвертирован: [hash 16][count u16] (codec.py
+  толерантен).
+- Нужен СТАБИЛЬНЫЙ marked-хэш клиента: shield eMuleAI банит "Userhash
+  changed" при смене хэша между дозвонами и наказывает "Bad user hash"
+  без маркеров SO_EMULE (PeerClient: local_userhash + markers).
+- OP_OUTOFPARTREQS (0x57) сразу после выдачи слота = источник ещё не
+  приготовил блоки; transfer ретраит до 5 раз с паузой 3 с.
+- Паритет HELLO (параграф 7 клауда): старый формат тегов CTag, порядок
+  NAME,VERSION,UDPPORTS,MISO1,MISO2,EMULE_VER; CryptLayer
+  Supports+Requests биты (0x180).
+
+Suite: 315 passed, 3 skipped; compileall 0.
+
+Остаток: источники с userhash из KAD в download.run ядра (runner уже
+передаёт target_userhash - проверить на реальном KAD-источнике); GeoIP;
+ротация узлов паука.
