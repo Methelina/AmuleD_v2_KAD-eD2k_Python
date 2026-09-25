@@ -2,7 +2,7 @@
 
 AmuleD is a portable, console-first ED2K/Kademlia client written in Python 3.12. It is an independent clean-room implementation of the public ED2K and Kademlia protocols, not a binary wrapper around aMule/eMule and not a GPL source port.
 
-The current milestone provides a fully working **Kademlia (KAD) engine against the live eMule network** — keyword search (200 real results for a "video" query in about one second), file-source discovery (KADEMLIA2_SEARCH_SOURCE_REQ, sources persisted to DuckDB), and **publishing of your own shared files into the KAD index** (keyword and source entries, live-accepted: files published by AmuleD are found by network searches and AmuleD itself shows up as a source) — plus a live-validated ED2K TCP server session with search, a complete download stack (queue, part files, MD4 verification), a peer protocol layer with client-side **TCP obfuscation dialing** (the modern network requires it; the obfuscated handshake is live-verified against real eMule peers), an **incoming peer listener with an upload engine** (queue, slots, throttling; a serve daemon shares real files and the loopback self-test verifies the MD4 of a served file), a unified client identity, IP filter and server blacklisting, a searchable DuckDB-backed result store, a permanent KAD spider daemon that keeps the network warm, and an interactive console menu.
+The current milestone provides a fully working **Kademlia (KAD) engine against the live eMule network** — keyword search (200 real results for a "video" query in about one second), file-source discovery (KADEMLIA2_SEARCH_SOURCE_REQ, sources persisted to DuckDB), and **publishing of your own shared files into the KAD index** (keyword and source entries, live-accepted: files published by AmuleD are found by network searches and AmuleD itself shows up as a source) — plus a live-validated ED2K TCP server session with search, a complete download stack (queue, part files, MD4 verification), a peer protocol layer with client-side **TCP obfuscation dialing** (the modern network requires it; the obfuscated handshake is live-verified against real eMule peers), an **incoming peer listener with an upload engine** and a **client credit ledger** (uploads/downloads attributed per userhash), and a **unified kernel process** that runs the KAD spider, the listener, the republication loop and the DuckDB state under one permanent connection with a CLI-facing IPC control channel — no more single-writer lock contention between daemons and the CLI. IP filter, server blacklisting, a DuckDB-backed result store, and an interactive console menu round out the stack.
 
 **Author:** Soror L.'.L.'. &nbsp;|&nbsp; **Version:** 0.5.1 &nbsp;|&nbsp; **License:** Apache 2.0
 
@@ -54,13 +54,14 @@ The project has exactly two launchers: the installer and the single runtime. `Am
 
 ```powershell
 .\AmuleD_Run.ps1                      # interactive console menu (Server / KAD / Share / Search / Downloads)
-.\AmuleD_Run.ps1 spider               # KAD spider daemon: keeps the network warm (verbose, Ctrl+C to stop)
-.\AmuleD_Run.ps1 serve                # incoming peer listener + upload engine: shares your files (Ctrl+C to stop)
+.\AmuleD_Run.ps1 serve                # THE KERNEL: KAD spider + listener + publish + CLI IPC (Ctrl+C to stop)
 .\AmuleD_Run.ps1 -NoPause --help      # CLI passthrough
 .\AmuleD_Run.ps1 -NoPause status --json
+.\AmuleD_Run.ps1 -NoPause daemon status   # kernel status over IPC (ports, spider pool, uptime)
+.\AmuleD_Run.ps1 -NoPause daemon stop     # graceful kernel shutdown
 ```
 
-The KAD network only answers after warm-up. Keep the spider running in a console while you use search or sources; it continuously matures the routing table, refreshes the node cache (`db\kad_nodes.json`), and writes a live status snapshot to `db\kad_status.json` (including hot-connection statistics from the node database at the end of every cycle).
+The kernel is the single long-lived process. It keeps the Kademlia network warm (permanent HELLO/PING maturation over the cached node pool, status snapshot in `db\kad_status.json`), serves uploads on an ephemeral TCP port (advertised through KAD source entries), republishes your files every few hours, and owns the DuckDB connection exclusively — the CLI talks to it over loopback IPC (`db\kernel_status.json` carries the control port). Commands that need the database directly (share management, search-result persistence, downloads) run after `daemon stop`, or through the kernel once routed via IPC.
 
 ### Interactive menu
 
@@ -113,15 +114,25 @@ The publish client performs the same iterative closest-node lookup as eMule (`KA
 
 ### Share files to others (serve daemon)
 
-`serve` runs the incoming peer listener as a service: it accepts eD2K client-to-client connections, performs the HELLO/HELLOANSWER handshake, resolves requested hashes against your shared files, queues peers (priority, slots, TTL, dedupe), and serves file parts with per-session throttling:
+`serve` runs the kernel: it accepts eD2K client-to-client connections, performs the HELLO/HELLOANSWER handshake, resolves requested hashes against your shared files, queues peers (priority, slots, TTL, dedupe), and serves file parts with per-session throttling. The kernel also runs the KAD spider in-process (network warm-up, routing-table maturation, node cache persistence) and republishes KAD source entries with its actual bound TCP port on a schedule:
 
 ```powershell
-.\AmuleD_Run.ps1 serve                      # listener + hourly-repeated KAD republication
+.\AmuleD_Run.ps1 serve                      # kernel: spider + listener + hourly-repeated KAD republication
 .\AmuleD_Run.ps1 serve --publish-limit 10   # cap files per republication pass
-.\AmuleD_Run.ps1 serve --no-publish         # listener only
+.\AmuleD_Run.ps1 serve --no-publish         # kernel without republication
+.\AmuleD_Run.ps1 serve --no-spider          # kernel without the in-process spider
 ```
 
-The daemon advertises its actual bound port inside KAD source entries, writes a status snapshot to `db\serve_status.json` (pid, port, active connections), enforces `serve.max_sessions`, and shuts down gracefully on Ctrl+C. The client identity (userhash, nickname, TCP port) lives in the `identity` section of `config\amuled.jsonc` — the same userhash backs the HELLO handshake and the KAD source publish, matching eMule's `GetClientHash = GetUserHash` model; a userhash is generated and persisted on first run. Loopback self-test: AmuleD's own downloader fetches a real shared file from the daemon and the reassembled MD4 matches.
+The kernel writes `db\kernel_status.json` (pid, serve port, control port), enforces `serve.max_sessions`, and shuts down gracefully on Ctrl+C or `amuled daemon stop`. The client identity (userhash, nickname, TCP port) lives in the `identity` section of `config\amuled.jsonc` — the same userhash backs the HELLO handshake and the KAD source publish, matching eMule's `GetClientHash = GetUserHash` model; a userhash is generated and persisted on first run. While the kernel runs it holds the DuckDB connection exclusively, so `amuled credits list|get`, `daemon status` and `daemon stop` answer over IPC in milliseconds, and other database-touching commands are meant for `daemon stop` windows (or future IPC routes). Loopback self-test: AmuleD's own downloader fetches a real shared file from the kernel and the reassembled MD4 matches; served bytes are credited to the remote client's ledger (`client_credits` table) in the same process.
+
+### Client credits
+
+Every served/received byte is attributed to the remote client's userhash (eMule's credit model at the accounting level; signature verification is a separate external track):
+
+```powershell
+.\AmuleD_Run.ps1 -NoPause credits list --limit 20 --json
+.\AmuleD_Run.ps1 -NoPause credits get <user_hash> --json
+```
 
 ### Sources and downloads
 
@@ -238,6 +249,8 @@ Core policy documents:
 | Upload engine (queue/slots/throttle) | Implemented | `src/amuled_v2/core/upload/` |
 | Incoming peer listener (plain) | Implemented | `src/amuled_v2/core/peer/listener.py` |
 | Serve daemon (share files) | Implemented | `scripts/serve_daemon.py` |
+| Unified kernel (spider+listener+state, one process) | **Live-validated** | `src/amuled_v2/core/kernel.py`, `core/kernel_control.py`, `core/kad/spider.py` |
+| Client credits ledger (per-userhash accounting) | Implemented | `src/amuled_v2/state.py` (migration 7) |
 | Incoming obfuscated accept | Planned (external) | `docs/roadmap.md` |
 | GeoIP / UPnP-NAT-PMP | Planned | `docs/roadmap.md` |
 
@@ -252,7 +265,7 @@ Core policy documents:
 ```text
 AmuleD_v2/
 ├── AmuleD_install.ps1         # Idempotent portable installer
-├── AmuleD_Run.ps1             # Single runtime dispatcher: menu / spider / serve / CLI
+├── AmuleD_Run.ps1             # Single runtime dispatcher: menu / kernel(serve) / CLI
 ├── pyproject.toml             # Package metadata and dependencies
 ├── requirements.txt           # Locked dependency groups
 ├── AGENTS.md                  # Project-local development rules
@@ -265,13 +278,15 @@ AmuleD_v2/
 ├── temp/                      # Partial downloads
 ├── shared/                    # Default shared storage
 ├── docs/                      # Specification, roadmap, protocol matrix
-├── scripts/                   # KAD spider, serve daemon, interactive menu, warm-up and diagnostic scripts
+├── scripts/                   # Kernel launcher, interactive menu, warm-up and diagnostic scripts
 ├── src/amuled_v2/             # Python implementation
-│   ├── core/kad/              # KAD engine (packets, bootstrap, routing, search, publish, obfuscation, strategies)
+│   ├── core/kad/              # KAD engine (packets, bootstrap, routing, search, publish, spider, obfuscation, strategies)
 │   ├── core/peer/             # Peer protocol (client, listener, codec, obfuscation)
 │   ├── core/upload/           # Upload engine (queue, slots, throttled block transfer)
+│   ├── core/kernel.py         # Unified kernel: spider + listener + state + IPC
+│   ├── core/kernel_control.py # Kernel IPC control server/client (JSON lines)
 │   └── core/identity.py       # Unified client identity (userhash/nick/port)
-└── tests/                     # Unit, codec, state, and protocol tests
+└── tests/                     # Unit, codec, state, kernel and protocol tests
 ```
 
 ### Runtime isolation
@@ -305,7 +320,7 @@ Run all commands from `AmuleD_v2` using the project-local interpreter:
 Current full offline-suite status:
 
 ```text
-281 passed, 6 skipped
+294 passed, 6 skipped
 ```
 
 ### Tagged diagnostics
@@ -352,16 +367,18 @@ Completed development stations:
 - Client-side TCP obfuscation dialing - **DONE** (handshake live-verified)
 - KAD publish (keywords + sources) with republication loop - **DONE** (live-accepted)
 - Upload engine, incoming listener, serve daemon, unified identity - **DONE** (loopback self-test: MD4-verified)
+- Client credit ledger per userhash (upload/download accounting) - **DONE**
+- Unified kernel: spider + listener + DuckDB state in one process, CLI over IPC - **DONE** (zero lock contention, live-validated)
 
 Active / next stations (WIP/PLANNED):
 
 1. Downloads fed from KAD sources end to end (MD4-verified) - **WIP**
 2. Incoming obfuscated accept (external protocol review) - **WIP**
-3. Credits / SecureIdent skeleton - **PLANNED**
-4. Spider daemon stale-node rotation, search tactics as CLI flags - **PLANNED**
+3. IPC routing for the remaining CLI commands (share/search/servers/download) - **PLANNED**
+4. Credits / SecureIdent skeleton - **PLANNED** (crypto pending external session)
 5. GeoIP / UPnP-NAT-PMP - **PLANNED**
 
-Deprecated early-session notes are kept for context in docs/roadmap.md - every section there is tagged DONE/SOLVED/WIP/DEPRECATED/TODO; the live state is in sections 11a-11f.
+Deprecated early-session notes are kept for context in docs/roadmap.md - every section there is tagged DONE/SOLVED/WIP/DEPRECATED/TODO; the live state is in sections 11a-11f. The standalone KAD spider script is superseded by the in-kernel spider (`core/kad/spider.py`).
 
 ---
 
