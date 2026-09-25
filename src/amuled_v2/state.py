@@ -1348,6 +1348,11 @@ class StateBackend:
         bytes.fromhex(normalized)
         return normalized
 
+    @staticmethod
+    def _iso(value: Any) -> Any:
+        """JSON-friendly timestamps (IPC responses serialize to JSON)."""
+        return value.isoformat(sep=" ") if hasattr(value, "isoformat") else value
+
     def see_client(self, user_hash: str) -> None:
         """Register a HELLO from a client (seen_clients upsert)."""
         normalized = self._normalize_user_hash(user_hash)
@@ -1442,8 +1447,8 @@ class StateBackend:
             "user_hash": row[0],
             "uploaded": row[1],
             "downloaded": row[2],
-            "last_seen": row[3],
-            "updated_at": row[4],
+            "last_seen": self._iso(row[3]),
+            "updated_at": self._iso(row[4]),
         }
 
     def list_credits(self, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -1465,8 +1470,8 @@ class StateBackend:
                 "user_hash": row[0],
                 "uploaded": row[1],
                 "downloaded": row[2],
-                "last_seen": row[3],
-                "updated_at": row[4],
+                "last_seen": self._iso(row[3]),
+                "updated_at": self._iso(row[4]),
             }
             for row in rows
         ]
@@ -1488,8 +1493,8 @@ class StateBackend:
         return [
             {
                 "user_hash": row[0],
-                "first_seen": row[1],
-                "last_seen": row[2],
+                "first_seen": self._iso(row[1]),
+                "last_seen": self._iso(row[2]),
                 "hellos": row[3],
             }
             for row in rows
