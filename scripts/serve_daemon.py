@@ -31,7 +31,7 @@ from amuled_v2.core.kernel import run_kernel
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="AmuleD v0.5.1 unified kernel: spider + listener + IPC."
+        description="AmuleD v0.6.0 unified kernel: spider + listener + IPC."
     )
     parser.add_argument(
         "--once",

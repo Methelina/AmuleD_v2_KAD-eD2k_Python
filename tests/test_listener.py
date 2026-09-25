@@ -107,7 +107,12 @@ def _run(coro) -> None:
     asyncio.run(coro)
 
 
-async def _start_server(tmp_path, queue: UploadQueue, size: int = 200_000):
+async def _start_server(
+    tmp_path,
+    queue: UploadQueue,
+    size: int = 200_000,
+    queue_rank_period: float = 60.0,
+):
     shared = _make_shared_file(tmp_path, size)
     resolver = _FakeResolver({shared.file_hash: shared})
     server = IncomingPeerServer(
@@ -117,6 +122,7 @@ async def _start_server(tmp_path, queue: UploadQueue, size: int = 200_000):
         host="127.0.0.1",
         port=0,
         idle_timeout=15.0,
+        queue_rank_period=queue_rank_period,
     )
     await server.start()
     return server, shared
@@ -362,6 +368,63 @@ def test_emuleinfo_answered_and_session_alive(tmp_path) -> None:
                 await writer.wait_closed()
             except OSError:
                 pass
+        finally:
+            await server.close()
+
+    _run(scenario())
+
+def test_queued_client_promoted_after_slot_frees(tmp_path) -> None:
+    """Stage X parity: the queued client HOLDS its connection; when the
+    slot holder leaves, the next rank refresh promotes it and the engine
+    answers ACCEPTUPLOADREQ on the same connection."""
+
+    async def scenario() -> None:
+        server, shared = await _start_server(
+            tmp_path, UploadQueue(max_slots=1), queue_rank_period=0.3
+        )
+        try:
+            readers = []
+            writers = []
+            for i in range(2):
+                reader, writer = await asyncio.open_connection(
+                    "127.0.0.1", server.bound_port
+                )
+                await _send(
+                    writer,
+                    C2CTCP.HELLO,
+                    build_hello_payload(
+                        user_hash=os.urandom(16),
+                        client_id=1,
+                        client_port=4662,
+                        nickname=f"peer{i}",
+                    ),
+                )
+                await _recv(reader)
+                readers.append(reader)
+                writers.append(writer)
+
+            await _send(writers[0], C2CTCP.STARTUPLOADREQ, shared.file_hash)
+            opcode, _ = await _recv(readers[0])
+            assert opcode == C2CTCP.ACCEPTUPLOADREQ
+
+            await _send(writers[1], C2CTCP.STARTUPLOADREQ, shared.file_hash)
+            opcode, payload = await _recv(readers[1])
+            assert opcode == C2CTCP.QUEUERANK
+            assert parse_queue_rank(payload) == 1
+
+            # Slot holder disconnects: its session ends, the slot is
+            # released, and the queued client is promoted on the next
+            # rank refresh -> ACCEPTUPLOADREQ on the same connection.
+            writers[0].close()
+            try:
+                await writers[0].wait_closed()
+            except OSError:
+                pass
+
+            opcode, _ = await asyncio.wait_for(
+                _recv(readers[1]), timeout=10.0
+            )
+            assert opcode == C2CTCP.ACCEPTUPLOADREQ
         finally:
             await server.close()
 

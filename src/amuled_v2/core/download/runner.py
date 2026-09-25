@@ -8,9 +8,17 @@ part file via ``record_block`` and completion is finalized only when a
 peer delivers the whole file.
 
 src/amuled_v2/core/download/runner.py
-Version:     0.1.0
-Author:      Soror L'.L'.
-Updated:     2026-09-23
+Version:     0.2.0
+Author:      Soror L.'.L.'.
+Updated:     2026-09-26
+
+Patch Notes v0.2.0 (Soror L'.L'.):
+  [+] Parallel peer attempts (race semantics): up to max_peers peers run
+      concurrently; the first peer delivering a complete file wins and the
+      losers are cancelled.  Part-file writes stay sequential on the event
+      loop, so sparse block writes from several peers are safe.
+  [+] Optional source_provider: sources may come from the kernel over IPC
+      instead of the runner's own state connection.
 
 Patch Notes v0.1.0 (Soror L'.L'.):
   [+] Added DownloadRunner coordinating sequential peer download attempts.
@@ -20,6 +28,7 @@ Patch Notes v0.1.0 (Soror L'.L'.):
 
 from __future__ import annotations
 
+import asyncio
 import struct
 from typing import TYPE_CHECKING, Callable
 
@@ -64,6 +73,7 @@ class DownloadRunner:
         peer_response_timeout: float = 20.0,
         queue_wait_timeout: float = 60.0,
         traffic_sink: "Callable[[str, int], None] | None" = None,
+        source_provider: "Callable[[str, int], list[dict]] | None" = None,
     ) -> None:
         self.queue = queue
         self.local_client_id = local_client_id
@@ -76,9 +86,15 @@ class DownloadRunner:
         # Stage C credit accounting: forwarded to every PeerClient; called
         # with (peer_user_hash_hex, downloaded_bytes) per finished transfer.
         self.traffic_sink = traffic_sink
+        # Stage U: when the kernel owns the db, sources arrive over IPC via
+        # this provider instead of a direct state query.
+        self.source_provider = source_provider
 
     def resolve_sources(self, file_hash: str, *, limit: int = 20) -> list[tuple[str, int]]:
-        rows = self.queue.state.list_file_sources(file_hash, limit=limit)
+        if self.source_provider is not None:
+            rows = self.source_provider(file_hash, limit)
+        else:
+            rows = self.queue.state.list_file_sources(file_hash, limit=limit)
         seen: set[tuple[str, int]] = set()
         endpoints: list[tuple[str, int]] = []
         skipped = 0
@@ -99,6 +115,65 @@ class DownloadRunner:
                 skipped,
             )
         return endpoints
+
+    async def _attempt_peer(
+        self,
+        endpoint: tuple[str, int],
+        file_hash: str,
+        size: int,
+        file_hash_bytes: bytes,
+        progress_callback: Callable[[int, int, int], None] | None,
+    ) -> dict:
+        """Drive one peer through the full download ladder; return an
+        outcome dict (never raises — failures become outcome dicts)."""
+        host, port = endpoint
+        outcome: "DownloadOutcome | None" = None
+        client = None
+        try:
+            from amuled_v2.core.peer.client import PeerClient
+
+            client = PeerClient(
+                host,
+                port,
+                local_client_id=self.local_client_id,
+                local_port=self.local_port,
+                nickname=self.nickname,
+                connect_timeout=self.peer_connect_timeout,
+                response_timeout=self.peer_response_timeout,
+                queue_wait_timeout=self.queue_wait_timeout,
+                traffic_sink=self.traffic_sink,
+            )
+            await client.connect()
+            await client.handshake()
+            await client.request_file(file_hash_bytes)
+            await client.wait_upload_slot(file_hash_bytes)
+            outcome = await client.transfer(
+                file_hash_bytes,
+                size,
+                write_block=lambda start, data: self.queue.record_block(
+                    file_hash, start, data
+                ),
+                progress_callback=progress_callback,
+            )
+            return outcome.to_dict()
+        except Exception as exc:
+            log.warning(
+                "DOWNLOAD peer attempt failed: endpoint=%s:%d, error=%s",
+                host, port, exc,
+            )
+            if outcome is not None:
+                return outcome.to_dict()
+            return {
+                "file_hash": file_hash,
+                "bytes_received": 0,
+                "blocks_received": 0,
+                "complete": False,
+                "elapsed": 0.0,
+                "detail": f"peer error: {exc}",
+            }
+        finally:
+            if client is not None:
+                await client.close()
 
     async def run(
         self,
@@ -124,85 +199,58 @@ class DownloadRunner:
             )
 
         file_hash_bytes = bytes.fromhex(str(entry["hash"]))
+        size = int(entry["size"])
+        endpoints = sources[: self.max_peers]
+        log.info(
+            "DOWNLOAD race start: hash=%s, peers=%d",
+            file_hash, len(endpoints),
+        )
+
+        tasks = {
+            asyncio.create_task(
+                self._attempt_peer(
+                    endpoint, file_hash, size, file_hash_bytes, progress_callback
+                ),
+                name=f"dl-peer-{endpoint[0]}:{endpoint[1]}",
+            ): endpoint
+            for endpoint in endpoints
+        }
         attempts: list[dict] = []
-        for endpoint in sources[: self.max_peers]:
-            host, port = endpoint
-            outcome: "DownloadOutcome | None" = None
-            client = None
-            try:
-                from amuled_v2.core.peer.client import (
-                    PeerCodecError,
-                    PeerClient,
-                    PeerSessionError,
+        pending = set(tasks)
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
                 )
-
-                client = PeerClient(
-                    host,
-                    port,
-                    local_client_id=self.local_client_id,
-                    local_port=self.local_port,
-                    nickname=self.nickname,
-                    connect_timeout=self.peer_connect_timeout,
-                    response_timeout=self.peer_response_timeout,
-                    queue_wait_timeout=self.queue_wait_timeout,
-                    traffic_sink=self.traffic_sink,
-                )
-                await client.connect()
-                await client.handshake()
-                await client.request_file(file_hash_bytes)
-                await client.wait_upload_slot(file_hash_bytes)
-                outcome = await client.transfer(
-                    file_hash_bytes,
-                    int(entry["size"]),
-                    write_block=lambda start, data: self.queue.record_block(
-                        file_hash, start, data
-                    ),
-                    progress_callback=progress_callback,
-                )
-                attempts.append(outcome.to_dict())
-            except (PeerSessionError, PeerCodecError, OSError) as exc:
-                from amuled_v2.core.download.queue import DownloadQueueError
-
-                if isinstance(exc, DownloadQueueError):
-                    log.warning(
-                        "DOWNLOAD source lookup failed: endpoint=%s:%d, error=%s",
-                        host,
-                        port,
-                        exc,
+                for task in done:
+                    attempts.append(task.result())
+                refreshed = self.queue.get(file_hash)
+                if refreshed is not None and refreshed["status"] == "complete":
+                    # First winner takes the file; the losing peers are
+                    # cancelled mid-transfer.
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    finalized = self.queue.finalize(file_hash, verify=verify)
+                    winner = next(
+                        (a for a in attempts if a.get("complete")),
+                        attempts[-1] if attempts else {},
                     )
-                else:
-                    log.warning(
-                        "DOWNLOAD peer attempt failed: endpoint=%s:%d, error=%s",
-                        host,
-                        port,
-                        exc,
+                    log.info(
+                        "DOWNLOAD race won: hash=%s, attempts=%d", file_hash,
+                        len(attempts),
                     )
-                if outcome is not None:
-                    attempts.append(outcome.to_dict())
-                else:
-                    attempts.append(
-                        {
-                            "file_hash": file_hash,
-                            "bytes_received": 0,
-                            "blocks_received": 0,
-                            "complete": False,
-                            "elapsed": 0.0,
-                            "detail": f"peer error: {exc}",
-                        }
-                    )
-            finally:
-                if client is not None:
-                    await client.close()
-
-            refreshed = self.queue.get(file_hash)
-            if refreshed is not None and refreshed["status"] == "complete":
-                finalized = self.queue.finalize(file_hash, verify=verify)
-                outcome_dict = attempts[-1] if attempts else {}
-                return {
-                    "status": "complete",
-                    "outcome": outcome_dict,
-                    "finalized": finalized,
-                }
+                    return {
+                        "status": "complete",
+                        "outcome": winner,
+                        "finalized": finalized,
+                    }
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         return {
             "status": "incomplete",

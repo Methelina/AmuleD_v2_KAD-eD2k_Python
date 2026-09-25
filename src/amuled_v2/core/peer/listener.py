@@ -371,6 +371,7 @@ class IncomingPeerSession:
         allow_compression: bool = True,
         idle_timeout: float | None = 300.0,
         traffic_recorder: Callable[[str, int], None] | None = None,
+        queue_rank_period: float = 60.0,
     ) -> None:
         self._reader = reader
         self._writer = writer
@@ -384,6 +385,7 @@ class IncomingPeerSession:
         # (peer_user_hash_hex, uploaded_bytes); failures are swallowed by
         # the caller-supplied recorder, never by the session.
         self._traffic_recorder = traffic_recorder
+        self._queue_rank_period = queue_rank_period
         self._peer_name = _format_peer(writer)
         self._transport: StreamTransport | None = None
 
@@ -662,19 +664,99 @@ class IncomingPeerSession:
 
                 outcome, rank_value = decision
                 if outcome != "accept":
-                    rank_payload = struct.pack("<I", rank_value & 0xFFFFFFFF)
-                    await transport.send(C2CTCP.QUEUERANK, rank_payload)
-                    log.info(
-                        "QUEUERANK sent: peer=%s, hash=%s, rank=%d",
-                        self._peer_name,
-                        last_hash_hex,
-                        rank_value,
-                    )
-                    await self._safe_close(transport)
-                    return self._build_report(
-                        hello, last_hash_hex, started_at, accepted=False,
-                        detail="queued",
-                    )
+                    # Queue hold (eMule parity: the uploader keeps the
+                    # queued client's connection open and pushes updated
+                    # QUEUERANKs; when the head of the queue is promoted it
+                    # answers with the engine hook -> ACCEPTUPLOADREQ).
+                    # A clean EOF or END_OF_DOWNLOAD ends the wait.
+                    while True:
+                        rank_payload = struct.pack("<I", rank_value & 0xFFFFFFFF)
+                        await transport.send(C2CTCP.QUEUERANK, rank_payload)
+                        log.info(
+                            "QUEUERANK sent: peer=%s, hash=%s, rank=%d",
+                            self._peer_name,
+                            last_hash_hex,
+                            rank_value,
+                        )
+                        try:
+                            packet = await asyncio.wait_for(
+                                transport.recv(),
+                                timeout=self._queue_rank_period,
+                            )
+                        except asyncio.TimeoutError:
+                            head = self._upload_queue.next_for_slot()
+                            if (
+                                head is not None
+                                and head.user_hash == user_hash_hex
+                                and head.requested_hash == last_hash_key
+                            ):
+                                try:
+                                    self._upload_queue.grant_slot(
+                                        user_hash_hex, last_hash_key
+                                    )
+                                    granted_key = (user_hash_hex, last_hash_key)
+                                    outcome = "accept"
+                                    break
+                                except Exception as exc:
+                                    log.warning(
+                                        "grant_slot failed on rank refresh: "
+                                        "peer=%s, error=%s",
+                                        self._peer_name,
+                                        exc,
+                                    )
+                            fresh = self._upload_queue.rank_of(
+                                user_hash_hex, last_hash_key
+                            )
+                            rank_value = (
+                                fresh if fresh is not None else rank_value
+                            )
+                            continue
+                        if packet is None:
+                            await self._safe_close(transport)
+                            return self._build_report(
+                                hello, last_hash_hex, started_at,
+                                accepted=False, detail="queued",
+                            )
+                        wait_opcode, wait_payload = packet
+                        if wait_opcode == C2CTCP.STARTUPLOADREQ:
+                            re_hash = parse_file_hash_payload(wait_payload)
+                            re_key = re_hash.hex().lower()
+                            rank_value = self._upload_queue.enqueue(
+                                user_hash=user_hash_hex,
+                                client_id=client_id,
+                                client_port=hello.client_port,
+                                nickname=hello.nickname,
+                                requested_hash=re_key,
+                                file_priority=shared_file.priority,
+                            )
+                            head = self._upload_queue.next_for_slot()
+                            if (
+                                head is not None
+                                and head.user_hash == user_hash_hex
+                                and head.requested_hash == re_key
+                            ):
+                                try:
+                                    self._upload_queue.grant_slot(
+                                        user_hash_hex, re_key
+                                    )
+                                    granted_key = (user_hash_hex, re_key)
+                                    last_hash_hex = re_hash.hex().upper()
+                                    last_hash_key = re_key
+                                    outcome = "accept"
+                                    break
+                                except Exception as exc:
+                                    log.warning(
+                                        "grant_slot failed in queue wait: "
+                                        "peer=%s, error=%s",
+                                        self._peer_name,
+                                        exc,
+                                    )
+                        elif wait_opcode == C2CTCP.END_OF_DOWNLOAD:
+                            await self._safe_close(transport)
+                            return self._build_report(
+                                hello, last_hash_hex, started_at,
+                                accepted=False, detail="queued",
+                            )
 
                 # Accept path: the engine's on_start_upload_request hook
                 # re-examines the replayed STARTUPLOADREQ (is_active → True)
@@ -870,6 +952,7 @@ class IncomingPeerServer:
         idle_timeout: float | None = 300.0,
         max_connections: int = 64,
         traffic_recorder: Callable[[str, int], None] | None = None,
+        queue_rank_period: float = 60.0,
     ) -> None:
         self._identity = identity
         self._resolver = resolver
@@ -880,6 +963,7 @@ class IncomingPeerServer:
         self._allow_compression = allow_compression
         self._idle_timeout = idle_timeout
         self._traffic_recorder = traffic_recorder
+        self._queue_rank_period = queue_rank_period
         if max_connections < 1:
             raise ListenerError(f"max_connections must be >= 1, got {max_connections}")
         self._max_connections = max_connections
@@ -951,6 +1035,7 @@ class IncomingPeerServer:
             allow_compression=self._allow_compression,
             idle_timeout=self._idle_timeout,
             traffic_recorder=self._traffic_recorder,
+            queue_rank_period=self._queue_rank_period,
         )
         self._connections.add(session)
         try:

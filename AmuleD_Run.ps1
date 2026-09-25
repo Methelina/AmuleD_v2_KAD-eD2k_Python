@@ -1,9 +1,13 @@
 # ==========================================================
-# AmuleD v0.5.1 Portable Runtime (PowerShell Version)
+# AmuleD v0.6.0 Portable Runtime (PowerShell Version)
 # ==========================================================
-# Version: 2.1.0
+# Version: 2.1.1
 # Author:  Soror L.'.L.'.
 # Updated: 2026-09-25
+#
+# Patchnote v2.1.1 (By Soror L.'.L.'.):
+#   [!] `spider` mode marked DEPRECATED: the unified kernel (`serve`) includes
+#       the spider; a warning is printed before the legacy script starts.
 #
 # Patchnote v2.1.0 (By Soror L.'.L.'.):
 #   [+] Added `serve` mode: incoming peer serve daemon (scripts\serve_daemon.py),
@@ -46,7 +50,7 @@ param(
 # Set UTF-8 encoding and working directory
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
-$Host.UI.RawUI.WindowTitle = "AmuleD v0.5.1 Portable Runtime by Soror L.'.L.'."
+$Host.UI.RawUI.WindowTitle = "AmuleD v0.6.0 Portable Runtime by Soror L.'.L.'."
 Set-Location $PSScriptRoot
 
 # ==========================================================
@@ -65,7 +69,7 @@ Write-Host "    ░ ░    ░    ░     ░ ░    ░    ░" -ForegroundColo
 Write-Host "      ░  ░  ░    ░      ░  ░  ░    ░" -ForegroundColor Yellow
 Write-Host ""
 Write-Host " ======================================================" -ForegroundColor Cyan
-Write-Host "   AmuleD v0.5.1 Portable ED2K/Kademlia Launcher" -ForegroundColor White
+Write-Host "   AmuleD v0.6.0 Portable ED2K/Kademlia Launcher" -ForegroundColor White
 Write-Host "   by Soror L.'.L.'." -ForegroundColor Yellow
 Write-Host ""
 
@@ -225,6 +229,8 @@ if ($Mode -eq "menu") {
 }
 
 if ($Mode -eq "spider") {
+    Write-Host "[RUNNER] [WARN] DEPRECATED: the standalone spider mode is obsolete (stage U)." -ForegroundColor Yellow
+    Write-Host "[RUNNER] [WARN] Use '.\AmuleD_Run.ps1 serve' — the unified kernel includes the spider." -ForegroundColor Yellow
     if (-not (Test-Path $SpiderScript)) {
         Write-Host "[RUNNER] [ERROR] Spider script not found: $SpiderScript" -ForegroundColor Red
         if (-not $NoPause) {

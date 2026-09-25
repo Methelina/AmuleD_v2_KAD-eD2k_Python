@@ -12,11 +12,17 @@ Implements the core scheduling rules from eMuleAI's UploadQueue.cpp:
   its current rank instead of being re-enqueued.
 
 src/amuled_v2/core/upload/queue.py
-Version:     0.1.0
+Version:     0.2.0
 Author:      Soror L.'.L'.
-Updated:     2026-09-24
+Updated:     2026-09-26
 
-Patch Notes v0.1.0 (Soror L.'.L'.):
+Patch Notes v0.2.0 (Soror L'.L'.):
+  [+] Stage X upload parity: optional credit_bonus callable (eMule credits
+      -> queue priority): a client's bonus (SecureIdent-style, > 1.0 for
+      proven uploaders) is refreshed on every recompute and breaks ties
+      before enqueue time, promoting clients that gave us more bytes.
+
+Patch Notes v0.1.0 (Soror L'.L'.):
   [+] Added UploadPriority with eMule PR_LOW/PR_NORMAL/PR_HIGH mapping.
   [+] Added frozen UploadClient dataclass with hash validation and to_dict.
   [+] Added UploadQueue with enqueue/dequeue, grant/release, rank, TTL, and
@@ -27,6 +33,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 from amuled_v2.logging_setup import LogTags, get_tagged_logger
 
@@ -68,6 +75,7 @@ class UploadClient:
     nickname: str
     requested_hash: str
     file_priority: int = 1
+    credit_bonus: float = 1.0
     enqueued_at: float = field(default_factory=time.monotonic)
     rank: int = 0
 
@@ -79,6 +87,7 @@ class UploadClient:
             "nickname": self.nickname,
             "requested_hash": self.requested_hash,
             "file_priority": self.file_priority,
+            "credit_bonus": self.credit_bonus,
             "enqueued_at": self.enqueued_at,
             "rank": self.rank,
         }
@@ -96,9 +105,18 @@ class UploadQueue:
     (10 min) covers the typical slot lifetime before re-queuing.
     """
 
-    def __init__(self, max_slots: int = 4, slot_ttl: float = 600.0) -> None:
+    def __init__(
+        self,
+        max_slots: int = 4,
+        slot_ttl: float = 600.0,
+        credit_bonus: "Callable[[str], float] | None" = None,
+    ) -> None:
         self.max_slots = max_slots
         self.slot_ttl = slot_ttl
+        # eMule credits -> priority: called per waiting client on every
+        # recompute; the returned factor (> 1.0 favors the client) is a
+        # secondary sort key right after the file priority.
+        self._credit_bonus = credit_bonus
         self._waiting: dict[tuple[str, str], UploadClient] = {}
         self._slots: dict[tuple[str, str], float] = {}
 
@@ -112,9 +130,18 @@ class UploadQueue:
         return normalized
 
     def _recompute(self) -> None:
+        for client in self._waiting.values():
+            if self._credit_bonus is not None:
+                try:
+                    object.__setattr__(
+                        client, "credit_bonus",
+                        max(0.0, float(self._credit_bonus(client.user_hash))),
+                    )
+                except Exception:
+                    pass
         ordered = sorted(
             self._waiting.values(),
-            key=lambda c: (-c.file_priority, c.enqueued_at),
+            key=lambda c: (-c.file_priority, -c.credit_bonus, c.enqueued_at),
         )
         for index, client in enumerate(ordered, start=1):
             object.__setattr__(client, "rank", index)

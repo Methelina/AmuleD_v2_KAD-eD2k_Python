@@ -1249,3 +1249,24 @@ class TestUploadSessionEdgeCases:
                 part.data for part in sorted(matching, key=lambda p: p.start)
             )
             assert reassembled == content[req_start:req_end]
+
+def test_credit_bonus_promotes_generous_client() -> None:
+    """Stage X: credits -> priority.  A client with a higher credit bonus
+    outranks an earlier-enqueued client despite identical file priority."""
+    from amuled_v2.core.upload.queue import UploadQueue
+
+    bonus = {("b" * 32): 5.0}
+    queue = UploadQueue(
+        max_slots=1, credit_bonus=lambda uh: bonus.get(uh, 1.0)
+    )
+    file_hash = "ab" * 16
+    queue.enqueue("a" * 32, 1, 4662, "plain", file_hash)
+    rank_b = queue.enqueue("b" * 32, 2, 4662, "generous", file_hash)
+    assert rank_b == 1
+    assert queue.rank_of("a" * 32, file_hash) == 2
+
+    # Snapshot carries the refreshed bonus values.
+    snapshot = queue.snapshot()
+    entries = {c["user_hash"]: c for c in snapshot["queue"]}
+    assert entries["a" * 32]["credit_bonus"] == 1.0
+    assert entries["b" * 32]["credit_bonus"] == 5.0

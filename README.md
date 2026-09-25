@@ -1,10 +1,10 @@
-# AmuleD v0.5.1
+# AmuleD v0.6.0
 
 AmuleD is a portable, console-first ED2K/Kademlia client written in Python 3.12. It is an independent clean-room implementation of the public ED2K and Kademlia protocols, not a binary wrapper around aMule/eMule and not a GPL source port.
 
 The current milestone provides a fully working **Kademlia (KAD) engine against the live eMule network** — keyword search (200 real results for a "video" query in about one second), file-source discovery (KADEMLIA2_SEARCH_SOURCE_REQ, sources persisted to DuckDB), and **publishing of your own shared files into the KAD index** (keyword and source entries, live-accepted: files published by AmuleD are found by network searches and AmuleD itself shows up as a source) — plus a live-validated ED2K TCP server session with search, a complete download stack (queue, part files, MD4 verification), a peer protocol layer with client-side **TCP obfuscation dialing** (the modern network requires it; the obfuscated handshake is live-verified against real eMule peers), an **incoming peer listener with an upload engine** and a **client credit ledger** (uploads/downloads attributed per userhash), and a **unified kernel process** that runs the KAD spider, the listener, the republication loop and the DuckDB state under one permanent connection with a CLI-facing IPC control channel — no more single-writer lock contention between daemons and the CLI. IP filter, server blacklisting, a DuckDB-backed result store, and an interactive console menu round out the stack.
 
-**Author:** Soror L.'.L.'. &nbsp;|&nbsp; **Version:** 0.5.1 &nbsp;|&nbsp; **License:** Apache 2.0
+**Author:** Soror L.'.L.'. &nbsp;|&nbsp; **Version:** 0.6.0 &nbsp;|&nbsp; **License:** Apache 2.0
 
 **Documentation:** [English](README.md) · [Русский](README.ru.md)
 **Repositary:** [GitHub - Methelina/AmuleD_v2_KAD-eD2k_Python](https://github.com/Methelina/AmuleD_v2_KAD-eD2k_Python.git)
@@ -185,7 +185,7 @@ The JSONL form contains stable fields for timestamp, level, tag, logger, and mes
 The public name and version are:
 
 ```text
-AmuleD v0.5.1
+AmuleD v0.6.0
 ```
 
 The stable technical names are intentionally separate:
@@ -193,7 +193,7 @@ The stable technical names are intentionally separate:
 | Item | Value |
 |---|---|
 | Public client name | `AmuleD` |
-| Public version string | `AmuleD v0.5.1` |
+| Public version string | `AmuleD v0.6.0` |
 | Python package | `amuled_v2` |
 | CLI executable | `amuled` |
 | Project directory | `AmuleD_v2` |

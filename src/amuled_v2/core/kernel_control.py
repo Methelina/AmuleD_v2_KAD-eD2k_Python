@@ -50,7 +50,11 @@ async def control_request(
 ) -> dict[str, Any]:
     """One JSON-lines request/response against the kernel control server."""
     reader, writer = await asyncio.wait_for(
-        asyncio.open_connection("127.0.0.1", port), timeout=timeout
+        # Large read limit: one response can be a full search-results or
+        # share listing in a single JSON line (the default 64 KiB breaks
+        # readline with LimitOverrunError on live-size payloads).
+        asyncio.open_connection("127.0.0.1", port, limit=64 * 1024 * 1024),
+        timeout=timeout,
     )
     try:
         writer.write((json.dumps(request) + "\n").encode("utf-8"))

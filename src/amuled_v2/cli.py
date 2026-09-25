@@ -22,6 +22,9 @@ Author:      Soror L.'.L.'.
 Updated:     2026-09-23
 
 Patch Notes v0.6.0 (Soror L.'.L'.):
+  [+] Stage U phase 3: search results/sources/download list+add/servers
+      failures/ipfilter status route over kernel IPC first, falling back to
+      direct DuckDB when the kernel is down.
   [+] Search results persist in DuckDB with full tag sets.
   [+] Added `search results list/show/clear` for cached results.
   [+] Implemented the GLOBAL channel as a real UDP server-list search.
@@ -68,6 +71,7 @@ import asyncio
 import json
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -888,14 +892,24 @@ def _cmd_search_global(args: argparse.Namespace) -> int:
 
 
 def _cmd_search_results_list(args: argparse.Namespace) -> int:
-    state = get_state()
-    state.connect()
-    rows = state.list_search_results(
-        query=args.query,
-        channel=args.channel,
-        hash_prefix=args.hash,
-        limit=args.limit,
-    )
+    response = _kernel_control({
+        "command": "search.results.list",
+        "query": args.query,
+        "channel": args.channel,
+        "hash": args.hash,
+        "limit": args.limit,
+    })
+    if response is not None:
+        rows = response.get("results", [])
+    else:
+        state = get_state()
+        state.connect()
+        rows = state.list_search_results(
+            query=args.query,
+            channel=args.channel,
+            hash_prefix=args.hash,
+            limit=args.limit,
+        )
     result = {
         "status": "ok",
         "results": rows,
@@ -920,9 +934,15 @@ def _cmd_search_results_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_search_results_show(args: argparse.Namespace) -> int:
-    state = get_state()
-    state.connect()
-    tags = state.get_search_result_tags(args.hash)
+    response = _kernel_control({
+        "command": "search.results.show", "hash": args.hash,
+    })
+    if response is not None:
+        tags = response.get("tags", [])
+    else:
+        state = get_state()
+        state.connect()
+        tags = state.get_search_result_tags(args.hash)
     result = {
         "status": "ok" if tags else "not_found",
         "hash": args.hash.lower(),
@@ -948,9 +968,15 @@ def _cmd_search_results_show(args: argparse.Namespace) -> int:
 
 
 def _cmd_search_results_clear(args: argparse.Namespace) -> int:
-    state = get_state()
-    state.connect()
-    removed = state.clear_search_results(query=args.query)
+    response = _kernel_control({
+        "command": "search.results.clear", "query": args.query,
+    })
+    if response is not None:
+        removed = int(response.get("removed", 0))
+    else:
+        state = get_state()
+        state.connect()
+        removed = state.clear_search_results(query=args.query)
     result = {
         "status": "ok",
         "removed": removed,
@@ -1601,6 +1627,43 @@ def _cmd_credits(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_upload_status(args: argparse.Namespace) -> int:
+    response = _kernel_control({"command": "upload.status"})
+    if response is None:
+        result = {
+            "status": "error",
+            "reason": "kernel is not running (upload queue lives in the kernel)",
+        }
+        if args.json:
+            _print_json(result)
+        else:
+            _print_text("Upload status", [
+                "status : error",
+                "reason : kernel is not running (upload queue lives in the kernel)",
+            ])
+        return 2
+    snapshot = response.get("snapshot")
+    result = {"status": "ok", **(snapshot or {})}
+    if args.json:
+        _print_json(result)
+    else:
+        if snapshot is None:
+            _print_text("Upload status", [f"reason : {response.get('reason')}"])
+            return 0
+        lines = [
+            f"slots   : {snapshot.get('active_slots', 0)}/{snapshot.get('max_slots', 0)}",
+            f"waiting : {snapshot.get('waiting', 0)}",
+        ]
+        for client in snapshot.get("queue", []):
+            lines.append(
+                f"  rank={client.get('rank', '?')} "
+                f"{client.get('user_hash', '?')} file={client.get('file_hash', '?')}"
+            )
+        _print_text("Upload status", lines)
+    log.info("Upload status listed: waiting=%s", snapshot.get("waiting", 0))
+    return 0
+
+
 def _cmd_daemon(args: argparse.Namespace) -> int:
     """Kernel lifecycle commands (stage U): status / stop via IPC."""
     status = _kernel_control({"command": "status"})
@@ -1647,10 +1710,15 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 
 
 def _cmd_servers_failures(args: argparse.Namespace) -> int:
-    state = get_state()
-    state.connect()
-    blacklisted = state.list_blacklisted_servers()
-    tracked = state.list_server_failures()
+    response = _kernel_control({"command": "servers.failures"})
+    if response is not None:
+        blacklisted = response.get("blacklisted", [])
+        tracked = response.get("tracked", [])
+    else:
+        state = get_state()
+        state.connect()
+        blacklisted = state.list_blacklisted_servers()
+        tracked = state.list_server_failures()
     result = {
         "status": "ok",
         "blacklisted": blacklisted,
@@ -1700,9 +1768,13 @@ def _cmd_servers_forgive(args: argparse.Namespace) -> int:
 
 
 def _cmd_ipfilter_status(args: argparse.Namespace) -> int:
-    ip_filter = _load_ipfilter()
-    stats = ip_filter.statistics()
-    result = {"status": "ok", "path": str(_IPFILTER_PATH), **stats}
+    response = _kernel_control({"command": "ipfilter.status"})
+    if response is not None:
+        result = {"status": "ok", **response}
+    else:
+        ip_filter = _load_ipfilter()
+        stats = ip_filter.statistics()
+        result = {"status": "ok", "path": str(_IPFILTER_PATH), **stats}
     if args.json:
         _print_json(result)
     else:
@@ -1803,9 +1875,15 @@ def _cmd_sources_prune(args: argparse.Namespace) -> int:
 
 
 def _cmd_sources_list(args: argparse.Namespace) -> int:
-    state = get_state()
-    state.connect()
-    rows = state.list_file_sources(args.hash, limit=args.limit)
+    response = _kernel_control({
+        "command": "sources.list", "hash": args.hash, "limit": args.limit,
+    })
+    if response is not None:
+        rows = response.get("sources", [])
+    else:
+        state = get_state()
+        state.connect()
+        rows = state.list_file_sources(args.hash, limit=args.limit)
     result = {
         "status": "ok",
         "file_hash": args.hash.lower() if args.hash else None,
@@ -1861,13 +1939,27 @@ def _cmd_download_add(args: argparse.Namespace) -> int:
         else:
             _print_text("Download refused", [f"status : error", f"reason : {exc}"])
         return 2
-    queue = _download_queue()
-    entry = queue.add(
-        file_hash=parsed.file_hash.hex(),
-        name=parsed.name,
-        size=parsed.size,
-    )
-    result = {"status": "ok", "action": "add", **entry}
+    response = _kernel_control({"command": "download.add", "link": args.link})
+    if response is not None:
+        result = response
+        if result.get("status") != "ok":
+            if args.json:
+                _print_json(result)
+            else:
+                _print_text("Download refused", [
+                    "status : error",
+                    f"reason : {result.get('reason', 'unknown')}",
+                ])
+            return 2
+        entry = result
+    else:
+        queue = _download_queue()
+        entry = queue.add(
+            file_hash=parsed.file_hash.hex(),
+            name=parsed.name,
+            size=parsed.size,
+        )
+        result = {"status": "ok", "action": "add", **entry}
     if args.json:
         _print_json(result)
     else:
@@ -1876,10 +1968,71 @@ def _cmd_download_add(args: argparse.Namespace) -> int:
             f"hash   : {entry['hash']}",
             f"name   : {entry['name']}",
             f"size   : {entry['size']}",
-            f"queue  : {entry['status']}",
+            f"queue  : {entry.get('queue', entry['status'])}",
         ])
     log.info(f"Download add completed: hash={entry['hash']}")
     return 0
+
+
+def _download_run_via_kernel(args: argparse.Namespace) -> int | None:
+    """In-kernel download run (stage U): the kernel owns the DuckDB, so it
+    executes the peer race; the CLI starts the task and polls progress.
+    Returns None when no kernel is running (caller falls back locally)."""
+    start = _kernel_control({
+        "command": "download.run", "hash": args.hash, "max_peers": args.max_peers,
+    })
+    if start is None:
+        return None
+    if not start.get("started"):
+        reason = start.get("reason", "unknown")
+        if getattr(args, "json", False):
+            _print_json({"status": "error", "reason": reason})
+        else:
+            _print_text("Download run", [f"status : error", f"reason : {reason}"])
+        return 2
+
+    def _progress(received: int, total: int, blocks: int) -> None:
+        from amuled_v2.progressbar import render_progress
+
+        _progress_line(
+            f"{render_progress(0, total, received, 30)} download "
+            f"{received}/{total} bytes, blocks={blocks}"
+        )
+
+    poll_delay = 2.0
+    while True:
+        time.sleep(poll_delay)
+        status = _kernel_control({"command": "download.status", "hash": args.hash})
+        if status is None:
+            log.warning("kernel stopped responding during download run")
+            return 2
+        if not getattr(args, "json", False):
+            _progress(
+                int(status.get("received", 0)),
+                int(status.get("total", 0)),
+                int(status.get("blocks", 0)),
+            )
+        if status.get("done"):
+            break
+    _progress_done()
+    result = {"status": status.get("status", "error"), **status}
+    if args.json:
+        _print_json(result)
+    else:
+        lines = [f"status : {result['status']}"]
+        outcome = result.get("outcome")
+        if isinstance(outcome, dict):
+            lines.append(
+                f"peer   : received={outcome.get('bytes_received')}, "
+                f"blocks={outcome.get('blocks_received')}, "
+                f"detail={outcome.get('detail')}"
+            )
+        finalized = result.get("finalized")
+        if isinstance(finalized, dict):
+            lines.append(f"target : {finalized.get('target')}")
+        _print_text("Download run", lines)
+    log.info(f"Download run (kernel) completed: hash={args.hash}, status={result['status']}")
+    return 0 if result["status"] in ("complete", "already_complete") else 1
 
 
 def _cmd_download_run(args: argparse.Namespace) -> int:
@@ -1889,6 +2042,9 @@ def _cmd_download_run(args: argparse.Namespace) -> int:
         f"Command started: name=download-run, hash={args.hash}, "
         f"max_peers={args.max_peers}, verify={not args.no_verify}"
     )
+    routed = _download_run_via_kernel(args)
+    if routed is not None:
+        return routed
     queue = _download_queue()
 
     def _credit_downloaded(user_hash_hex: str, downloaded: int) -> None:
@@ -1950,8 +2106,13 @@ def _cmd_download_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_download_list(args: argparse.Namespace) -> int:
-    queue = _download_queue()
-    entries = queue.list(limit=args.limit)
+    response = _kernel_control({
+        "command": "download.list", "limit": args.limit,
+    })
+    if response is not None:
+        entries = response.get("downloads", [])
+    else:
+        entries = _download_queue().list(limit=args.limit)
     result = {
         "status": "ok",
         "downloads": entries,
@@ -1975,15 +2136,30 @@ def _cmd_download_list(args: argparse.Namespace) -> int:
 
 
 def _download_lifecycle(args: argparse.Namespace, action: str) -> int:
-    queue = _download_queue()
-    if action == "pause":
-        entry = queue.pause(args.hash)
-    elif action == "resume":
-        entry = queue.resume(args.hash)
-    elif action == "start":
-        entry = queue.start(args.hash)
+    response = _kernel_control({
+        "command": f"download.{action}", "hash": args.hash,
+    })
+    if response is not None:
+        if response.get("status") != "ok":
+            if getattr(args, "json", False):
+                _print_json(response)
+            else:
+                _print_text(f"Download {action}", [
+                    "status : error",
+                    f"reason : {response.get('reason', 'unknown')}",
+                ])
+            return 2
+        entry = response
     else:
-        raise ValueError(f"unknown lifecycle action: {action}")
+        queue = _download_queue()
+        if action == "pause":
+            entry = queue.pause(args.hash)
+        elif action == "resume":
+            entry = queue.resume(args.hash)
+        elif action == "start":
+            entry = queue.start(args.hash)
+        else:
+            raise ValueError(f"unknown lifecycle action: {action}")
     result = {"status": "ok", "action": action, **entry}
     if args.json:
         _print_json(result)
@@ -1992,7 +2168,7 @@ def _download_lifecycle(args: argparse.Namespace, action: str) -> int:
             f"status : ok",
             f"hash   : {entry['hash']}",
             f"name   : {entry['name']}",
-            f"queue  : {entry['status']}",
+            f"queue  : {entry.get('queue', entry['status'])}",
         ])
     log.info(f"Download {action} completed: hash={entry['hash']}")
     return 0
@@ -2007,8 +2183,25 @@ def _cmd_download_resume(args: argparse.Namespace) -> int:
 
 
 def _cmd_download_cancel(args: argparse.Namespace) -> int:
-    queue = _download_queue()
-    summary = queue.cancel(args.hash, keep_files=args.keep_files)
+    response = _kernel_control({
+        "command": "download.cancel",
+        "hash": args.hash,
+        "keep_files": bool(args.keep_files),
+    })
+    if response is not None:
+        if response.get("status") != "ok":
+            if args.json:
+                _print_json(response)
+            else:
+                _print_text("Download cancelled", [
+                    "status : error",
+                    f"reason : {response.get('reason', 'unknown')}",
+                ])
+            return 2
+        summary = response
+    else:
+        queue = _download_queue()
+        summary = queue.cancel(args.hash, keep_files=args.keep_files)
     result = {"status": "ok", **summary}
     if args.json:
         _print_json(result)
@@ -2135,6 +2328,82 @@ def _cmd_import_shared(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_import_known_met(args: argparse.Namespace) -> int:
+    """Stage X: import an eMule known.met into the shared-files table."""
+    from amuled_v2.core.sharing.known_met import parse_known_met
+    from amuled_v2.core.sharing.shared_files import SharedFile
+    from amuled_v2.state import get_state
+
+    entries = parse_known_met(args.known_met)
+    records = [
+        SharedFile(
+            file_hash=bytes.fromhex(entry.file_hash),
+            name=entry.name or f"known-{entry.file_hash[:8]}",
+            size=entry.size if entry.size >= 0 else 0,
+            path=None,
+            imported=True,
+        )
+        for entry in entries
+    ]
+    saved = 0
+    if args.save:
+        state = get_state()
+        state.connect()
+        saved = state.save_shared_files(records)
+    result = {
+        "status": "ok",
+        "known_met": str(args.known_met),
+        "entries": len(entries),
+        "saved": saved,
+    }
+    if args.json:
+        _print_json(result)
+    else:
+        _print_text("Import known.met", [
+            f"status  : {result['status']}",
+            f"file    : {result['known_met']}",
+            f"entries : {result['entries']}",
+            f"saved   : {result['saved']}",
+        ])
+    log.info(f"known.met import completed: entries={len(entries)}, saved={saved}")
+    return 0
+
+
+def _cmd_export_known_met(args: argparse.Namespace) -> int:
+    """Stage X: export the shared-files table to a known.met file."""
+    from amuled_v2.core.sharing.known_met import KnownMetEntry, write_known_met
+    from amuled_v2.state import get_state
+
+    state = get_state()
+    state.connect()
+    rows = state.list_shared_files(limit=args.limit)
+    entries = [
+        KnownMetEntry(
+            file_hash=str(row["hash"]).upper(),
+            name=str(row["name"]),
+            size=int(row["size"]),
+        )
+        for row in rows
+        if row.get("path")  # export only actually shared (resolvable) files
+    ]
+    written = write_known_met(args.known_met, entries)
+    result = {
+        "status": "ok",
+        "known_met": str(args.known_met),
+        "entries": written,
+    }
+    if args.json:
+        _print_json(result)
+    else:
+        _print_text("Export known.met", [
+            f"status  : {result['status']}",
+            f"file    : {result['known_met']}",
+            f"entries : {result['entries']}",
+        ])
+    log.info(f"known.met export completed: entries={written}")
+    return 0
+
+
 # ------------------------------------------------------------------
 # Argument parser
 # ------------------------------------------------------------------
@@ -2230,6 +2499,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="Persist imported metadata to the project DuckDB state.",
     )
     p_import_shared.set_defaults(func=_cmd_import_shared)
+
+    p_import_known = import_sub.add_parser(
+        "known-met",
+        help="Import an eMule known.met file (stage X).",
+        parents=parents,
+    )
+    p_import_known.add_argument(
+        "known_met",
+        help="Path to the source known.met file.",
+    )
+    p_import_known.add_argument(
+        "--save",
+        action="store_true",
+        default=True,
+        help="Persist imported records to the project DuckDB state (default).",
+    )
+    p_import_known.add_argument(
+        "--no-save",
+        dest="save",
+        action="store_false",
+        help="Parse and report only, without writing state.",
+    )
+    p_import_known.set_defaults(func=_cmd_import_known_met)
+
+    # --- export ---
+    p_export = sub.add_parser(
+        "export",
+        help="Export project state to eMule-compatible formats (stage X).",
+        parents=parents,
+    )
+    export_sub = p_export.add_subparsers(dest="export_command", metavar="<resource>")
+    p_export_known = export_sub.add_parser(
+        "known-met",
+        help="Export shared files to a known.met file.",
+        parents=parents,
+    )
+    p_export_known.add_argument(
+        "known_met",
+        help="Destination known.met path.",
+    )
+    p_export_known.add_argument(
+        "--limit",
+        type=int,
+        default=100000,
+        help="Max shared-file rows to export.",
+    )
+    p_export_known.set_defaults(func=_cmd_export_known_met)
 
     # --- share ---
     p_share = sub.add_parser(
@@ -2791,6 +3107,18 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         p_d = daemon_sub.add_parser(action, help=help_text, parents=parents)
         p_d.set_defaults(func=_cmd_daemon)
+
+    # --- upload ---
+    p_upload = sub.add_parser(
+        "upload",
+        help="Upload queue snapshot (stage X, via IPC).",
+        parents=parents,
+    )
+    upload_sub = p_upload.add_subparsers(dest="upload_command", metavar="<action>")
+    p_upload_status = upload_sub.add_parser(
+        "status", help="Show active slots and waiting clients.", parents=parents
+    )
+    p_upload_status.set_defaults(func=_cmd_upload_status)
 
     # --- download ---
     p_download = sub.add_parser(

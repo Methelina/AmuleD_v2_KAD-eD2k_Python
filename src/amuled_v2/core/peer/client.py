@@ -149,8 +149,12 @@ def build_emuleinfo_payload(emule_version: int = 0x3C) -> bytes:
 
     ВАЖНО (уже ломали): второй байт обязан быть 0xC5, иначе приёмник считает
     нас не-eMule, не принимает инфо-пакет и рвёт соединение по своему
-    таймауту хендшейка (~10 с). Набор тегов — стандартные 7 флагов
-    возможностей; их id и значения менять нельзя.
+    таймауту хендшейка (~10 с). Набор тегов — стандартные 7 флагов; id и
+    порядок менять нельзя.
+
+    Значения — честные (сверка стадии X): заявляем только сжатие и
+    (в features) то, что реально обрабатываем. Source exchange, udp version
+    aux-операции и комментарии мы не отвечаем — нули.
     """
     from amuled_v2.core.codec.binary import BinaryWriter
 
@@ -158,12 +162,12 @@ def build_emuleinfo_payload(emule_version: int = 0x3C) -> bytes:
     writer.write_u8(emule_version)
     writer.write_u8(EMULE_PROTOCOL)
     tags: list[Ed2kTag] = [
-        Ed2kTag(name_id=0x20, type=0x03, value=1),   # сжатие данных
-        Ed2kTag(name_id=0x22, type=0x03, value=4),   # udp version
+        Ed2kTag(name_id=0x20, type=0x03, value=1),   # сжатие данных (есть)
+        Ed2kTag(name_id=0x22, type=0x03, value=0),   # udp version (aux — нет)
         Ed2kTag(name_id=0x21, type=0x03, value=0),   # udp port (нет)
-        Ed2kTag(name_id=0x23, type=0x03, value=3),   # source exchange
-        Ed2kTag(name_id=0x24, type=0x03, value=1),   # comments
-        Ed2kTag(name_id=0x25, type=0x03, value=2),   # extended requests
+        Ed2kTag(name_id=0x23, type=0x03, value=0),   # source exchange (нет)
+        Ed2kTag(name_id=0x24, type=0x03, value=0),   # comments (нет)
+        Ed2kTag(name_id=0x25, type=0x03, value=0),   # extended requests (нет)
         Ed2kTag(name_id=0x27, type=0x03, value=0),   # features (без крипты)
     ]
     writer.write_u32(len(tags))

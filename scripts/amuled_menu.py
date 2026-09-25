@@ -1,14 +1,18 @@
-"""AmuleD v0.5.1 Interactive Menu -- a thin interactive shell over the CLI.
+"""AmuleD v0.6.0 Interactive Menu -- a thin interactive shell over the CLI.
 
 A synchronous, console-only interactive menu that shells every operation out
 to ``python -m amuled_v2 <args> --json`` via :mod:`subprocess`.  No protocol,
 network, or state logic is reimplemented here; the menu only renders JSON.
 
 scripts/amuled_menu.py
-Version:     0.1.0
+Version:     0.6.0
 Author:      Soror L'.L'.
-Updated:     2026-09-23
+Updated:     2026-09-26
 
+Patch Notes v0.6.0 (Soror L'.L'.):
+  [*] KAD status screen now reads the unified kernel (kernel_status.json +
+      `daemon status` over IPC); the standalone spider hint was replaced
+      with the `serve` hint (stage U: the kernel includes the spider).
 Patch Notes v0.1.0 (Soror L'.L'.):
   [+] Thin interactive menu over the AmuleD CLI (Server, KAD, Share, Search,
       Downloads, Status, IP filter).
@@ -33,7 +37,7 @@ from amuled_v2.logging_setup import LogTags, configure_logging, get_tagged_logge
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT / "src"
-STATUS_FILE = ROOT / "db" / "kad_status.json"
+STATUS_FILE = ROOT / "db" / "kernel_status.json"
 DEFAULT_SERVER = "176.123.5.89:4725"
 
 configure_logging(
@@ -55,7 +59,7 @@ def _setup_console() -> None:
     if os.name == "nt":
         os.system("")
     print("=" * 60)
-    print("AmuleD v0.5.1 Interactive Menu -- by Soror L'.L'.")
+    print("AmuleD v0.6.0 Interactive Menu -- by Soror L'.L'.")
     print("=" * 60)
     print()
 
@@ -621,35 +625,26 @@ def _print_download_list() -> None:
 
 
 # ------------------------------------------------------------------
-# KAD status (reads db/kad_status.json)
+# Kernel/KAD status (reads db/kernel_status.json + daemon status over IPC)
 # ------------------------------------------------------------------
 def show_kad_status() -> None:
     if not STATUS_FILE.exists():
-        print("  Spider daemon not running (no status file).")
-        print("  Hint: run '.\\AmuleD_Run.ps1 spider' to warm the KAD network.")
+        print("  Kernel is not running (no kernel_status.json).")
+        print("  Hint: run '.\\AmuleD_Run.ps1 serve' — the kernel includes the KAD spider.")
         return
-    try:
-        status = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
-    except Exception as exc:
-        print(f"  Status file unreadable: {exc}")
+    result = cli("daemon", "status", timeout=30)
+    if result.get("status") != "ok" or not result.get("running"):
+        print("  Kernel is not running.")
         return
+    spider = result.get("spider") or {}
     print()
-    print(f"  own_id      : {status.get('own_id', '?')}")
-    print(f"  started_at  : {status.get('started_at', '?')}")
-    print(f"  uptime_s    : {status.get('uptime_s', 0)}")
-    print(f"  cycles      : {status.get('cycles', 0)}")
-    print(f"  pool_size   : {status.get('pool_size', 0)}")
-    print(f"  alive_est   : {status.get('alive_estimate', 0)}")
-    print(f"  hellos      : {status.get('hellos_total', 0)}")
-    print(f"  pongs       : {status.get('pongs_total', 0)}")
-    print(f"  udp_keys    : {status.get('udp_keys', 0)}")
-    print(f"  bound_port  : {status.get('bound_port', '?')}")
-    print(f"  strategy    : {status.get('strategy', '?')}")
-    hot = status.get("hot_nodes_stats", {})
-    if hot:
-        print(f"  hot_stats   : source={hot.get('source')} rows={hot.get('rows')} "
-              f"hellos={hot.get('sum_hellos')} pings={hot.get('sum_pings')} "
-              f"udp_keys={hot.get('with_udp_key')}")
+    print(f"  running      : yes")
+    print(f"  serve_port   : {result.get('serve_port', '?')}")
+    print(f"  connections  : {result.get('active_connections', 0)}")
+    print(f"  uptime_s     : {result.get('uptime_s', 0)}")
+    print(f"  pool_size    : {spider.get('pool_size', 0)}")
+    print(f"  alive_est    : {spider.get('alive_estimate', 0)}")
+    print(f"  cycles       : {spider.get('uptime_cycles', 0)}")
 
 
 # ------------------------------------------------------------------

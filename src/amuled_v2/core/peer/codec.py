@@ -143,36 +143,55 @@ def _build_hello_tags(nickname: str, version: int = 0x3C, client_port: int = 0) 
       что мы не умеем KAD;
     - CT_PORT в HELLO не входит (порт уже в фиксированном поле), лишние
       теги меняют tagcount — держим набор 1:1 с протоколом.
+
+    MISCOPTIONS-сверка (стадия X): заявляем ТОЛЬКО то, что реально
+    обрабатываем (слушатель: REQUESTFILENAME / HASHSETREQUEST /
+    SETREQFILEID / REQUESTPARTS(_I64) / END_OF_DOWNLOAD / EMULEINFO;
+    клиент: COMPRESSEDPART-сборка, I64-диапазоны, kad2). AICH, source
+    exchange, multipacket, extended requests, accept comment и aux-UDP
+    запросы мы НЕ отвечаем — биты = 0, иначе пир пришлёт формат,
+    который мы молча проглотим и он решит, что мы сломаны.
     """
     # (kad_udp_port << 16) | ed2k_udp_port; постоянного UDP-порта нет — 0.
     udports = 0
-    # Флаги возможностей: AICH, Unicode, сжатие, source exchange, multipacket,
-    # large files и т.п. Биты должны соответствовать тому, что мы реально
-    # умеем отвечать, иначе пир пришлёт неподдерживаемый формат.
+    # Возможности как код: 1 = обработчик есть, 0 = нет.
+    cap_compression = 1      # шлём COMPRESSEDPART(_I64), клиент собирает чанки
+    cap_unicode = 1          # теги UTF-8
+    cap_large_files = 1      # REQUESTPARTS_I64 / SENDINGPART_I64
+    cap_kad2 = 9             # kad2-клиент (поиск/публикация/источники)
+    cap_no_view_shared = 1   # раздаемые файлы на просмотр не открываем
+    cap_aich = 0             # AICH-ответы не реализованы
+    cap_udp_version = 0      # aux-UDP (OS_UDP_*) не отвечаем
+    cap_source_exchange = 0  # OP_REQUESTSOURCES не отвечаем
+    cap_extended_requests = 0  # комментарии/файл-теги в ответах не шлём
+    cap_accept_comment = 0   # комментарии о файле не принимаем
+    cap_multipacket = 0      # multipacket (0xBC) не разбираем
+    cap_ext_multipacket = 0  # extended multipacket не разбираем
+    cap_file_identifiers = 0  # 0xA4 file identifiers не отвечаем
     miso1 = (
-        (1 << 29)   # AICH version 1
-        | (1 << 28)  # Unicode
-        | (4 << 24)  # UDP version
-        | (1 << 20)  # data compression
-        | (0 << 16)  # SecIdent (нет)
-        | (4 << 12)  # source exchange v4
-        | (2 << 8)   # extended requests v2
-        | (1 << 4)   # accept comment
+        (cap_aich << 29)
+        | (cap_unicode << 28)
+        | (cap_udp_version << 24)
+        | (cap_compression << 20)
+        | (0 << 16)  # SecIdent (крипта — BLOCKED-EXTERNAL)
+        | (cap_source_exchange << 12)
+        | (cap_extended_requests << 8)
+        | (cap_accept_comment << 4)
         | (0 << 3)   # peer cache (нет)
-        | (1 << 2)   # no view shared files
-        | (1 << 1)   # multipacket
+        | (cap_no_view_shared << 2)
+        | (cap_multipacket << 1)
         | (0 << 0)   # preview (нет)
     )
     miso2 = (
-        (1 << 13)   # file identifiers
+        (cap_file_identifiers << 13)
         | (0 << 12)  # direct UDP callback (нет)
         | (0 << 11)  # captcha (нет)
-        | (1 << 10)  # source exchange v2
+        | (0 << 10)  # source exchange v2 (не отвечаем)
         | (0 << 9) | (0 << 8) | (0 << 7)  # TCP-криптослой (не реализован)
         | (0 << 6)   # reserved (mod bit)
-        | (1 << 5)   # extended multipacket
-        | (1 << 4)   # large files
-        | 9          # KAD version 9 (kad2)
+        | (cap_ext_multipacket << 5)
+        | (cap_large_files << 4)
+        | cap_kad2   # KAD version 9 (kad2)
     )
     # Версия, под которой нас видят пиры: (major << 17) | (minor << 10) |
     # (update << 7) = eMule 0.50a. Держать синхронно с build_emuleinfo_payload.
