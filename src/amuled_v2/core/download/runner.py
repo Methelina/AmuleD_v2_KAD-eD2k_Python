@@ -63,6 +63,7 @@ class DownloadRunner:
         peer_connect_timeout: float = 8.0,
         peer_response_timeout: float = 20.0,
         queue_wait_timeout: float = 60.0,
+        traffic_sink: "Callable[[str, int], None] | None" = None,
     ) -> None:
         self.queue = queue
         self.local_client_id = local_client_id
@@ -72,6 +73,9 @@ class DownloadRunner:
         self.peer_connect_timeout = peer_connect_timeout
         self.peer_response_timeout = peer_response_timeout
         self.queue_wait_timeout = queue_wait_timeout
+        # Stage C credit accounting: forwarded to every PeerClient; called
+        # with (peer_user_hash_hex, downloaded_bytes) per finished transfer.
+        self.traffic_sink = traffic_sink
 
     def resolve_sources(self, file_hash: str, *, limit: int = 20) -> list[tuple[str, int]]:
         rows = self.queue.state.list_file_sources(file_hash, limit=limit)
@@ -141,6 +145,7 @@ class DownloadRunner:
                     connect_timeout=self.peer_connect_timeout,
                     response_timeout=self.peer_response_timeout,
                     queue_wait_timeout=self.queue_wait_timeout,
+                    traffic_sink=self.traffic_sink,
                 )
                 await client.connect()
                 await client.handshake()

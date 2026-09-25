@@ -60,7 +60,7 @@ try:
 except ImportError:  # pragma: no cover - exercised only without DuckDB
     _HAS_DUCKDB = False
 
-_CURRENT_SCHEMA_VERSION = 6
+_CURRENT_SCHEMA_VERSION = 7
 _JSON_STORE: dict[str, Any] | None = None
 
 
@@ -247,6 +247,32 @@ def _migrate_v6(con: Any) -> None:
     )
 
 
+def _migrate_v7(con: Any) -> None:
+    # Stage C: client credit ledger keyed by the 32-hex userhash (the same
+    # identity eMule keys credits on).  Accruals work without any crypto;
+    # SecureIdent signatures are a separate external track.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS client_credits (
+            user_hash     VARCHAR PRIMARY KEY,
+            uploaded      BIGINT NOT NULL DEFAULT 0,
+            downloaded    BIGINT NOT NULL DEFAULT 0,
+            last_seen     TIMESTAMP,
+            updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS seen_clients (
+            user_hash     VARCHAR PRIMARY KEY,
+            first_seen    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            hellos        BIGINT NOT NULL DEFAULT 0
+        )
+    """)
+    con.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (7)"
+    )
+
+
 def _init_duckdb(con: Any) -> None:
     """Apply all pending schema migrations."""
     log.debug("Initializing DuckDB schema")
@@ -272,6 +298,10 @@ def _init_duckdb(con: Any) -> None:
     if current < 6:
         _migrate_v6(con)
         log.info("DuckDB schema migrated to version 6")
+        current = 6
+    if current < 7:
+        _migrate_v7(con)
+        log.info("DuckDB schema migrated to version 7")
     else:
         log.debug("DuckDB schema is current")
 
@@ -1307,6 +1337,163 @@ class StateBackend:
     def _normalize_path(self, path: str | Path) -> str:
         """Return a stable absolute path string for portable persistence."""
         return str(Path(path).expanduser().resolve())
+
+    # -- client credits (stage C) -------------------------------------------
+
+    @staticmethod
+    def _normalize_user_hash(user_hash: str) -> str:
+        normalized = user_hash.strip().lower()
+        if len(normalized) != 32:
+            raise ValueError("user hash must contain 32 hexadecimal digits")
+        bytes.fromhex(normalized)
+        return normalized
+
+    def see_client(self, user_hash: str) -> None:
+        """Register a HELLO from a client (seen_clients upsert)."""
+        normalized = self._normalize_user_hash(user_hash)
+        con = self._require_duckdb()
+        con.execute(
+            """
+            INSERT INTO seen_clients (user_hash, first_seen, last_seen, hellos)
+            VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+            ON CONFLICT (user_hash) DO UPDATE SET
+                last_seen = now(),
+                hellos = seen_clients.hellos + 1
+            """,
+            (normalized,),
+        )
+
+    def record_traffic(
+        self, user_hash: str, *, uploaded: int = 0, downloaded: int = 0
+    ) -> dict[str, int]:
+        """Accumulate served/received bytes for a client credit ledger row.
+
+        Mirrors the eMule credit model at the accounting level: bytes are
+        attributed to the remote client's userhash; the cryptographic
+        SecureIdent verification of that hash is a separate (external)
+        track.  Creates the row on first contact and updates last_seen.
+        """
+        if uploaded < 0 or downloaded < 0:
+            raise ValueError("uploaded/downloaded must be non-negative")
+        normalized = self._normalize_user_hash(user_hash)
+        con = self._require_duckdb()
+        con.execute(
+            """
+            INSERT INTO client_credits (user_hash, uploaded, downloaded, last_seen)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (user_hash) DO UPDATE SET
+                uploaded = client_credits.uploaded + ?,
+                downloaded = client_credits.downloaded + ?,
+                last_seen = now(),
+                updated_at = now()
+            """,
+            (normalized, uploaded, downloaded, uploaded, downloaded),
+        )
+        con.execute(
+            """
+            INSERT INTO seen_clients (user_hash, first_seen, last_seen, hellos)
+            VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0)
+            ON CONFLICT (user_hash) DO UPDATE SET last_seen = now()
+            """,
+            (normalized,),
+        )
+        return {"uploaded": uploaded, "downloaded": downloaded}
+
+    def refund_traffic(
+        self, user_hash: str, *, uploaded: int = 0, downloaded: int = 0
+    ) -> dict[str, int] | None:
+        """Subtract bytes from a credit row (clamped at zero). Returns the
+        resulting counters, or ``None`` when the client is unknown."""
+        if uploaded < 0 or downloaded < 0:
+            raise ValueError("uploaded/downloaded must be non-negative")
+        normalized = self._normalize_user_hash(user_hash)
+        con = self._require_duckdb()
+        con.execute(
+            """
+            UPDATE client_credits SET
+                uploaded = CASE WHEN uploaded - ? < 0 THEN 0 ELSE uploaded - ? END,
+                downloaded = CASE WHEN downloaded - ? < 0 THEN 0 ELSE downloaded - ? END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE user_hash = ?
+            """,
+            (uploaded, uploaded, downloaded, downloaded, normalized),
+        )
+        if con.execute(
+            "SELECT COUNT(*) FROM client_credits WHERE user_hash = ?",
+            (normalized,),
+        ).fetchone()[0] == 0:
+            return None
+        return self.get_credits(normalized) or {}
+
+    def get_credits(self, user_hash: str) -> dict[str, Any] | None:
+        """Return one credit row, or ``None`` for an unknown client."""
+        normalized = self._normalize_user_hash(user_hash)
+        con = self._require_duckdb()
+        row = con.execute(
+            """
+            SELECT user_hash, uploaded, downloaded, last_seen, updated_at
+            FROM client_credits WHERE user_hash = ?
+            """,
+            (normalized,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "user_hash": row[0],
+            "uploaded": row[1],
+            "downloaded": row[2],
+            "last_seen": row[3],
+            "updated_at": row[4],
+        }
+
+    def list_credits(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Return credit rows ordered by total traffic (largest first)."""
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+        con = self._require_duckdb()
+        rows = con.execute(
+            """
+            SELECT user_hash, uploaded, downloaded, last_seen, updated_at
+            FROM client_credits
+            ORDER BY uploaded + downloaded DESC, user_hash
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "user_hash": row[0],
+                "uploaded": row[1],
+                "downloaded": row[2],
+                "last_seen": row[3],
+                "updated_at": row[4],
+            }
+            for row in rows
+        ]
+
+    def list_seen_clients(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Return recently seen clients (HELLO registrations)."""
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+        con = self._require_duckdb()
+        rows = con.execute(
+            """
+            SELECT user_hash, first_seen, last_seen, hellos
+            FROM seen_clients
+            ORDER BY last_seen DESC, user_hash
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "user_hash": row[0],
+                "first_seen": row[1],
+                "last_seen": row[2],
+                "hellos": row[3],
+            }
+            for row in rows
+        ]
 
     def close(self) -> None:
         if self._con is not None and self.backend == "duckdb":

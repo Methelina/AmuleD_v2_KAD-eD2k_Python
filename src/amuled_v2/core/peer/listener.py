@@ -370,6 +370,7 @@ class IncomingPeerSession:
         throttle: UploadThrottle | None = None,
         allow_compression: bool = True,
         idle_timeout: float | None = 300.0,
+        traffic_recorder: Callable[[str, int], None] | None = None,
     ) -> None:
         self._reader = reader
         self._writer = writer
@@ -379,8 +380,25 @@ class IncomingPeerSession:
         self._throttle = throttle
         self._allow_compression = allow_compression
         self._idle_timeout = idle_timeout
+        # Stage C credit accounting: called after a served transfer with
+        # (peer_user_hash_hex, uploaded_bytes); failures are swallowed by
+        # the caller-supplied recorder, never by the session.
+        self._traffic_recorder = traffic_recorder
         self._peer_name = _format_peer(writer)
         self._transport: StreamTransport | None = None
+
+    def _credit_uploaded(self, hello: Any, stats: UploadSessionStats | None) -> None:
+        recorder = self._traffic_recorder
+        if recorder is None or stats is None or stats.bytes_sent <= 0:
+            return
+        try:
+            recorder(hello.user_hash.hex().lower(), stats.bytes_sent)
+        except Exception as exc:
+            log.debug(
+                "credit accounting skipped: peer=%s, error=%s",
+                self._peer_name,
+                exc,
+            )
 
     async def _expect_plain_or_fail(self) -> tuple[int, bytes]:
         """Receive the first framed packet, validating the protocol byte.
@@ -720,7 +738,16 @@ class IncomingPeerSession:
                     allow_compression=self._allow_compression,
                     on_start_upload_request=_on_start_upload_request,
                 )
-                await _run_upload_engine(session, self._peer_name, last_hash_hex)
+                try:
+                    await _run_upload_engine(
+                        session, self._peer_name, last_hash_hex
+                    )
+                except ListenerError:
+                    # The client may close as soon as it has every byte it
+                    # asked for; the served bytes still count toward its
+                    # credit ledger before the transport error propagates.
+                    self._credit_uploaded(hello, session.stats)
+                    raise
                 if granted_key is not None:
                     self._upload_queue.release_slot(*granted_key)
                     granted_key = None
@@ -737,6 +764,7 @@ class IncomingPeerSession:
             stats = session.stats
         else:
             stats = UploadSessionStats()
+        self._credit_uploaded(hello, stats)
 
         await self._safe_close(transport)
 
@@ -841,6 +869,7 @@ class IncomingPeerServer:
         allow_compression: bool = True,
         idle_timeout: float | None = 300.0,
         max_connections: int = 64,
+        traffic_recorder: Callable[[str, int], None] | None = None,
     ) -> None:
         self._identity = identity
         self._resolver = resolver
@@ -850,6 +879,7 @@ class IncomingPeerServer:
         self._throttle = throttle
         self._allow_compression = allow_compression
         self._idle_timeout = idle_timeout
+        self._traffic_recorder = traffic_recorder
         if max_connections < 1:
             raise ListenerError(f"max_connections must be >= 1, got {max_connections}")
         self._max_connections = max_connections
@@ -920,6 +950,7 @@ class IncomingPeerServer:
             throttle=self._throttle,
             allow_compression=self._allow_compression,
             idle_timeout=self._idle_timeout,
+            traffic_recorder=self._traffic_recorder,
         )
         self._connections.add(session)
         try:

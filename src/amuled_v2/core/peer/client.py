@@ -188,6 +188,7 @@ class PeerClient:
         connect_timeout: float = 10.0,
         response_timeout: float = 20.0,
         queue_wait_timeout: float = 120.0,
+        traffic_sink: Optional[Callable[[str, int], None]] = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -197,6 +198,10 @@ class PeerClient:
         self.connect_timeout = connect_timeout
         self.response_timeout = response_timeout
         self.queue_wait_timeout = queue_wait_timeout
+        # Stage C credit accounting: called once per finished transfer with
+        # (peer_user_hash_hex, downloaded_bytes); exceptions are swallowed —
+        # credit bookkeeping must never break a download.
+        self.traffic_sink = traffic_sink
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self.connected = False
@@ -540,6 +545,21 @@ class PeerClient:
 
     # -- transfer ------------------------------------------------------------
 
+    def _maybe_credit_downloaded(self, received: int) -> None:
+        """Report received bytes to the credit ledger via traffic_sink."""
+        sink = self.traffic_sink
+        peer = self.peer_info
+        if sink is None or peer is None or received <= 0:
+            return
+        try:
+            sink(peer.user_hash, received)
+        except Exception as exc:
+            log.debug(
+                "PEER traffic sink failed: peer=%s, error=%s",
+                peer.user_hash,
+                exc,
+            )
+
     async def transfer(
         self,
         file_hash: bytes,
@@ -623,12 +643,20 @@ class PeerClient:
                 starts[0],
             )
 
-            expected = len(starts)
-            while expected > 0:
+            # Byte-based round accounting: the server splits each requested
+            # range into an arbitrary number of sub-packets (13000/10240,
+            # CreateStandardPackets/CreatePackedPackets), so counting PACKETS
+            # deadlocks the round.  Count PAYLOAD bytes instead: the round
+            # is complete once every requested byte has arrived.
+            expected_bytes = sum(
+                e - s for s, e in zip(starts, ends) if s < e
+            )
+            while expected_bytes > 0:
                 packet = await self._receive(
                     timeout=self.response_timeout, close_on_timeout=False
                 )
                 if packet is None:
+                    self._maybe_credit_downloaded(received)
                     outcome = DownloadOutcome(
                         file_hash=file_hash.hex().upper(),
                         bytes_received=received,
@@ -699,9 +727,10 @@ class PeerClient:
                         received,
                         total_size,
                     )
-                    expected = 0
+                    expected_bytes = 0
                     break
                 elif opcode == C2CTCP.OUTOFPARTREQS:
+                    self._maybe_credit_downloaded(received)
                     outcome = DownloadOutcome(
                         file_hash=file_hash.hex().upper(),
                         bytes_received=received,
@@ -716,6 +745,7 @@ class PeerClient:
                         "PEER requeued during transfer: rank=%d",
                         parse_queue_rank(payload),
                     )
+                    self._maybe_credit_downloaded(received)
                     outcome = DownloadOutcome(
                         file_hash=file_hash.hex().upper(),
                         bytes_received=received,
@@ -741,11 +771,12 @@ class PeerClient:
                         progress_callback(received, total_size, blocks)
                     except Exception:
                         pass
-                expected -= 1
+                expected_bytes -= len(part.data)
             if received >= total_size:
                 break
 
         complete = received >= total_size
+        self._maybe_credit_downloaded(received)
         outcome = DownloadOutcome(
             file_hash=file_hash.hex().upper(),
             bytes_received=received,

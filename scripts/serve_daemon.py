@@ -96,10 +96,17 @@ async def _publish_sources_once(
         user_hash = load_identity().user_hash
     state = get_state()
     state.connect()
-    limit = publish_limit if publish_limit > 0 else 100000
-    rows = [r for r in state.list_shared_files(limit=100000) if r.get("path")][
-        :limit
-    ]
+    try:
+        limit = publish_limit if publish_limit > 0 else 100000
+        rows = [
+            r
+            for r in state.list_shared_files(limit=100000)
+            if r.get("path")
+        ][:limit]
+    finally:
+        # Never hold the single-writer DuckDB longer than the listing:
+        # the spider and CLI take turns on the same file.
+        state.close()
     if not rows:
         return {"status": "no_files", "published": 0, "accepts": 0}
 
@@ -202,6 +209,19 @@ async def _run(args: argparse.Namespace) -> int:
     queue = UploadQueue(max_slots=upload_slots)
     throttle = UploadThrottle(throttle_rate) if throttle_rate > 0 else None
 
+    def _record_uploaded(user_hash_hex: str, uploaded: int) -> None:
+        """Stage C: attribute served bytes to the remote client's ledger.
+
+        Opens/closes DuckDB per record (single-writer database shared with
+        the spider), mirroring the StateSharedFileResolver pattern.
+        """
+        state = get_state()
+        state.connect()
+        try:
+            state.record_traffic(user_hash_hex, uploaded=uploaded)
+        finally:
+            state.close()
+
     server = IncomingPeerServer(
         identity=identity.to_local_identity(),
         resolver=resolver,
@@ -210,6 +230,7 @@ async def _run(args: argparse.Namespace) -> int:
         port=identity.tcp_port,
         throttle=throttle,
         max_connections=max_sessions,
+        traffic_recorder=_record_uploaded,
     )
     await server.start()
     bound_port = server.bound_port

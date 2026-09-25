@@ -1783,11 +1783,27 @@ def _cmd_download_run(args: argparse.Namespace) -> int:
         f"max_peers={args.max_peers}, verify={not args.no_verify}"
     )
     queue = _download_queue()
+
+    def _credit_downloaded(user_hash_hex: str, downloaded: int) -> None:
+        """Stage C: attribute received bytes to the remote client's ledger."""
+        try:
+            state = get_state()
+            state.connect()
+            try:
+                state.record_traffic(user_hash_hex, downloaded=downloaded)
+            finally:
+                close = getattr(state, "close", None)
+                if close is not None:
+                    close()
+        except Exception as exc:
+            log.debug(f"credit accounting skipped: {exc}")
+
     runner = DownloadRunner(
         queue,
         local_port=int(load_config(save_if_missing=True).get("network", {}).get("client_tcp_port", 8089)),
         max_peers=args.max_peers,
         queue_wait_timeout=args.queue_wait,
+        traffic_sink=_credit_downloaded,
     )
 
     def _progress(received: int, total: int, blocks: int) -> None:
