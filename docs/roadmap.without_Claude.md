@@ -49,17 +49,30 @@ docs\continuation-prompt.md. Этот файл — рабочий план no-Cl
       [--loop-interval H]` (петля перепубликации, ~24ч ротация).
 - [x] Тесты: tests/test_publish.py +9; offline suite 280 passed.
 
-## Стадия S — Listener как боевой сервис [TODO]
+## Стадия S — Listener как боевой сервис [DONE]
 
-- [ ] LocalIdentity из конфига (userhash/ник/TCP-порт) — единый источник
-      с KAD-идентичностью (Prefs.cpp GetClientHash = GetUserHash).
-- [ ] `AmuleD_Run.ps1 serve` (диспетчер: guard от дублей, tagged JSONL-лог),
-      слушает ephemeral TCP, порт пишется в kad_status.json.
-- [ ] Реклама TCP-порта в KAD publish (type-1 source entries → наш порт).
-- [ ] Graceful shutdown, ограничение числа одновременных сессий, throttle
-      (байт/с) из конфига.
-- [ ] Интеграционный self-test: наш PeerClient качает у нашего listener
-      реальный файл из Incoming по loopback (внутренняя согласованность).
+- [x] LocalIdentity из конфига (`identity`-секция amuled.jsonc: userhash
+      генерируется и персистится при первом запуске; nick/tcp_port) —
+      единый источник с KAD-публикацией (user_hash = GetUserHash-модель),
+      `src/amuled_v2/core/identity.py`.
+- [x] `AmuleD_Run.ps1 serve` (v2.1.0: guard от дублей, tagged JSONL-лог),
+      слушает ephemeral TCP, порт пишется в `db/serve_status.json`
+      (девиэйшен: не kad_status.json — паук переписывает свой файл каждый
+      цикл и затёр бы ключ).
+- [x] Реклама TCP-порта в KAD publish: демон перепубликует source-записи
+      с фактическим портом (старт + `serve.republish_hours`, по умолчанию
+      6ч; live: 4 accepts за проход). `--no-publish`/`--publish-limit`.
+- [x] Graceful shutdown (SIGINT/SIGTERM + KeyboardInterrupt-fallback),
+      `serve.max_sessions` (reject сверх лимита), троттлинг байт/с из
+      конфига (`serve.throttle_bytes_per_sec`), upload_slots.
+- [x] Интеграционный self-test: наш PeerClient качает у нашего listener
+      реальный файл из Incoming по loopback — MD4 сошёлся (5 916 774 байта,
+      33 блока с компрессией). Offline: tests/test_serve_selftest.py.
+- Фиксы по пути: PeerInfo(version=) → несуществующий kwarg; transfer()
+  слал серверный OP_ACCEPTUPLOADREQ (движок рвал сессию — см. комментарий
+  в client.py); REQUESTPARTS-паддинг (0,0) валидировался как ошибка;
+  COMPRESSEDPART-саб-пакеты теперь пересобираются клиентом (chunk +
+  total-size, CreatePackedPackets-семантика); DuckDB lock retry 20x1s.
 
 ## Стадия C — Credits/SecureIdent-каркас (крипто — мок) [TODO]
 
@@ -94,7 +107,7 @@ docs\continuation-prompt.md. Этот файл — рабочий план no-Cl
 ## Definition of done трека (без внешней сессии)
 
 1. P: наш файл находится KAD-поиском с чужих узлов; перепубликация работает. [DONE]
-2. S: listener живёт как демон, порт опубликован, self-test loopback зелёный.
+2. S: listener живёт как демон, порт опубликован, self-test loopback зелёный. [DONE]
 3. C: credits пишутся при отдаче/получении; миграция 7 применена.
 4. Полный offline suite зелёный; worktree закоммичен по подтверждению
    пользователя; roadmap/continuation-prompt синхронизированы.

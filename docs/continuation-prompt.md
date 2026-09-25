@@ -1,7 +1,7 @@
 # Continuation prompt — AmuleD v0.5.1 (K:\work\AmuleD_v2)
 
-Updated: 2026-09-25 04:05
-Session state: 8 (no-Claude track; стадия P — KAD publish — DONE, live-accepted; следующая — стадия S)
+Updated: 2026-09-25 09:50
+Session state: 8 (no-Claude track; стадии P и S — DONE, live-accepted; следующая — стадия C)
 
 ---
 
@@ -61,6 +61,39 @@ Wire-оракул: tshark K:\Software\WireShark\WiresharkPortable64\App\Wireshar
 - Offline suite: 280 passed (+9 tests/test_publish.py); compileall 0.
 - Незакоммичено: publish.py, packets.py (count-фикс), cli.py (publish),
   listener.py, upload/, test_publish.py и др. — коммит по подтверждению.
+
+## Сессия 8 (no-Claude track): стадии P+S — DONE
+
+### Стадия S — serve-демон (вторая половина сессии)
+
+- `core/identity.py`: AppIdentity из конфига (`identity.user_hash/nick/
+  tcp_port/client_id`); userhash генерируется и персистится при первом
+  запуске. Один userhash на HELLO-handshake и KAD-публикацию
+  (Prefs GetClientHash = GetUserHash).
+- `scripts/serve_daemon.py` + `AmuleD_Run.ps1 serve` (guard, v2.1.0):
+  ephemeral TCP, статус в `db/serve_status.json` (НЕ kad_status.json —
+  паук его перезаписывает), max_sessions, throttle байт/с, graceful
+  shutdown, периодическая KAD-перепубликация source-записей с фактическим
+  портом (live: 4 accepts/проход). `--no-publish`, `--publish-limit`,
+  `--once` (требует identity.tcp_port>0).
+- LIVE self-test: наш PeerClient скачал у демона реальный файл из Incoming
+  (5 916 774 байта, 33 блока, сжатие) — MD4 сошёлся.
+- Грабли (пойманы живьём):
+  - `PeerClient.transfer()` слал серверный OP_ACCEPTUPLOADREQ — движок
+    рвал сессию после первого батча (комментарий оставлен в client.py);
+  - COMPRESSEDPART приходит САБ-ПАКЕТАМИ (CreatePackedPackets: каждый чанк
+    несёт BLOCK start + TOTAL compressed size) — клиент теперь копит чанки
+    и декомпрессит целиком (codec: parse_compressed_part_chunk[_i64]);
+  - REQUESTPARTS-паддинг (0,0) — легален (start==end допускается, ошибка
+    только start>end) — поправлены валидаторы codec;
+  - клиентский PeerInfo(version=) — несуществующее поле (emule_version);
+  - DuckDB lock retry поднят до 20x1s (паук держит БД подолгу);
+  - слоты upload-очереди текут при краше сессии (TTL 600с) — при отладке
+    рестартить демона.
+- Offline suite: 281 passed, 6 skipped; compileall 0.
+- Незакоммичено: стадия S (identity/serve_daemon/AmuleD_Run/фиксы codec,
+  client, listener, state, config) + README-обновление — коммит по
+  подтверждению.
 
 ## Быстрый старт (обязательный порядок)
 
