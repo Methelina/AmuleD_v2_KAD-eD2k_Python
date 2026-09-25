@@ -29,9 +29,9 @@ Opcodes covered by this module:
     OP_COMPRESSEDPART_I64 0xA1  compressed sending part (u64 start/end)
 
 src/amuled_v2/core/peer/codec.py
-Version:     0.1.0
+Version:     0.2.0
 Author:      Soror L.'.L'.
-Updated:     2026-09-23
+Updated:     2026-09-24
 
 Patch Notes v0.1.0 (Soror L.'.L'.):
   [+] Added C2CTCP opcode constants for client-to-client TCP.
@@ -46,6 +46,9 @@ Patch Notes v0.1.0 (Soror L.'.L'.):
   [+] Added parse_compressed_part / parse_compressed_part_i64 for OP_COMPRESSEDPART(_I64).
   [+] Added parse_queue_rank / parse_file_status for OP_QUEUERANK / OP_FILESTATUS.
   [+] Added frozen dataclass models with to_dict serialization.
+
+Patch Notes v0.2.0 (Soror L.'.L'.):
+  [+] Added upload-answer payload builders (QUEUERANK, ACCEPTUPLOADREQ, END_OF_DOWNLOAD, SENDINGPART_I64, COMPRESSEDPART_I64, REQFILENAMEANSWER, FILESTATUS).
 """
 
 from __future__ import annotations
@@ -87,6 +90,13 @@ __all__ = [
     "parse_compressed_part_i64",
     "parse_queue_rank",
     "parse_file_status",
+    "build_queue_rank_payload",
+    "build_accept_upload_req_payload",
+    "build_end_of_download_payload",
+    "build_sending_part_i64_payload",
+    "build_compressed_part_i64_payload",
+    "build_file_name_answer_payload",
+    "build_file_status_payload",
 ]
 
 _HASH16_SIZE = 16
@@ -833,3 +843,157 @@ def parse_queue_rank(payload: bytes) -> int:
         raise PeerCodecError(f"OP_QUEUERANK has {reader.remaining} trailing bytes")
     log.debug("QUEUERANK parsed: rank=%d", rank)
     return rank
+
+
+def build_queue_rank_payload(rank: int) -> bytes:
+    """Encode an ``OP_QUEUERANK`` payload (UInt32 rank)."""
+    if not isinstance(rank, int) or isinstance(rank, bool):
+        raise PeerCodecError(f"rank must be int: {rank}")
+    if not 0 <= rank <= 0xFFFFFFFF:
+        raise PeerCodecError(f"rank out of UInt32 range: {rank}")
+    writer = BinaryWriter()
+    writer.write_u32(rank)
+    payload = writer.to_bytes()
+    log.debug("QUEUERANK payload built: rank=%d, size=%d", rank, len(payload))
+    return payload
+
+
+def build_accept_upload_req_payload() -> bytes:
+    """Encode an ``OP_ACCEPTUPLOADREQ`` payload (empty)."""
+    payload = b""
+    log.debug("ACCEPTUPLOADREQ payload built: size=%d", len(payload))
+    return payload
+
+
+def build_end_of_download_payload(file_hash: bytes) -> bytes:
+    """Encode an ``OP_END_OF_DOWNLOAD`` payload (hash16)."""
+    if len(file_hash) != _HASH16_SIZE:
+        raise PeerCodecError("file hash must contain exactly 16 bytes")
+    writer = BinaryWriter()
+    writer.write_hash16(file_hash)
+    payload = writer.to_bytes()
+    log.debug("END_OF_DOWNLOAD payload built: hash=%s, size=%d", file_hash.hex().upper(), len(payload))
+    return payload
+
+
+def build_sending_part_i64_payload(
+    file_hash: bytes,
+    start: int,
+    end: int,
+    data: bytes,
+) -> bytes:
+    """Encode an ``OP_SENDINGPART_I64`` payload (hash16, u64 start/end, raw data)."""
+    if len(file_hash) != _HASH16_SIZE:
+        raise PeerCodecError("file hash must contain exactly 16 bytes")
+    if not isinstance(start, int) or isinstance(start, bool):
+        raise PeerCodecError(f"start must be int: {start}")
+    if not isinstance(end, int) or isinstance(end, bool):
+        raise PeerCodecError(f"end must be int: {end}")
+    if not 0 <= start <= 0xFFFFFFFFFFFFFFFF:
+        raise PeerCodecError(f"start out of UInt64 range: {start}")
+    if not 0 <= end <= 0xFFFFFFFFFFFFFFFF:
+        raise PeerCodecError(f"end out of UInt64 range: {end}")
+    if start >= end:
+        raise PeerCodecError(f"start {start} must be less than end {end}")
+    if len(data) != end - start:
+        raise PeerCodecError(
+            f"OP_SENDINGPART_I64 data length {len(data)} != end-start {end - start}"
+        )
+    writer = BinaryWriter()
+    writer.write_hash16(file_hash)
+    writer.write_u64(start)
+    writer.write_u64(end)
+    writer.write_bytes(data)
+    payload = writer.to_bytes()
+    log.debug(
+        "SENDINGPART_I64 payload built: hash=%s, start=%d, end=%d, data_size=%d, size=%d",
+        file_hash.hex().upper(),
+        start,
+        end,
+        len(data),
+        len(payload),
+    )
+    return payload
+
+
+def build_compressed_part_i64_payload(
+    file_hash: bytes,
+    start: int,
+    data: bytes,
+) -> bytes:
+    """Encode an ``OP_COMPRESSEDPART_I64`` payload (zlib-compressed UInt64 start)."""
+    if len(file_hash) != _HASH16_SIZE:
+        raise PeerCodecError("file hash must contain exactly 16 bytes")
+    if not isinstance(start, int) or isinstance(start, bool):
+        raise PeerCodecError(f"start must be int: {start}")
+    if not 0 <= start <= 0xFFFFFFFFFFFFFFFF:
+        raise PeerCodecError(f"start out of UInt64 range: {start}")
+    if not data:
+        raise PeerCodecError("compressed part data must be non-empty")
+    compressed_data = zlib.compress(data)
+    writer = BinaryWriter()
+    writer.write_hash16(file_hash)
+    writer.write_u64(start)
+    writer.write_u32(len(compressed_data))
+    writer.write_bytes(compressed_data)
+    payload = writer.to_bytes()
+    log.debug(
+        "COMPRESSEDPART_I64 payload built: hash=%s, start=%d, compressed=%d, data_size=%d, size=%d",
+        file_hash.hex().upper(),
+        start,
+        len(compressed_data),
+        len(data),
+        len(payload),
+    )
+    return payload
+
+
+def build_file_name_answer_payload(file_hash: bytes, name: str) -> bytes:
+    """Encode an ``OP_REQFILENAMEANSWER`` payload (hash16 + UTF-8 string)."""
+    if len(file_hash) != _HASH16_SIZE:
+        raise PeerCodecError("file hash must contain exactly 16 bytes")
+    writer = BinaryWriter()
+    writer.write_hash16(file_hash)
+    writer.write_string_utf8(name)
+    payload = writer.to_bytes()
+    log.debug("REQFILENAMEANSWER payload built: hash=%s, name=%r, size=%d", file_hash.hex().upper(), name, len(payload))
+    return payload
+
+
+def build_file_status_payload(
+    file_hash: bytes,
+    chunk_count: int,
+    present_chunks: tuple[int, ...] | list[int],
+) -> bytes:
+    """Encode an ``OP_FILESTATUS`` payload (hash16, u16 chunk_count, bit array)."""
+    if len(file_hash) != _HASH16_SIZE:
+        raise PeerCodecError("file hash must contain exactly 16 bytes")
+    if not isinstance(chunk_count, int) or isinstance(chunk_count, bool):
+        raise PeerCodecError(f"chunk_count must be int: {chunk_count}")
+    if not 0 <= chunk_count <= 0xFFFF:
+        raise PeerCodecError(f"chunk_count out of UInt16 range: {chunk_count}")
+    for index in present_chunks:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise PeerCodecError(f"present_chunks index must be int: {index}")
+        if not 0 <= index < chunk_count:
+            raise PeerCodecError(
+                f"present_chunks index {index} out of range for chunk_count {chunk_count}"
+            )
+    bit_array = bytearray((chunk_count + 7) // 8)
+    for index in present_chunks:
+        byte_index = index // 8
+        bit_index = index % 8
+        bit_array[byte_index] |= 1 << bit_index
+    writer = BinaryWriter()
+    writer.write_hash16(file_hash)
+    writer.write_u16(chunk_count)
+    writer.write_bytes(bytes(bit_array))
+    payload = writer.to_bytes()
+    log.debug(
+        "FILESTATUS payload built: hash=%s, chunk_count=%d, present=%d, size=%d",
+        file_hash.hex().upper(),
+        chunk_count,
+        len(present_chunks),
+        len(payload),
+    )
+    return payload

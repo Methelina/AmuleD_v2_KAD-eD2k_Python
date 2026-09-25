@@ -1368,6 +1368,177 @@ def _cmd_kad_sources(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_publish(args: argparse.Namespace) -> int:
+    """Shared driver for ``publish keywords`` / ``publish sources``.
+
+    With ``--loop-interval H`` the publish pass repeats every H hours
+    (KAD store entries expire after ~24h; KADEMLIAREPUBLISHTIMEK), so the
+    command acts as a long-running republication daemon (Ctrl+C to stop).
+    """
+    import time as _time
+
+    log.debug(
+        f"Command started: name=publish-{args.publish_command}, "
+        f"limit={args.limit}, timeout={args.timeout}, tcp_port={args.tcp_port}"
+    )
+    try:
+        while True:
+            result = asyncio.run(_run_publish(args))
+            if getattr(args, "json", False):
+                _print_json(result)
+            else:
+                lines = [
+                    f"status      : {result['status']}",
+                    f"mode        : {result['mode']}",
+                    f"files       : {result['file_count']}",
+                    f"published   : {result['published']}",
+                    f"accepts     : {result['accepts']}",
+                    f"duration    : {result['duration_s']}s",
+                ]
+                for item in result["reports"]:
+                    lines.append(
+                        f"  {item['publish_op']} target={item['target']} "
+                        f"accepts={len(item['accepts'])}/{len(item['targets'])} "
+                        f"avg_load={item['avg_load']}"
+                    )
+                _print_text("Kad publish", lines)
+            log.info(
+                f"Publish completed: mode={result['mode']}, "
+                f"published={result['published']}, accepts={result['accepts']}"
+            )
+            if result["status"] != "ok":
+                return 2
+            interval_h = getattr(args, "loop_interval", 0.0)
+            if interval_h <= 0:
+                return 0
+            log.info(
+                f"Publish loop: sleeping {interval_h}h until next republication pass"
+            )
+            _time.sleep(interval_h * 3600)
+    except KeyboardInterrupt:
+        log.info("Publish loop interrupted by user")
+        return 0
+    except Exception as exc:
+        log.error(f"Publish failed: error={exc!r}")
+        if getattr(args, "json", False):
+            _print_json({"status": "error", "reason": str(exc)})
+        else:
+            _print_text("Kad publish failed", [
+                "status  : error",
+                f"reason  : {exc}",
+            ])
+        return 2
+
+
+async def _run_publish(args: argparse.Namespace) -> dict:
+    """Publish shared files (keyword entries and/or source entries) to Kad2."""
+    import socket as _socket
+    import time
+
+    from amuled_v2.core.kad.publish import (
+        KeywordPublisher,
+        SourcePublisher,
+    )
+    from amuled_v2.core.kad.runtime import (
+        bootstrap_runtime,
+        load_kad_runtime,
+        load_kadabra_state,
+        save_kadabra_state,
+    )
+
+    class _Shared:
+        """Duck-typed SharedFile for KeywordPublisher (name/size/hash)."""
+
+        def __init__(self, row: dict) -> None:
+            self.name = row["name"]
+            self.size = int(row["size"])
+            self.file_hash = bytes.fromhex(row["hash"])
+            self.hash_hex = row["hash"].upper()
+
+    state = get_state()
+    state.connect()
+    limit = args.limit if args.limit > 0 else 100000
+    rows = state.list_shared_files(limit=100000)
+    # Only on-disk files can actually be served; imported metadata rows
+    # (path=None) must not be advertised as sources.
+    files = [_Shared(row) for row in rows if row.get("path")][:limit]
+    if not files:
+        return {
+            "status": "error",
+            "reason": "no shared files in DuckDB (run share scan first)",
+            "mode": args.publish_command,
+            "file_count": 0,
+            "published": 0,
+            "accepts": 0,
+            "duration_s": 0.0,
+            "reports": [],
+        }
+
+    rt = load_kad_runtime()
+    await bootstrap_runtime(rt, local_port=0)
+    kadabra = load_kadabra_state()
+
+    tcp_port = args.tcp_port
+    if tcp_port <= 0:
+        tcp_port = 4662
+
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", 0))
+
+    reports: list[dict] = []
+    published = 0
+    accepts = 0
+    start = time.monotonic()
+    try:
+        if args.publish_command == "keywords":
+            pub = KeywordPublisher(own_id=rt.own_id, own_tcp_port=tcp_port)
+            for f in files:
+                report = await pub.publish_file(
+                    f,
+                    socket=sock,
+                    routing_table=rt.routing,
+                    timeout=args.timeout,
+                )
+                reports.append(report.to_dict())
+                published += report.published
+                accepts += len(report.accepts)
+        elif args.publish_command == "sources":
+            pub = SourcePublisher(
+                own_id=rt.own_id,
+                own_tcp_port=tcp_port,
+                user_hash=rt.own_id.to_bytes(),
+            )
+            for f in files:
+                report = await pub.publish_sources(
+                    f.file_hash,
+                    [(0, tcp_port, None)],
+                    socket=sock,
+                    routing_table=rt.routing,
+                    file_size=f.size,
+                    timeout=args.timeout,
+                )
+                reports.append(report.to_dict())
+                published += report.published
+                accepts += len(report.accepts)
+        else:
+            raise ValueError(f"unknown publish mode: {args.publish_command}")
+    finally:
+        sock.close()
+        save_kadabra_state(kadabra)
+
+    duration = time.monotonic() - start
+    return {
+        "status": "ok",
+        "mode": args.publish_command,
+        "file_count": len(files),
+        "published": published,
+        "accepts": accepts,
+        "duration_s": round(duration, 3),
+        "reports": reports,
+    }
+
+
 def _cmd_servers_failures(args: argparse.Namespace) -> int:
     state = get_state()
     state.connect()
@@ -2414,6 +2585,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not persist sources to DuckDB.",
     )
     p_kad_sources.set_defaults(func=_cmd_kad_sources)
+
+    # --- publish ---
+    p_publish = sub.add_parser(
+        "publish",
+        help="Publish shared files to the Kad2 index (keywords/sources).",
+        parents=parents,
+    )
+    publish_sub = p_publish.add_subparsers(dest="publish_command", metavar="<action>")
+
+    def add_publish_parser(name: str, help_text: str):
+        p = publish_sub.add_parser(name, help=help_text, parents=parents)
+        p.add_argument(
+            "--limit",
+            type=int,
+            default=1,
+            help="Number of shared files to publish (0 = all).",
+        )
+        p.add_argument(
+            "--timeout",
+            type=float,
+            default=30.0,
+            help="Lookup window per file in seconds.",
+        )
+        p.add_argument(
+            "--tcp-port",
+            type=int,
+            default=0,
+            help="TCP port advertised in source entries (default 4662).",
+        )
+        p.add_argument(
+            "--loop-interval",
+            type=float,
+            default=0.0,
+            help="Republication interval in hours; 0 = single pass.",
+        )
+        p.set_defaults(func=_cmd_publish)
+        return p
+
+    add_publish_parser(
+        "keywords",
+        "Publish shared-file keyword entries (KADEMLIA2_PUBLISH_KEY_REQ).",
+    )
+    add_publish_parser(
+        "sources",
+        "Publish ourselves as a source for shared file hashes "
+        "(KADEMLIA2_PUBLISH_SOURCE_REQ).",
+    )
 
     # --- download ---
     p_download = sub.add_parser(

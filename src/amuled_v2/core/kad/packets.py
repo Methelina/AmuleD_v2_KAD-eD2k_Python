@@ -63,6 +63,9 @@ __all__ = [
     "build_hello_req",
     "parse_hello_res",
     "build_ping",
+    "build_publish_key_req",
+    "build_publish_source_req",
+    "parse_publish_res",
 ]
 
 # --- Protocol bytes -------------------------------------------------------
@@ -383,12 +386,19 @@ def _read_hello_contact(
     return cid, tcp_port, version, tag_count, data, offset
 
 
-def _build_tag_list(tags: bytes) -> bytes:
+def _build_tag_list(tags: bytes, count: int) -> bytes:
+    """Prefix an already-encoded tag body with its tag COUNT byte.
+
+    ``count`` is the number of tags (not bytes) and must be supplied by the
+    caller, who built the tags and knows their number (mirrors
+    DataIO.cpp WriteTagList which writes ``WriteUInt8(list.GetCount())``)."""
     if not tags:
         return b"\x00"
     if len(tags) > 255:
         raise KadPacketError("tag list exceeds 255 bytes")
-    return bytes((len(tags),)) + tags
+    if not 0 <= count <= 0xFF:
+        raise KadPacketError(f"tag count exceeds UInt8: {count}")
+    return bytes((count,)) + tags
 
 
 def build_hello_req(
@@ -396,6 +406,7 @@ def build_hello_req(
     tcp_port: int,
     sender_version: int = KADEMLIA_VERSION,
     tags: bytes = b"",
+    tag_count: int = 0,
 ) -> bytes:
     """Build a ``KADEMLIA2_HELLO_REQ`` datagram.
 
@@ -421,14 +432,15 @@ def build_hello_req(
     payload = (
         sender_id.to_bytes()
         + struct.pack("<HB", tcp_port, sender_version)
-        + _build_tag_list(tags)
+        + _build_tag_list(tags, tag_count)
     )
+
     log.debug(
         "build_hello_req: id=%s tcp=%d version=%d tags=%d",
         sender_id,
         tcp_port,
         sender_version,
-        len(tags),
+        tag_count,
     )
     return _header(KAD_PROTOCOL, KADEMLIA2_HELLO_REQ) + payload
 
@@ -491,3 +503,172 @@ def build_ping() -> bytes:
     """
     log.debug("build_ping: empty payload")
     return _header(KAD_PROTOCOL, KADEMLIA2_PING) + b""
+
+
+# --- KADEMLIA2_PUBLISH_KEY_REQ -----------------------------------------------
+
+
+def build_publish_key_req(
+    keyword_target: KadUInt128,
+    file_entries: list[Tuple[KadUInt128, bytes, int]],
+) -> bytes:
+    """Build a ``KADEMLIA2_PUBLISH_KEY_REQ`` (0x43) payload.
+
+    Layout (per ``CSearch::StorePacket`` STOREKEYWORD case,
+    Search.cpp:935-991)::
+
+        UInt128  uTarget          # the keyword hash (lookup target)
+        UInt16   uCount           # number of file entries (little-endian)
+        repeat uCount:
+            UInt128 uAnswer      # the file hash
+            TagList tags         # UInt8 count + per-tag encoding
+                                 #   (FILENAME string, FILESIZE uint32)
+
+    ``file_entries`` is a list of ``(file_hash, tag_bytes, tag_count)``
+    tuples where ``tag_bytes`` is the raw, already-encoded Kad tag list
+    *without* the leading count byte (that is added here as ``tag_count``).
+    The entry count is patched in before the keyword hash, mirroring eMule's
+    ``CByteIO`` seek-and-rewrite at Search.cpp:966-970.
+    """
+    if len(file_entries) > 0xFFFF:
+        raise KadPacketError(
+            f"KADEMLIA2_PUBLISH_KEY_REQ file count exceeds UInt16: {len(file_entries)}"
+        )
+    out = bytearray()
+    out += keyword_target.to_bytes()
+    out += struct.pack("<H", len(file_entries))
+    for file_hash, tag_bytes, tag_count in file_entries:
+        out += file_hash.to_bytes()
+        out += _build_tag_list(tag_bytes, tag_count)
+    log.debug(
+        "build_publish_key_req: keyword=%s files=%d",
+        keyword_target,
+        len(file_entries),
+    )
+    return bytes(out)
+
+
+# --- KADEMLIA2_PUBLISH_SOURCE_REQ --------------------------------------------
+
+_TAGNAME_FILENAME = b"\x01"
+_TAGNAME_FILESIZE = b"\x02"
+_TAGNAME_SOURCETYPE = b"\xFF"
+_TAGNAME_SOURCEPORT = b"\xFD"
+_TAGNAME_SOURCEUPORT = b"\xFC"
+_TAGNAME_ENCRYPTION = b"\xF3"
+
+
+def build_publish_source_req(
+    file_hash: KadUInt128,
+    publisher_id: KadUInt128,
+    tags: bytes,
+    tag_count: int,
+) -> bytes:
+    """Build a ``KADEMLIA2_PUBLISH_SOURCE_REQ`` (0x44) payload.
+
+    Layout (per ``CSearch::StorePacket`` STOREFILE case,
+    Search.cpp:832-934, and ``SendPublishSourcePacket`` at
+    KademliaUDPListener.cpp:188-216)::
+
+        UInt128  uTarget     # the file hash (m_uTarget)
+        UInt128  uContactID  # the publisher's client/user hash
+                             #   (CKademlia::GetPrefs()->GetClientHash(),
+                             #    Search.cpp:854)
+        TagList  tags        # UInt8 count + per-tag encoding
+                             #   SOURCETYPE, SOURCEPORT, SOURCEUPORT,
+                             #   FILESIZE, ENCRYPTION per Search.cpp:875-913
+
+    The eMule reference tags differ by source type:
+
+    - HighID (``type 1`` / ``type 4`` for >4 GB): ``TAG_SOURCETYPE`` +
+      ``TAG_SOURCEPORT`` (TCP) + optional ``TAG_SOURCEUPORT`` (UDP) +
+      optional ``TAG_FILESIZE``.
+    - Firewalled with buddy (``type 3`` / ``type 5``): additionally
+      ``TAG_SERVERIP`` (buddy IP), ``TAG_SERVERPORT`` (buddy UDP), and
+      ``TAG_SERVINGBUDDYHASH``.
+
+    ``tags`` is the raw, already-encoded tag bytes (without the leading
+    count byte); ``tag_count`` is the number of tags and is written as the
+    list count byte here via :func:`_build_tag_list`.
+    """
+    out = bytearray()
+    out += file_hash.to_bytes()
+    out += publisher_id.to_bytes()
+    out += _build_tag_list(tags, tag_count)
+    log.debug(
+        "build_publish_source_req: file_hash=%s publisher_id=%s tags=%d",
+        file_hash,
+        publisher_id,
+        tag_count,
+    )
+    return bytes(out)
+
+
+# --- KADEMLIA2_PUBLISH_RES ---------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PublishRes:
+    """Parsed ``KADEMLIA2_PUBLISH_RES`` (0x4B) response.
+
+    Layout (per ``Process_KADEMLIA2_PUBLISH_RES``,
+    KademliaUDPListener.cpp:1430-1453)::
+
+        UInt128  uFile    # the file hash the result refers to
+        UInt8    uLoad    # publisher load (0-100, 100 = full/busy)
+        [UInt8   byOptions] # optional; bit 0 = bRequestACK
+                          #   (0=ACK not requested, 1=ACK requested)
+
+    When ``ack_requested`` is true the receiver must send a
+    ``KADEMLIA2_PUBLISH_RES_ACK`` (0x4C) datagram back.
+    """
+
+    file_hash: KadUInt128
+    load: int
+    ack_requested: bool = False
+    ack_options: int = 0
+
+
+def parse_publish_res(payload: bytes) -> PublishRes:
+    """Parse a ``KADEMLIA2_PUBLISH_RES`` (0x4B) payload.
+
+    Raises :class:`KadPacketError` on truncation.
+    """
+    raw = bytes(payload)
+    if len(raw) < 16 + 1:
+        raise KadPacketError(
+            f"KADEMLIA2_PUBLISH_RES too short: have {len(raw)}, need >= 17"
+        )
+    file_hash = KadUInt128(raw[0:16])
+    load = raw[16]
+    ack_requested = False
+    ack_options = 0
+    if len(raw) > 17:
+        ack_options = raw[17]
+        ack_requested = bool(ack_options & 0x01)
+    log.debug(
+        "parse_publish_res: file_hash=%s load=%d ack_requested=%s",
+        file_hash,
+        load,
+        ack_requested,
+    )
+    return PublishRes(
+        file_hash=file_hash,
+        load=load,
+        ack_requested=ack_requested,
+        ack_options=ack_options,
+    )
+
+
+# --- KADEMLIA2_PUBLISH_RES_ACK ------------------------------------------------
+
+
+def build_publish_res_ack() -> bytes:
+    """Build a ``KADEMLIA2_PUBLISH_RES_ACK`` (0x4C) datagram.
+
+    Per ``Process_KADEMLIA2_PUBLISH_RES`` (KademliaUDPListener.cpp:1448-1450)
+    the ACK is a null-packet: an empty payload, just the two-byte
+    ``[protocol][opcode]`` header (sent via ``SendNullPacket``).
+    """
+    log.debug("build_publish_res_ack: empty payload")
+    return _header(KAD_PROTOCOL, KADEMLIA2_PUBLISH_RES_ACK) + b""
