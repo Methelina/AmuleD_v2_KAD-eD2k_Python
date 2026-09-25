@@ -552,6 +552,9 @@ def test_kernel_ipc_download_run_end_to_end(tmp_path, monkeypatch) -> None:
         from amuled_v2.state import get_state
 
         kernel = _make_kernel(tmp_path)
+        # Loopback self-dial: our listener is plain-only (obf accept is
+        # BLOCKED-EXTERNAL), so the runner must accept no-userhash rows.
+        kernel.plain_dial_ok = True
         state = kernel.state
         kernel.server = IncomingPeerServer(
             identity=LocalIdentity(

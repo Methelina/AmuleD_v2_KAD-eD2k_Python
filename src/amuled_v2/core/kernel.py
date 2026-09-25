@@ -181,6 +181,7 @@ class AmuleDKernel:
                     local_port=self._tcp_port,
                     max_peers=max_peers,
                     traffic_sink=self._record_downloaded,
+                    plain_dial_ok=getattr(self, "plain_dial_ok", False),
                 )
 
                 def _progress(received: int, total: int, blocks: int) -> None:
