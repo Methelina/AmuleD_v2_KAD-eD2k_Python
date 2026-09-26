@@ -1017,3 +1017,230 @@ async def negotiate_basic_client(
     except asyncio.TimeoutError as exc:
         raise ObfuscationError(f"BASIC handshake timed out after {timeout:.1f}s") from exc
     return session, leftover
+
+
+# ---------------------------------------------------------------------------
+# ACCEPTOR side (incoming connections) — EncryptedStreamSocket.cpp
+# Receive()/StartNegotiation(false)/ONS_BASIC_CLIENTA_* and the DH variant
+# of ONS_BASIC_SERVER_*.  Stage X: the inbound obfuscation accept.
+# ---------------------------------------------------------------------------
+
+
+class AcceptorSession:
+    """Established obfuscation pair for an accepted connection.
+
+    Exposes the same ``encrypt()/decrypt()`` surface as
+    :class:`BasicObfuscationSession` so transports can use either
+    interchangeably.
+    """
+
+    def __init__(self, send_stream: Rc4Stream, recv_stream: Rc4Stream) -> None:
+        self._send = send_stream
+        self._recv = recv_stream
+        self.state = "encrypting"
+
+    def encrypt(self, wire: bytes) -> bytes:
+        return self._send.crypt(wire)
+
+    def decrypt(self, raw: bytes) -> bytes:
+        return self._recv.crypt(raw)
+
+
+def _read_exact_plain(
+    reader: asyncio.StreamReader, n: int, timeout: float
+) -> "asyncio.Future[bytes] | bytes":
+    return asyncio.wait_for(reader.readexactly(n), timeout)
+
+
+def _derive_acceptor_keys_own_hash(
+    own_userhash: bytes, keypart: int
+) -> tuple[bytes, bytes]:
+    """BASIC acceptor keys: recv = MD5(hash||34||part), send = MD5(hash||203||part)."""
+    part = struct.pack("<I", keypart)
+    recv_key = _md5_digest(bytes(own_userhash) + bytes((MAGICVALUE_REQUESTER,)) + part)
+    send_key = _md5_digest(bytes(own_userhash) + bytes((MAGICVALUE_SERVER,)) + part)
+    return send_key, recv_key
+
+
+async def accept_basic_client(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    own_userhash: bytes,
+    first_byte: int,
+    *,
+    keypart_raw: bytes | None = None,
+    magic_raw: bytes | None = None,
+    padding: Optional[bytes] = None,
+    timeout: float = 10.0,
+) -> tuple[AcceptorSession, bytes]:
+    """Accept a BASIC-obfuscated incoming connection.
+
+    Per ``Receive()`` ECS_UNKNOWN + ``ONS_BASIC_CLIENTA_RANDOMPART`` /
+    ``_MAGICVALUE`` / ``_METHODTAGSPADLEN`` / ``_PADDING``:
+
+    - ``first_byte`` is the already-consumed semi-random marker (never
+      0xE3/0xC5/0xD4);
+    - the next 4 raw bytes are the RandomKeyPart (or ``keypart_raw`` when
+      the caller pre-buffered them);
+    - keys: recv = MD5(hash || 34 || part), send = MD5(hash || 203 || part),
+      1024-byte keystream drop;
+    - the next 4 bytes decrypt to MAGICVALUE_SYNC, then method/method/
+      padlen, then the padding;
+    - the response [MAGIC u32][method 0x00][padlen][pad] is sent fully
+      encrypted with the send stream.
+
+    ``magic_raw`` optionally supplies the caller-pre-buffered 4 bytes that
+    should be decrypted as the magic (used by the dispatcher that reads
+    ahead).  Returns ``(AcceptorSession, leftover_decrypted_bytes)``.
+    Raises :class:`ObfuscationError` when the magic does not match.
+    """
+    if len(own_userhash) != 16:
+        raise ObfuscationError("own_userhash must be exactly 16 bytes")
+    if keypart_raw is None:
+        keypart_raw = await _read_exact_plain(reader, 4, timeout)
+    if len(keypart_raw) != 4:
+        raise ObfuscationError(f"keypart truncated: {len(keypart_raw)}")
+    keypart = struct.unpack("<I", keypart_raw)[0]
+    send_key, recv_key = _derive_acceptor_keys_own_hash(own_userhash, keypart)
+    recv_stream = Rc4Stream(recv_key, RC4_KEY_DROP_BYTES)
+    send_stream = Rc4Stream(send_key, RC4_KEY_DROP_BYTES)
+
+    if magic_raw is None:
+        magic_raw = await _read_exact_plain(reader, 4, timeout)
+    magic = struct.unpack("<I", recv_stream.crypt(magic_raw))[0]
+    if magic != MAGICVALUE_SYNC:
+        raise ObfuscationError(
+            f"BASIC magic mismatch: got 0x{magic:08X}, expected 0x{MAGICVALUE_SYNC:08X}"
+        )
+    methods = recv_stream.crypt(await _read_exact_plain(reader, 2, timeout))
+    padlen = recv_stream.crypt(await _read_exact_plain(reader, 1, timeout))[0]
+    if padlen:
+        recv_stream.crypt(await _read_exact_plain(reader, padlen, timeout))
+
+    if padding is not None:
+        resp_pad = bytes(padding)
+    else:
+        resp_pad = os.urandom(semirandom_padding_length())
+    response = (
+        struct.pack("<I", MAGICVALUE_SYNC)
+        + bytes((ENM_OBFUSCATION, len(resp_pad)))
+        + resp_pad
+    )
+    writer.write(send_stream.crypt(response))
+    await writer.drain()
+    log.debug(
+        "BASIC accept complete: keypart=%u, methods=%02X/%02X, pad=%d",
+        keypart,
+        methods[0],
+        methods[1],
+        padlen,
+    )
+    return AcceptorSession(send_stream, recv_stream), b""
+
+
+async def accept_dh_client(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    g_a: bytes,
+    *,
+    padding: Optional[bytes] = None,
+    timeout: float = 10.0,
+) -> tuple[AcceptorSession, bytes]:
+    """Accept a DH-obfuscated incoming connection (server role).
+
+    The dialer sent [marker][g^a 96B][padlen][pad] as PLAINTEXT (the
+    marker and any consumed prefix are the caller's concern; ``g_a`` is
+    the complete 96-byte public value).  The acceptor answers with
+    [g^b 96B plaintext][RC4(send): MAGIC u32 | method 0x00 | padlen | pad]
+    and both sides derive keys from G^(ab): acceptor send = MD5(shared ||
+    203), acceptor recv = MD5(shared || 34).
+    """
+    if len(g_a) != DH_PUBKEY_BYTES:
+        raise ObfuscationError(
+            f"g^a must be {DH_PUBKEY_BYTES} bytes, got {len(g_a)}"
+        )
+    # Consume the dialer's trailing padlen+pad (plaintext).
+    padlen = (await _read_exact_plain(reader, 1, timeout))[0]
+    if padlen:
+        await _read_exact_plain(reader, padlen, timeout)
+
+    b = generate_dh_private_key()
+    g_b = compute_dh_public_key(b)
+    server_int = int.from_bytes(g_a, "big")
+    shared_buf = pow(server_int, b, DIFFIE_HELLMAN_PRIME).to_bytes(
+        DH_PUBKEY_BYTES, "big"
+    )
+    send_key = _md5_digest(shared_buf + bytes((MAGICVALUE_SERVER,)))
+    recv_key = _md5_digest(shared_buf + bytes((MAGICVALUE_REQUESTER,)))
+    send_stream = Rc4Stream(send_key, RC4_KEY_DROP_BYTES)
+    recv_stream = Rc4Stream(recv_key, RC4_KEY_DROP_BYTES)
+
+    if padding is not None:
+        resp_pad = bytes(padding)
+    else:
+        resp_pad = os.urandom(16)
+    body = (
+        struct.pack("<I", MAGICVALUE_SYNC)
+        + bytes((ENM_OBFUSCATION, len(resp_pad)))
+        + resp_pad
+    )
+    writer.write(bytes(g_b) + send_stream.crypt(body))
+    await writer.drain()
+    log.debug(
+        "DH accept complete: g^b sent, body=%d bytes, g_a_head=%s, g_b_head=%s, "
+        "send_key=%s",
+        len(body),
+        g_a[:8].hex(),
+        g_b[:8].hex(),
+        send_key[:4].hex(),
+    )
+    return AcceptorSession(send_stream, recv_stream), b""
+
+
+async def accept_obfuscated_client(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    own_userhash: bytes,
+    first_byte: int,
+    *,
+    timeout: float = 10.0,
+    allow_dh: bool = True,
+) -> tuple[AcceptorSession, bytes]:
+    """Dispatcher for an incoming non-protocol first byte.
+
+    Reads ahead 4 bytes, tries BASIC; when the BASIC magic does not match
+    and *allow_dh* is set, falls back to the DH acceptor reusing the
+    pre-read bytes as the head of g^a (the DH request has no keypart, so
+    those bytes are simply the first 8 bytes of G^A together with the
+    marker byte's replacement semantics: the marker IS byte 0 of the
+    request, and G^A follows it immediately).
+    """
+    keypart_raw = await _read_exact_plain(reader, 4, timeout)
+    magic_raw = await _read_exact_plain(reader, 4, timeout)
+    try:
+        return await accept_basic_client(
+            reader,
+            writer,
+            own_userhash,
+            first_byte,
+            keypart_raw=keypart_raw,
+            magic_raw=magic_raw,
+            timeout=timeout,
+        )
+    except ObfuscationError as basic_exc:
+        if not allow_dh:
+            raise
+        log.debug(
+            "BASIC accept failed (trying DH): first_byte=0x%02X, error=%s",
+            first_byte,
+            basic_exc,
+        )
+    # DH: [marker][g^a 96][padlen][pad] — marker consumed by caller, the
+    # first 8 bytes of g^a are keypart_raw + magic_raw already read.
+    g_a = keypart_raw + magic_raw
+    remaining = DH_PUBKEY_BYTES - len(g_a)
+    if remaining > 0:
+        g_a += await _read_exact_plain(reader, remaining, timeout)
+    return await accept_dh_client(
+        reader, writer, g_a, timeout=timeout
+    )

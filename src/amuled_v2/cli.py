@@ -1664,6 +1664,49 @@ def _cmd_upload_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_geoip_lookup(args: argparse.Namespace) -> int:
+    """Stage X: IP geolocation (MMDB primary, legacy dat fallback)."""
+    from amuled_v2.core.geoip import load_geoip
+
+    if args.db:
+        candidates = [Path(args.db)]
+    else:
+        assets = ROOT / "assets" / "v1"
+        candidates = sorted(assets.glob("*.mmdb")) + [assets / "GeoIP.dat"]
+    db = None
+    used = None
+    for candidate in candidates:
+        db = load_geoip(candidate)
+        if db is not None:
+            used = candidate
+            break
+    if db is None:
+        result = {"status": "error", "reason": "no loadable geo database"}
+        if args.json:
+            _print_json(result)
+        else:
+            _print_text("GeoIP lookup", ["status : error", "reason : no loadable geo database"])
+        return 2
+    country = db.lookup(args.ip)
+    result = {
+        "status": "ok",
+        "ip": args.ip,
+        "country": country,
+        "db": str(used),
+    }
+    if args.json:
+        _print_json(result)
+    else:
+        _print_text("GeoIP lookup", [
+            f"status  : {result['status']}",
+            f"ip      : {args.ip}",
+            f"country : {country or 'unknown'}",
+            f"db      : {used}",
+        ])
+    log.info(f"GeoIP lookup: ip={args.ip}, country={country}")
+    return 0
+
+
 def _cmd_daemon(args: argparse.Namespace) -> int:
     """Kernel lifecycle commands (stage U): status / stop via IPC."""
     status = _kernel_control({"command": "status"})
@@ -3249,6 +3292,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ipfilter_test.add_argument("ip", help="IPv4 address to test.")
     p_ipfilter_test.set_defaults(func=_cmd_ipfilter_test)
+
+    # --- geoip ---
+    p_geoip = sub.add_parser(
+        "geoip",
+        help="IP geolocation via MMDB (eMuleAI parity) or legacy GeoIP.dat.",
+        parents=parents,
+    )
+    geoip_sub = p_geoip.add_subparsers(dest="geoip_command", metavar="<action>")
+
+    p_geoip_lookup = geoip_sub.add_parser(
+        "lookup",
+        help="Look up the country of one IP address.",
+        parents=parents,
+    )
+    p_geoip_lookup.add_argument("ip", help="IP address to look up.")
+    p_geoip_lookup.add_argument(
+        "--db",
+        default=None,
+        help="Path to an .mmdb or GeoIP.dat file "
+        "(default: assets/v1/*.mmdb, then assets/v1/GeoIP.dat).",
+    )
+    p_geoip_lookup.set_defaults(func=_cmd_geoip_lookup)
 
     return parser
 

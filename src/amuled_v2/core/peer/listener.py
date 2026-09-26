@@ -6,8 +6,13 @@ requested shared file against DuckDB state, enqueues the peer on the upload
 queue, and hands the established session to the upload engine for block
 transfer.
 
-Protocol flow (plain, no obfuscation — see ``_expect_plain_or_fail``):
+Protocol flow (see ``_expect_first_packet``):
 
+    0. First wire byte selects the transport mode (EncryptedStreamSocket.cpp
+       Receive ECS_UNKNOWN): 0xE3/0xC5/0xD4 -> plain framing; anything else
+       -> obfuscated accept (BASIC with our userhash, DH fallback — stage X,
+       ``accept_obfuscated_client``).  The first DECRYPTED packet must be
+       OP_HELLO (ListenSocket.cpp:4692 ERR_NOHELLO).
     1. Client connects, first packet must be OP_HELLO (0x01, protocol 0xE3).
     2. Server parses HELLO and replies with OP_HELLOANSWER (0x4C) using
        ``build_hello_answer_payload`` from codec.py.
@@ -22,22 +27,17 @@ Protocol flow (plain, no obfuscation — see ``_expect_plain_or_fail``):
     5. Hand off to UploadSession (engine.py) which drives REQUESTFILENAME,
        HASHSETREQUEST, REQUESTPARTS/REQUESTPARTS_I64, and END_OF_DOWNLOAD.
 
-# WIP by external developer: incoming obfuscation accept (DH / basic obfuscation server-side accept — external session, see docs/Cloud_Prompt_Help_Plz.md)
-
-EncryptedStreamSocket.cpp documents the server-side obfuscation accept:
-  - Incoming first byte is a semi-random non-protocol marker (not 0xE3,
-    0xC5, 0xD4, nor 0xE5).  The server enters ECS_NEGOTIATING, reads the
-    4-byte MAGICVALUE_SYNC (0x835E6FC4), then 3 bytes of
-    (supported, preferred, padding_length), then padding bytes.  RC4 keys
-    are derived from MD5(UserHash_B + MagicValue203 + RandomKeyPart_A).
-    The server replies with MAGICVALUE_SYNC + selected method + padding.
-  - This module does NOT implement that path.  ``_expect_plain_or_fail``
-    accepts only the plain 0xE3 first byte and rejects everything else.
-
 src/amuled_v2/core/peer/listener.py
-Version:     0.1.0
+Version:     0.2.0
 Author:      Soror L.'.L'.
-Updated:     2026-09-24
+Updated:     2026-09-26
+
+Patch Notes v0.2.0 (Soror L'.L'.):
+  [+] Incoming obfuscation accept (stage X): non-protocol first byte now
+      starts the BASIC obfuscation accept from our own userhash with a
+      server-role DH fallback (accept_obfuscated_client); StreamTransport
+      decrypts at the point of consumption and honors decrypted leftovers.
+      The plain 0xE3/0xC5/0xD4 path is unchanged.
 
 Patch Notes v0.1.0 (Soror L.'.L'.):
   [+] Added ListenerError for listener-level failures.
@@ -142,7 +142,10 @@ class LocalIdentity:
 class StreamTransport:
     """asyncio-streams implementation of the UploadTransport protocol.
 
-    # WIP by external developer: incoming obfuscation accept (DH / basic obfuscation server-side accept — external session, see docs/Cloud_Prompt_Help_Plz.md)
+    Supports an optional established obfuscation session (BASIC / DH
+    acceptor output, stage X): ``crypt`` provides ``encrypt()/decrypt()``
+    and ``rx_plain`` carries already-decrypted handshake leftovers that
+    must be consumed exactly once before touching the raw stream.
     """
 
     def __init__(
@@ -153,13 +156,29 @@ class StreamTransport:
         protocol: int = EDONKEY,
         allow_emule_protocol: bool = False,
         idle_timeout: float | None = 300.0,
+        crypt: Any | None = None,
+        rx_plain: bytes = b"",
     ) -> None:
         self._reader = reader
         self._writer = writer
         self._protocol = protocol
         self._allow_emule_protocol = allow_emule_protocol
         self._idle_timeout = idle_timeout
+        self._crypt = crypt
+        self._rx_plain = bytearray(rx_plain)
         self.last_protocol_byte: int = protocol
+
+    async def _read_wire(self, n: int) -> bytes:
+        """Read n WIRE bytes, decrypting at the point of consumption."""
+        take = min(n, len(self._rx_plain))
+        raw = b""
+        if n > take:
+            raw = await self._reader.readexactly(n - take)
+        head = bytes(self._rx_plain[:take])
+        del self._rx_plain[:take]
+        if self._crypt is not None:
+            return head + self._crypt.decrypt(raw)
+        return head + raw
 
     async def recv(self) -> tuple[int, bytes] | None:
         """Receive one framed packet.
@@ -169,16 +188,14 @@ class StreamTransport:
 
         Returns ``(opcode, payload)``.  Returns ``None`` on a clean EOF.
         Stores the last protocol byte on ``self.last_protocol_byte``.
-
-        # WIP by external developer: encrypted transport (BASIC obfuscation / DH) is implemented externally; this transport assumes plain 0xE3 / 0xC5 framing only (external session, see docs/Cloud_Prompt_Help_Plz.md)
         """
         try:
             if self._idle_timeout is not None:
                 header = await asyncio.wait_for(
-                    self._reader.readexactly(6), self._idle_timeout
+                    self._read_wire(6), self._idle_timeout
                 )
             else:
-                header = await self._reader.readexactly(6)
+                header = await self._read_wire(6)
         except asyncio.TimeoutError as exc:
             raise ListenerError(
                 f"idle timeout waiting for packet header: {self._idle_timeout}s"
@@ -217,11 +234,11 @@ class StreamTransport:
             try:
                 if self._idle_timeout is not None:
                     payload = await asyncio.wait_for(
-                        self._reader.readexactly(payload_size),
+                        self._read_wire(payload_size),
                         self._idle_timeout,
                     )
                 else:
-                    payload = await self._reader.readexactly(payload_size)
+                    payload = await self._read_wire(payload_size)
             except asyncio.TimeoutError as exc:
                 raise ListenerError(
                     f"idle timeout waiting for payload: size={payload_size}"
@@ -242,8 +259,6 @@ class StreamTransport:
 
         ``protocol`` overrides the wire protocol byte (e.g. EMULE 0xC5 for
         OP_EMULEINFOANSWER); defaults to this transport's protocol.
-
-        # WIP by external developer: encrypted transport (BASIC obfuscation / DH) is implemented externally; this transport assumes plain 0xE3 / 0xC5 framing only (external session, see docs/Cloud_Prompt_Help_Plz.md)
         """
         if len(payload) > MAX_PACKET_SIZE - 1:
             raise ListenerError(
@@ -255,6 +270,8 @@ class StreamTransport:
             + bytes([opcode])
             + payload
         )
+        if self._crypt is not None:
+            wire = self._crypt.encrypt(wire)
         self._writer.write(wire)
         await self._writer.drain()
 
@@ -351,12 +368,12 @@ class IncomingPeerSession:
     """Handles one incoming peer connection end-to-end.
 
     Steps:
-      a. Wrap streams in StreamTransport.
-      b. _expect_plain_or_fail — accept only plain 0xE3 framing.
-      c. Receive OP_HELLO (0x01), parse, reply with OP_HELLOANSWER (0x4C).
-      d. Pre-engine loop handling OP_EMULEINFO (answer EMULEINFOANSWER) and
+      a. _expect_first_packet — plain 0xE3/0xC5/0xD4 framing or the
+         obfuscation accept (BASIC/DH, stage X).
+      b. Receive OP_HELLO (0x01), parse, reply with OP_HELLOANSWER (0x4C).
+      c. Pre-engine loop handling OP_EMULEINFO (answer EMULEINFOANSWER) and
          OP_STARTUPLOADREQ (queue/resolve/accept decision).
-      e. Hand off to UploadSession for the block transfer loop.
+      d. Hand off to UploadSession for the block transfer loop.
     """
 
     def __init__(
@@ -402,62 +419,95 @@ class IncomingPeerSession:
                 exc,
             )
 
-    async def _expect_plain_or_fail(self) -> tuple[int, bytes]:
-        """Receive the first framed packet, validating the protocol byte.
+    async def _expect_first_packet(self) -> tuple[StreamTransport, int, bytes]:
+        """Consume the first wire byte and establish the transport mode.
 
-        Per EncryptedStreamSocket.cpp Receive (lines 287-324): the server
-        inspects the first protocol byte.  OP_EDONKEYPROT (0xE3) passes
-        through as plain; OP_EMULEPROT (0xC5) is also accepted when
-        ``allow_emule_protocol`` is set (used for EMULEINFO exchanges).  Any
-        other byte (< 0xE3, i.e. not 0xE3/0xC5/0xD4/0xE5) triggers RC4
-        obfuscation negotiation in eMule — we reject it and close.
+        Per EncryptedStreamSocket.cpp Receive (lines 287-324): the
+        acceptor inspects byte 0.  0xE3/0xC5/0xD4 mean plain eDonkey
+        framing; ANY other byte starts the obfuscation accept
+        (BASIC with our own userhash, falling back to server-role DH) —
+        stage X, EncryptedStreamSocket.cpp ONS_BASIC_CLIENTA_*.
 
-        Returns ``(opcode, payload)`` of the first packet for the caller to
-        dispatch (expected to be OP_HELLO).
-
-        # WIP by external developer: incoming obfuscation accept (DH / basic obfuscation server-side accept — external session, see docs/Cloud_Prompt_Help_Plz.md)
+        Returns ``(transport, opcode, payload)`` of the first DECRYPTED
+        packet for the caller to dispatch (must be OP_HELLO per
+        ListenSocket.cpp:4692 ERR_NOHELLO).
         """
-        packet = await self._transport.recv()
-        if packet is None:
+        reader = self._reader
+        assert reader is not None
+        try:
+            first = await asyncio.wait_for(reader.readexactly(1), self._idle_timeout)
+        except asyncio.TimeoutError as exc:
             raise ListenerError(
-                "peer closed before sending first packet"
+                f"idle timeout waiting for first byte: {self._idle_timeout}s"
+            ) from exc
+        except asyncio.IncompleteReadError as exc:
+            raise ListenerError("peer closed before sending first byte") from exc
+        first_byte = first[0]
+
+        writer = self._writer
+        if first_byte in (EDONKEY, EMULE, 0xD4):
+            transport = StreamTransport(
+                reader,
+                writer,
+                protocol=EDONKEY,
+                allow_emule_protocol=True,
+                idle_timeout=self._idle_timeout,
+                rx_plain=first,
             )
+            self._transport = transport
+            log.debug("Plain protocol first byte: peer=%s, byte=0x%02X",
+                      self._peer_name, first_byte)
+        else:
+            from amuled_v2.core.peer.obfuscation import accept_obfuscated_client
+
+            try:
+                crypt_session, leftover = await asyncio.wait_for(
+                    accept_obfuscated_client(
+                        reader,
+                        writer,
+                        self._identity.user_hash,
+                        first_byte,
+                        timeout=15.0,
+                    ),
+                    timeout=20.0,
+                )
+            except Exception as exc:
+                raise ListenerError(
+                    f"obfuscation accept failed: {exc}"
+                ) from exc
+            transport = StreamTransport(
+                reader,
+                writer,
+                protocol=EDONKEY,
+                allow_emule_protocol=True,
+                idle_timeout=self._idle_timeout,
+                crypt=crypt_session,
+                rx_plain=leftover,
+            )
+            self._transport = transport
+            log.info(
+                "Obfuscated incoming connection accepted: peer=%s, mode=%s",
+                self._peer_name,
+                crypt_session.state,
+            )
+
+        packet = await transport.recv()
+        if packet is None:
+            raise ListenerError("peer closed before sending first packet")
         opcode, payload = packet
-        proto = self._transport.last_protocol_byte
+        proto = transport.last_protocol_byte
         if proto != EDONKEY:
-            if proto == EMULE and self._transport._allow_emule_protocol:
+            if proto == EMULE and transport._allow_emule_protocol:
                 pass
             else:
-                log.warning(
-                    "Obfuscated or unsupported protocol byte from peer=%s, "
-                    "protocol=0x%02X, opcode=0x%02X — rejecting (plain-only mode)",
-                    self._peer_name,
-                    proto,
-                    opcode,
-                )
                 raise ListenerError(
-                    f"obfuscated protocol not supported: protocol=0x{proto:02X}"
+                    f"unsupported protocol byte after accept: 0x{proto:02X}"
                 )
-        log.debug(
-            "Plain protocol accepted: peer=%s, protocol=0x%02X, opcode=0x%02X",
-            self._peer_name,
-            proto,
-            opcode,
-        )
-        return opcode, payload
+        return transport, opcode, payload
 
     async def run(self) -> dict[str, Any]:
         started_at = time.monotonic()
-        transport = StreamTransport(
-            self._reader,
-            self._writer,
-            protocol=EDONKEY,
-            allow_emule_protocol=True,
-            idle_timeout=self._idle_timeout,
-        )
-        self._transport = transport
-
-        opcode, payload = await self._expect_plain_or_fail()
+        transport, opcode, payload = await self._expect_first_packet()
         if opcode != C2CTCP.HELLO:
             raise ListenerError(
                 f"expected OP_HELLO (0x01) as first packet, got opcode=0x{opcode:02X}"
@@ -894,7 +944,8 @@ async def _run_upload_engine(
 ) -> UploadSessionStats:
     """Run the UploadSession loop, catching transport errors.
 
-    # WIP by external developer: encrypted transport (BASIC obfuscation / DH) is implemented externally; this session assumes an established transport.
+    The transport may be plain or obfuscated (stage X); the session works
+    with an established transport either way.
     """
     try:
         stats = await session.run()

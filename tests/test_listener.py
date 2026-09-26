@@ -429,3 +429,187 @@ def test_queued_client_promoted_after_slot_frees(tmp_path) -> None:
             await server.close()
 
     _run(scenario())
+
+def _local_hash_bytes() -> bytes:
+    """The listener identity userhash (tests/test_listener._LOCAL_HASH)."""
+    import test_listener as t
+    return bytes.fromhex(t._LOCAL_HASH) if isinstance(t._LOCAL_HASH, str) else bytes(t._LOCAL_HASH)
+
+
+def test_obfuscated_client_downloads_from_listener(tmp_path) -> None:
+    """Stage X acceptance: our live-verified PeerClient dials the listener
+    with BASIC obfuscation; the acceptor completes the handshake and the
+    client downloads the file with a matching MD4."""
+    import hashlib
+
+    from amuled_v2.core.peer.client import PeerClient
+    from amuled_v2.core.hashes.ed2k import ed2k_hash_file
+    from pathlib import Path
+
+    shared = _make_shared_file(tmp_path, size=50_000)
+    source_bytes = Path(shared.path).read_bytes()
+    from Crypto.Hash import MD4
+
+    expected_md4 = MD4.new(source_bytes).hexdigest()
+
+    async def scenario() -> None:
+        from amuled_v2.core.upload.queue import UploadQueue
+
+        resolver = _FakeResolver({shared.file_hash: shared})
+        server = IncomingPeerServer(
+            identity=_identity(0),
+            resolver=resolver,
+            upload_queue=UploadQueue(max_slots=1),
+            host="127.0.0.1",
+            port=0,
+            idle_timeout=15.0,
+        )
+        await server.start()
+        try:
+            blocks: dict[int, bytes] = {}
+            client = PeerClient(
+                "127.0.0.1",
+                server.bound_port,
+                connect_timeout=15.0,
+                response_timeout=20.0,
+                queue_wait_timeout=30.0,
+                target_userhash=_local_hash_bytes(),
+                local_userhash=bytes.fromhex("FEED" * 8),
+            )
+            async with client:
+                await asyncio.wait_for(client.handshake(), timeout=30)
+                await asyncio.wait_for(
+                    client.request_file(shared.file_hash), timeout=30
+                )
+                await asyncio.wait_for(
+                    client.wait_upload_slot(shared.file_hash), timeout=60
+                )
+                outcome = await asyncio.wait_for(
+                    client.transfer(
+                        shared.file_hash,
+                        shared.size,
+                        write_block=lambda s, d: blocks.__setitem__(s, d),
+                    ),
+                    timeout=120,
+                )
+            assert outcome.complete, outcome
+            assembled = bytearray(shared.size)
+            for start, data in blocks.items():
+                assembled[start:start + len(data)] = data
+            assert MD4.new(bytes(assembled)).hexdigest() == expected_md4
+        finally:
+            await server.close()
+
+    _run(scenario())
+
+
+def test_dh_client_accepted_by_listener(tmp_path) -> None:
+    """Stage X: a server-role DH dial is accepted; the acceptor answers
+    g^b and the post-handshake frames decrypt on the DH-derived keys."""
+    import struct as _struct
+
+    from amuled_v2.core.peer.obfuscation import (
+        Rc4Stream,
+        build_dh_request,
+        compute_dh_public_key,
+        generate_dh_private_key,
+    )
+    from amuled_v2.core.codec.binary import BinaryWriter
+
+    async def scenario() -> None:
+        shared = _make_shared_file(tmp_path, size=10_000)
+        resolver = _FakeResolver({shared.file_hash: shared})
+        server = IncomingPeerServer(
+            identity=_identity(0),
+            resolver=resolver,
+            upload_queue=UploadQueue(max_slots=1),
+            host="127.0.0.1",
+            port=0,
+            idle_timeout=15.0,
+        )
+        await server.start()
+        reader = writer = None
+        try:
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", server.bound_port
+            )
+            a = generate_dh_private_key()
+            g_a = compute_dh_public_key(a)
+            request = build_dh_request(g_a)
+            import amuled_v2.core.peer.obfuscation as _obf
+
+            _obf.log.debug(
+                "DH dialer: request=%d, g_a_head=%s, marker=0x%02X",
+                len(request), g_a[:8].hex(), request[0],
+            )
+            writer.write(request)
+            await writer.drain()
+
+            g_b = await asyncio.wait_for(reader.readexactly(96), 15.0)
+            # DH shared secret: g_b^a mod p (big-endian, 96 bytes)
+            from amuled_v2.core.peer.obfuscation import DIFFIE_HELLMAN_PRIME
+
+            secret = pow(int.from_bytes(g_b, "big"), a, DIFFIE_HELLMAN_PRIME)
+            secret_buf = secret.to_bytes(96, "big")
+            import hashlib as _h
+
+            recv_key = _h.md5(secret_buf + bytes((203,))).digest()
+            send_key = _h.md5(secret_buf + bytes((34,))).digest()
+            recv_stream = Rc4Stream(recv_key)
+            send_stream = Rc4Stream(send_key)
+
+            head = recv_stream.crypt(
+                await asyncio.wait_for(reader.readexactly(6), 15.0)
+            )
+            _obf.log.debug(
+                "DH dialer: recv_key=%s, head=%s",
+                recv_key[:4].hex(), head.hex(),
+            )
+            magic = _struct.unpack("<I", head[:4])[0]
+            assert magic == 0x835E6FC4, hex(magic)
+            assert head[4] == 0x00  # ENM_OBFUSCATION selected
+            pad_len = head[5]
+            if pad_len:
+                # Consume the pad THROUGH the recv stream so both sides'
+                # keystreams stay aligned.
+                recv_stream.crypt(
+                    await asyncio.wait_for(reader.readexactly(pad_len), 15.0)
+                )
+
+            # Handshake accepted — send a plain-protocol HELLO through the
+            # DH-encrypted stream and expect HELLOANSWER back.
+            from amuled_v2.core.peer.codec import build_hello_payload
+
+            hello = build_hello_payload(
+                user_hash=bytes.fromhex("BEEF" * 8),
+                client_id=1,
+                client_port=4662,
+                nickname="dh-probe",
+            )
+            w = BinaryWriter()
+            w.write_bytes(
+                bytes([EDONKEY])
+                + _struct.pack("<I", len(hello) + 1)
+                + bytes([C2CTCP.HELLO])
+                + hello
+            )
+            writer.write(send_stream.crypt(w.to_bytes()))
+            await writer.drain()
+            header = recv_stream.crypt(
+                await asyncio.wait_for(reader.readexactly(6), 15.0)
+            )
+            assert header[0] == EDONKEY
+            (length,) = _struct.unpack("<I", header[1:5])
+            payload = recv_stream.crypt(
+                await asyncio.wait_for(reader.readexactly(length - 1), 15.0)
+            )
+            assert header[5] == C2CTCP.HELLOANSWER
+            # Canonical HELLOANSWER: [hashlen u8 = 16][userhash 16]...
+            assert payload[0] == 16
+            assert payload[1:17] == _local_hash_bytes()
+        finally:
+            await server.close()
+            if writer is not None:
+                writer.close()
+
+    _run(scenario())
