@@ -11,14 +11,21 @@ save behavior; the kernel injects its permanent connection and never closes
 it mid-run.
 
 src/amuled_v2/core/kad/spider.py
-Version:     0.1.0
-Author:      Soror L.'.L.'.
-Updated:     2026-09-25
+Version:     0.3.0
+Author:      Soror L.'.L'.
+Updated:     2026-09-27
 
-Patch Notes v0.1.0 (Soror L'.L'.):
-  [+] Ported the kad_spider daemon into SpiderEngine (receiver, strategy
-      batch maturation cycle, bootstrap refresh, pool pruning, snapshot
-      persistence) with injectable StateBackend and stop-event lifecycle.
+Patch Notes v0.3.0 (Soror L'.L'.):
+  [+] Serving-buddy client (stage X): SpiderEngine accepts own buddy TCP
+      port and user hash, instantiates a BuddyCustomer after socket bind,
+      relays its KADEMLIA_FINDSERVINGBUDDY_RES (0x5A) into the receiver
+      loop, spawns run_registration, dials back requesters over plain TCP
+      keeping connections open, and periodically re-requests serving-buddy
+      slots from up to 3 alive nodes every 300 s.
+  [+] Serving-buddy UDP handlers (stage X): KADEMLIA_FINDSERVINGBUDDY_REQ
+      answered with 0x5A when TCP-open and below capacity; 0x52 relayed
+      to the registered served client as OP_CALLBACK via the buddy
+      registry (KademliaUDPListener.cpp:1681-1866).
 """
 
 from __future__ import annotations
@@ -42,12 +49,6 @@ from amuled_v2.core.kad.buddy import (
     KADEMLIA_FINDSERVINGBUDDY_REQ,
 )
 from amuled_v2.core.kad.nodes_dat import load_nodes_dat
-
-# Patch Notes v0.2.0 (Soror L'.L'.):
-#   [+] Serving-buddy UDP handlers (stage X): KADEMLIA_FINDSERVINGBUDDY_REQ
-#       answered with 0x5A when TCP-open and below capacity; 0x52 relayed
-#       to the registered served client as OP_CALLBACK via the buddy
-#       registry (KademliaUDPListener.cpp:1681-1866).
 from amuled_v2.core.kad.obfuscation import decode_obfuscated_kad
 from amuled_v2.core.kad.packets import (
     KADEMLIA2_BOOTSTRAP_RES,
@@ -79,6 +80,8 @@ MAX_POOL = int(os.environ.get("AMULED_KAD_SPIDER_MAX_POOL", "2000"))
 # fail; a node with MAX_NODE_FAILS fails is evicted from the pool.
 HELLO_PING_TIMEOUT_S = float(os.environ.get("AMULED_KAD_SPIDER_REQ_TIMEOUT", "90"))
 MAX_NODE_FAILS = int(os.environ.get("AMULED_KAD_SPIDER_MAX_FAILS", "3"))
+# Stage X serving-buddy: interval between find-serving-buddy requests.
+BUDDY_REQ_INTERVAL_S = 300.0
 
 
 def is_routable_ipv4(ip: str) -> bool:
@@ -172,6 +175,8 @@ class SpiderEngine:
         save_s: float = 60.0,
         bootstrap_every: int = 6,
         verbose: bool = False,
+        buddy_tcp_port: int = 0,
+        buddy_userhash: bytes = b"",
     ) -> None:
         self.root = root
         self.cache_file = root / "db" / "kad_nodes.json"
@@ -205,6 +210,12 @@ class SpiderEngine:
         # swept once a cycle — an entry older than HELLO_PING_TIMEOUT_S
         # without an answer counts as a fail against the node.
         self.hello_sent: Dict[Tuple[str, int], float] = {}
+        # Stage X serving-buddy client state (buddy_customer.py).
+        self.buddy_tcp_port = buddy_tcp_port
+        self.buddy_userhash = buddy_userhash
+        self.buddy_customer = None
+        self._buddy_dial_conns: list = []
+        self._buddy_reg_task: Optional[asyncio.Task] = None
         self.state: Dict[str, Any] = {
             "alive": 0,
             "cycle": 0,
@@ -412,8 +423,24 @@ class SpiderEngine:
 
     # -- lifecycle ----------------------------------------------------------
 
+    async def _buddy_dial_back(self, ip: str, port: int) -> None:
+        """Dial a requester over plain TCP for the buddy session to use.
+
+        The connection is kept open; the requester's listener drives the
+        session — we hold the reference and do not read or close.
+        """
+        try:
+            reader, writer = await asyncio.open_connection(ip, port)
+            self._buddy_dial_conns.append((reader, writer))
+        except OSError as exc:
+            log.warning("buddy dial-back failed: ip=%s port=%d error=%s", ip, port, exc)
+
     async def run(self, stop: asyncio.Event) -> None:
         """Full lifecycle until ``stop`` is set; saves on exit."""
+        from amuled_v2.core.kad.buddy_customer import (
+            KADEMLIA_FINDSERVINGBUDDY_RES,
+            BuddyCustomer,
+        )
         loop = asyncio.get_running_loop()
         self._bind_socket()
         sock = self.sock
@@ -423,6 +450,14 @@ class SpiderEngine:
         state["last_save"] = time.time()
         kadabra = self.kadabra
         strategy = get_strategy(self.strategy_name)
+
+        if self.buddy_tcp_port and self.buddy_userhash:
+            self.buddy_customer = BuddyCustomer(
+                self.own.to_bytes(),
+                self.buddy_userhash,
+                self.buddy_tcp_port,
+                dial_back=self._buddy_dial_back,
+            )
 
         async def receiver() -> None:
             while not stop.is_set():
@@ -504,6 +539,27 @@ class SpiderEngine:
                         continue
                     buddy_registry.relay_op_callback(
                         ucheck, fh, addr[0], req_tcp
+                    )
+                    continue
+                if op == KADEMLIA_FINDSERVINGBUDDY_RES:
+                    # Buddy RES (0x5A) — we were accepted as a served client.
+                    # (buddy_customer.py on_res)
+                    if self.buddy_customer is None:
+                        continue
+                    accepted = self.buddy_customer.on_res(payload, addr[0])
+                    if not accepted:
+                        continue
+                    if self._buddy_reg_task is None or self._buddy_reg_task.done():
+                        self._buddy_reg_task = asyncio.create_task(
+                            self.buddy_customer.run_registration(
+                                connect=asyncio.open_connection,
+                                stop=stop,
+                            )
+                        )
+                    log.info(
+                        "KAD buddy customer accepted: buddy=%s:%d",
+                        self.buddy_customer.buddy_ip,
+                        self.buddy_customer.buddy_tcp_port,
                     )
                     continue
                 if op == KADEMLIA2_HELLO_RES:
@@ -685,6 +741,29 @@ class SpiderEngine:
                     self.save_snapshot()
                     save_kadabra_state(kadabra, self.root, decay_factor=0.95)
                     state["last_save"] = time.time()
+
+                # Stage X serving-buddy: re-request a buddy slot every
+                # BUDDY_REQ_INTERVAL_S when we have none yet.
+                if (
+                    self.buddy_customer is not None
+                    and self.buddy_customer.buddy_ip is None
+                ):
+                    req_now = time.time()
+                    if req_now >= state.get("last_buddy_req", 0.0) + BUDDY_REQ_INTERVAL_S:
+                        targets = [
+                            key for key, r in list(nodes.items())
+                            if r["hellos"] > 0
+                        ][:3]
+                        for (b_ip, b_port) in targets:
+                            await sendto(
+                                self.buddy_customer.build_find_serving_buddy_req(),
+                                b_ip, b_port,
+                            )
+                        state["last_buddy_req"] = req_now
+                        log.debug(
+                            "buddy find-serving request sent: targets=%d",
+                            len(targets),
+                        )
 
                 state["cycle"] += 1
                 state["hot_stats"] = self._hot_stats()
