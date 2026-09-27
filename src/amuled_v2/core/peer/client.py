@@ -14,9 +14,28 @@ Implements the eMule-compatible download flow against one remote client:
    or the peer sends ``OP_END_OF_DOWNLOAD``.
 
 src/amuled_v2/core/peer/client.py
-Version:     0.3.0
+Version:     0.6.0
 Author:      Soror L.'.L.'.
-Updated:     2026-09-26
+Updated:     2026-09-27
+
+Patch Notes v0.6.0 (Soror L'.L'.):
+  [+] transfer(start_offset, end_offset): stripe scheduling — a racing
+      peer downloads only its disjoint region; write offsets stay
+      absolute, the queue gap list remains the completion source of
+      truth.  Before: every racing peer redundantly downloaded from
+      offset 0.
+
+Patch Notes v0.5.0 (Soror L'.L'.):
+  [+] Source exchange requester (stage X): request_sources() — SX2 when
+      the peer advertises miso2 bit 10 (new codec helper
+      miso2_source_exchange_v2, tag 0xFE) or SX1 nibble > 1, legacy
+      OP_REQUESTSOURCES for SX1 == 1; OP_ANSWERSOURCES(2) collected in
+      the wait/transfer receive loops (peer_tags now retained).
+
+Patch Notes v0.4.0 (Soror L'.L'.):
+  [+] AICH requester: request_aich() — OP_AICHREQUEST over the session
+      with the responder's master gate, OP_AICHANSWER parsing (client
+      side of stage X; recovery verification lives in hashes/aich.py).
 
 Patch Notes v0.3.0 (Soror L'.L'.):
   [+] BASIC-obfuscation session wired into the transport (block 11e #6,
@@ -75,6 +94,10 @@ from amuled_v2.core.peer.codec import (
     parse_publickey_payload,
     parse_signature_payload,
     miso1_secident_support,
+    build_aich_request_payload,
+    parse_aich_answer_payload,
+    parse_answer_sources,
+    parse_answer_sources2,
 )
 from amuled_v2.core.peer.obfuscation import (
     BasicObfuscationSession,
@@ -270,6 +293,10 @@ class PeerClient:
         self._writer: Optional[asyncio.StreamWriter] = None
         self.connected = False
         self.peer_info: Optional[PeerInfo] = None
+        # Stage X source exchange (requester): peer hello tags and sources
+        # collected from OP_ANSWERSOURCES(2) during the session.
+        self.peer_tags: tuple = ()
+        self.collected_sources: list = []
         # eMule marks every generated userhash with SO_EMULE markers
         # (Preferences.cpp::CreateUserHash: hash[5]=14, hash[14]=111);
         # GetHashType uses them to classify the client.  A plain random
@@ -691,7 +718,77 @@ class PeerClient:
         if peer is None:
             raise PeerSessionError("peer handshake finished without HELLOANSWER")
         self.peer_info = peer
+        self.peer_tags = peer_tags
         return peer
+
+    # -- source exchange (requester; stage X) ---------------------------------
+
+    async def request_sources(
+        self, file_hash: bytes, *, sx_options: int = 0
+    ) -> None:
+        """Ask a source-exchange-capable peer for sources of file_hash.
+
+        SX2 (OP_REQUESTSOURCES2) when the peer advertises the miso2 bit 10
+        or an SX1 nibble > 1; legacy OP_REQUESTSOURCES for SX1 == 1.
+        Answers arrive asynchronously — collected into
+        ``self.collected_sources`` by the receive loops.
+        """
+        from amuled_v2.core.peer.codec import (
+            build_request_sources2_payload,
+            build_request_sources_payload,
+            miso1_source_exchange,
+            miso2_source_exchange_v2,
+        )
+
+        sx1 = miso1_source_exchange(self.peer_tags)
+        sx2 = miso2_source_exchange_v2(self.peer_tags)
+        if sx2 or sx1 > 1:
+            await self._send(
+                EMULE_PROTOCOL,
+                C2CEMULE.REQUESTSOURCES2,
+                build_request_sources2_payload(2, sx_options, file_hash),
+            )
+            log.info(
+                "PEER source exchange requested (SX2): host=%s:%d, hash=%s",
+                self.host, self.port, file_hash.hex().upper(),
+            )
+        elif sx1 == 1:
+            await self._send(
+                EMULE_PROTOCOL,
+                C2CEMULE.REQUESTSOURCES,
+                build_request_sources_payload(file_hash),
+            )
+            log.info(
+                "PEER source exchange requested (SX1): host=%s:%d, hash=%s",
+                self.host, self.port, file_hash.hex().upper(),
+            )
+        else:
+            log.debug(
+                "PEER source exchange skipped (peer lacks SX): host=%s:%d",
+                self.host, self.port,
+            )
+
+    def _collect_answer_sources(
+        self, protocol: int, opcode: int, payload: bytes
+    ) -> bool:
+        """Collect OP_ANSWERSOURCES(2) if this packet is one; True when
+        handled.  Entries land in ``self.collected_sources``."""
+        if protocol != EMULE_PROTOCOL:
+            return False
+        if opcode == C2CEMULE.ANSWERSOURCES2:
+            _, file_hash, entries = parse_answer_sources2(payload)
+        elif opcode == C2CEMULE.ANSWERSOURCES:
+            _, file_hash, entries = parse_answer_sources(payload)
+        else:
+            return False
+        self.collected_sources.extend(entries)
+        log.info(
+            "PEER source exchange answer: host=%s:%d, hash=%s, "
+            "entries=%d (total=%d)",
+            self.host, self.port, file_hash.hex().upper(),
+            len(entries), len(self.collected_sources),
+        )
+        return True
 
     # -- file request and queue ----------------------------------------------
 
@@ -755,6 +852,56 @@ class PeerClient:
                 opcode,
             )
 
+    async def request_aich(
+        self,
+        file_hash: bytes,
+        part: int,
+        known_master: bytes,
+        *,
+        timeout: float = 10.0,
+    ) -> tuple[bytes, int, bytes, bytes]:
+        """AICH requester (stage X; SHAHashSet.cpp
+        CAICHRecoveryHashSet::RequestAICHRecovery): send OP_AICHREQUEST
+        and wait for OP_AICHANSWER.
+
+        Returns (file_hash, part, master, recovery_data).  The known
+        master gates the responder (mismatch is silently ignored —
+        anti-poison per SHAHashSet.cpp:766-771), so a client without a
+        trusted master first learns it from a source that advertises
+        AICH and verifies it against the completed download.
+        """
+        await self._send(
+            EMULE_PROTOCOL,
+            C2CEMULE.AICHREQUEST,
+            build_aich_request_payload(file_hash, part, known_master),
+        )
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PeerSessionError("timed out waiting for AICHANSWER")
+            packet = await self._receive(timeout=remaining)
+            if packet is None:
+                raise PeerSessionError("peer request window timed out (AICH)")
+            protocol, opcode, payload = packet
+            if protocol == EMULE_PROTOCOL and opcode == C2CEMULE.AICHANSWER:
+                answer = parse_aich_answer_payload(payload)
+                log.info(
+                    "PEER AICH answer: hash=%s, part=%d, master=%s, "
+                    "recovery=%d",
+                    answer[0].hex().upper(),
+                    answer[1],
+                    answer[2].hex(),
+                    len(answer[3]),
+                )
+                return answer
+            log.debug(
+                "PEER ignoring packet while awaiting AICHANSWER: "
+                "protocol=0x%02X, opcode=0x%02X",
+                protocol,
+                opcode,
+            )
+
     async def wait_upload_slot(
         self,
         file_hash: bytes,
@@ -780,6 +927,7 @@ class PeerClient:
                 continue
             protocol, opcode, payload = packet
             if protocol != EDONKEY:
+                self._collect_answer_sources(protocol, opcode, payload)
                 continue
             if opcode == C2CTCP.ACCEPTUPLOADREQ:
                 log.info(
@@ -836,12 +984,16 @@ class PeerClient:
         write_block: Callable[[int, bytes], None],
         progress_callback: Optional[Callable[[int, int, int], None]] = None,
         max_blocks: int = 100_000,
+        start_offset: int = 0,
+        end_offset: Optional[int] = None,
     ) -> DownloadOutcome:
         """Run the request-parts / sending-part loop until completion.
 
         ``write_block(start, data)`` receives every verified block (already
         decompressed).  ``progress_callback(received_bytes, total_size,
-        blocks)`` fires after each block.
+        blocks)`` fires after each block.  ``start_offset``/``end_offset``
+        bound the region this session downloads (stripe scheduling); write
+        offsets remain absolute.
         """
         started = time.monotonic()
         # ВАЖНО (на это уже нарывались): OP_ACCEPTUPLOADREQ — серверный
@@ -853,13 +1005,23 @@ class PeerClient:
         received = 0
         blocks = 0
         compressed = self.peer_info.compression if self.peer_info else False
+        # Stripe scheduling (stage X): the runner hands each racing peer a
+        # disjoint region [start_offset, end_offset); ranges are requested
+        # inside it and write_block receives ABSOLUTE file offsets, so the
+        # queue's gap list stays the source of truth for completion.
+        base_offset = start_offset
+        bound = total_size if end_offset is None else end_offset
 
         def _remaining_sink() -> list[tuple[int, int]]:
             try:
-                remaining = total_size - received
+                remaining = bound - (base_offset + received)
             except Exception:
                 return []
-            return [(0, min(remaining, total_size))] if remaining > 0 else []
+            return (
+                [(base_offset + received, base_offset + received + remaining)]
+                if remaining > 0
+                else []
+            )
 
         # COMPRESSEDPART reassembly buffer: eMule splits a compressed block
         # into sub-packets where every sub-packet repeats the BLOCK start and
@@ -870,13 +1032,17 @@ class PeerClient:
         outofpart_retries = 0
 
         while blocks < max_blocks:
-            if received >= total_size:
+            if base_offset + received >= bound:
                 break
             starts, ends = [], []
-            for offset in (received, received + EMBLOCK_SIZE, received + 2 * EMBLOCK_SIZE):
-                if offset >= total_size:
+            for offset in (
+                base_offset + received,
+                base_offset + received + EMBLOCK_SIZE,
+                base_offset + received + 2 * EMBLOCK_SIZE,
+            ):
+                if offset >= bound:
                     break
-                end = min(offset + EMBLOCK_SIZE, total_size)
+                end = min(offset + EMBLOCK_SIZE, bound)
                 starts.append(offset)
                 ends.append(end)
             if not starts:
@@ -930,7 +1096,7 @@ class PeerClient:
                         file_hash=file_hash.hex().upper(),
                         bytes_received=received,
                         blocks_received=blocks,
-                        complete=received >= total_size,
+                        complete=base_offset + received >= bound,
                         elapsed=time.monotonic() - started,
                         detail="idle timeout while transferring",
                     )
@@ -1010,7 +1176,7 @@ class PeerClient:
                             file_hash=file_hash.hex().upper(),
                             bytes_received=received,
                             blocks_received=blocks,
-                            complete=received >= total_size,
+                            complete=base_offset + received >= bound,
                             elapsed=time.monotonic() - started,
                             detail="peer has no more parts",
                         )
@@ -1037,12 +1203,14 @@ class PeerClient:
                         file_hash=file_hash.hex().upper(),
                         bytes_received=received,
                         blocks_received=blocks,
-                        complete=received >= total_size,
+                        complete=base_offset + received >= bound,
                         elapsed=time.monotonic() - started,
                         detail="moved back to queue",
                     )
                     return outcome
                 else:
+                    if self._collect_answer_sources(protocol, opcode, payload):
+                        continue
                     log.debug(
                         "PEER ignoring packet during transfer: opcode=0x%02X",
                         opcode,
@@ -1059,10 +1227,10 @@ class PeerClient:
                     except Exception:
                         pass
                 expected_bytes -= len(part.data)
-            if received >= total_size:
+            if base_offset + received >= bound:
                 break
 
-        complete = received >= total_size
+        complete = base_offset + received >= bound
         self._maybe_credit_downloaded(received)
         outcome = DownloadOutcome(
             file_hash=file_hash.hex().upper(),

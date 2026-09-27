@@ -553,6 +553,12 @@ class AmuleDKernel:
         self._tcp_port = self.server.bound_port
         # The HELLOANSWER must advertise the port that is actually listening.
         self.server._identity = identity.to_local_identity(tcp_port=self._tcp_port)
+        # Serving-buddy registry: the KAD spider answers
+        # KADEMLIA_FINDSERVINGBUDDY_REQ with this TCP port; the listener
+        # registers served clients into the same table (stage X).
+        from amuled_v2.core.kad.buddy import buddy_registry
+
+        buddy_registry.configure(tcp_port=self._tcp_port)
 
         if not self.args.no_spider:
             self.spider = SpiderEngine(

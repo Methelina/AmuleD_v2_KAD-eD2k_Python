@@ -8,9 +8,30 @@ part file via ``record_block`` and completion is finalized only when a
 peer delivers the whole file.
 
 src/amuled_v2/core/download/runner.py
-Version:     0.2.0
+Version:     0.5.0
 Author:      Soror L.'.L.'.
-Updated:     2026-09-26
+Updated:     2026-09-27
+
+Patch Notes v0.5.0 (Soror L'.L'.):
+  [+] Stripe scheduling: racing peers get disjoint file regions
+      (region = ceil(size/peers)); peer i downloads [i*region,
+      min(size, (i+1)*region)).  Queue gap list decides completion; the
+      outcome "complete" is now region-complete, winner selection falls
+      back to the last attempt as before.
+  [+] Buddy/direct callback: expect_connection_from started as a task
+      BEFORE the UDP callback request — dial-backs race the wait and
+      previously fell through to normal sessions when unclaimed.
+
+Patch Notes v0.4.0 (Soror L'.L'.):
+  [+] AICH requester audit (stage X): after a complete transfer the
+      runner cross-checks the AICH master with the peer (recovery walk)
+      and stores the verified master in state (aich_masters, migration
+      10) — seed for corrupt-part salvage; aich_audit flag.
+
+Patch Notes v0.3.0 (Soror L'.L'.):
+  [+] kad3/kad5: after the 12 s buddy-callback timeout fall through to
+      the NAT-T rendezvous path (uTP stream adopted as a downloader
+      PeerClient; session kept alive via a closer callback).
 
 Patch Notes v0.2.0 (Soror L'.L'.):
   [+] Parallel peer attempts (race semantics): up to max_peers peers run
@@ -93,6 +114,7 @@ class DownloadRunner:
         secure_ident: "Any | None" = None,
         connection_source: "Callable[[str, float], Any] | None" = None,
         callback_identity: "dict[str, Any] | None" = None,
+        aich_audit: bool = True,
     ) -> None:
         self.queue = queue
         self.local_client_id = local_client_id
@@ -120,6 +142,11 @@ class DownloadRunner:
         # ``callback_identity`` = {"tcp_port": int, "user_hash": bytes}.
         self.connection_source = connection_source
         self.callback_identity = callback_identity
+        # AICH requester (stage X): after a complete transfer, cross-check
+        # the AICH master with the peer and store the verified master in
+        # state (aich_masters, migration 10) — seed for corrupt-part
+        # salvage.
+        self.aich_audit = aich_audit
 
     def resolve_sources(
         self, file_hash: str, *, limit: int = 20
@@ -190,6 +217,8 @@ class DownloadRunner:
         size: int,
         file_hash_bytes: bytes,
         progress_callback: Callable[[int, int, int], None] | None,
+        start_offset: int = 0,
+        end_offset: int | None = None,
     ) -> dict:
         """Drive one peer through the full download ladder; return an
         outcome dict (never raises — failures become outcome dicts)."""
@@ -199,6 +228,7 @@ class DownloadRunner:
         source_type = str(endpoint.get("source_type") or "")
         outcome: "DownloadOutcome | None" = None
         client = None
+        closers: list[Callable[[], Any]] = []
         try:
             from amuled_v2.core.peer.client import PeerClient
 
@@ -214,9 +244,11 @@ class DownloadRunner:
                         "detail": "direct-callback: no inbound connection",
                     }
             elif source_type in ("kad3", "kad5"):
-                client = await self._connect_via_buddy_callback(
+                client, extra_close = await self._connect_via_buddy_callback(
                     endpoint, file_hash_bytes
                 )
+                if extra_close is not None:
+                    closers.append(extra_close)
                 if client is None:
                     return {
                         "file_hash": file_hash,
@@ -224,7 +256,7 @@ class DownloadRunner:
                         "blocks_received": 0,
                         "complete": False,
                         "elapsed": 0.0,
-                        "detail": "buddy-callback: no inbound connection",
+                        "detail": "buddy-callback/rendezvous: no connection",
                     }
             else:
                 client = PeerClient(
@@ -243,6 +275,15 @@ class DownloadRunner:
                 await client.connect()
             await client.handshake()
             await client.request_file(file_hash_bytes)
+            try:
+                # Stage X source exchange: ask the peer for additional
+                # sources; answers are collected asynchronously and
+                # persisted in the finally block below.
+                await client.request_sources(file_hash_bytes)
+            except Exception as exc:
+                log.debug(
+                    "DOWNLOAD source exchange request failed: error=%s", exc
+                )
             await client.wait_upload_slot(file_hash_bytes)
             outcome = await client.transfer(
                 file_hash_bytes,
@@ -251,7 +292,23 @@ class DownloadRunner:
                     file_hash, start, data
                 ),
                 progress_callback=progress_callback,
+                start_offset=start_offset,
+                end_offset=end_offset,
             )
+            if outcome.complete and start_offset == 0 and self.aich_audit:
+                # AICH audit (stage X): the file just completed with MD4
+                # pending; verify the AICH tree against the peer and store
+                # the recovery-verified master for future salvage.  Must
+                # never break the download itself.
+                try:
+                    await self._aich_audit(
+                        client, file_hash, file_hash_bytes, size
+                    )
+                except Exception as exc:
+                    log.debug(
+                        "DOWNLOAD AICH audit skipped: hash=%s, error=%s",
+                        file_hash, exc,
+                    )
             return outcome.to_dict()
         except Exception as exc:
             log.warning(
@@ -270,19 +327,117 @@ class DownloadRunner:
             }
         finally:
             if client is not None:
+                try:
+                    self._persist_collected_sources(client, file_hash_bytes)
+                except Exception:
+                    pass
                 await client.close()
+            for closer in closers:
+                try:
+                    closer()
+                except Exception:
+                    pass
+
+    def _persist_collected_sources(
+        self, client: Any, file_hash_bytes: bytes
+    ) -> None:
+        """Persist sources learned via source exchange (stage X)."""
+        entries = getattr(client, "collected_sources", None)
+        if not entries:
+            return
+        from amuled_v2.core.ed2k.server_client import (
+            FoundSource,
+            FoundSources,
+        )
+
+        sources = tuple(
+            FoundSource(
+                client_id=s.client_id,
+                client_port=s.port,
+                user_hash=s.user_hash,
+            )
+            for s in entries
+        )
+        record = FoundSources(file_hash=file_hash_bytes, sources=sources)
+        self.queue.state.save_found_sources(
+            record, server_ip="0.0.0.0", server_port=0, source_type="sx"
+        )
+        log.info(
+            "DOWNLOAD source-exchange sources saved: hash=%s, count=%d",
+            file_hash_bytes.hex().upper(),
+            len(sources),
+        )
+
+    async def _aich_audit(
+        self,
+        client,
+        file_hash: str,
+        file_hash_bytes: bytes,
+        size: int,
+    ) -> None:
+        """AICH requester audit (stage X; SHAHashSet.cpp UntrustedHashReceived
+        seed): cross-check the freshly downloaded file's AICH master with
+        the peer and store the recovery-verified master hash."""
+        from amuled_v2.core.codec.constants import PARTSIZE
+        from amuled_v2.core.hashes.aich import (
+            aich_hash_file,
+            aich_rebuild_master_from_part,
+        )
+
+        entry = self.queue.get(file_hash)
+        if entry is None:
+            return
+        part_path = str(entry["part_path"])
+        result = aich_hash_file(part_path)
+        master = result.master_hash
+        parts = (size + PARTSIZE - 1) // PARTSIZE
+        if parts > 1:
+            # Peer cross-check: recovery data must rebuild our master from
+            # part 0's bytes (the responder's master gate requires the
+            # known master, which we just computed ourselves).
+            got_hash, got_part, peer_master, recovery = (
+                await client.request_aich(file_hash_bytes, 0, master)
+            )
+            if got_hash != file_hash_bytes or peer_master != master:
+                log.warning(
+                    "DOWNLOAD AICH master mismatch: hash=%s, ours=%s, "
+                    "peer=%s",
+                    file_hash, master.hex(), peer_master.hex(),
+                )
+                return
+            with open(part_path, "rb") as handle:
+                part_data = handle.read(PARTSIZE)
+            rebuilt = aich_rebuild_master_from_part(
+                part_data, 0, recovery, size
+            )
+            if rebuilt != master:
+                log.warning(
+                    "DOWNLOAD AICH recovery rebuild mismatch: hash=%s",
+                    file_hash,
+                )
+                return
+        self.queue.state.save_aich_master(file_hash, master)
+        log.info(
+            "DOWNLOAD AICH master stored: hash=%s, master=%s, parts=%d",
+            file_hash, master.hex(), parts,
+        )
 
     async def _connect_via_buddy_callback(
         self, endpoint: dict[str, Any], file_hash_bytes: bytes
     ):
         """KAD type-3/5 firewalled source: ask its serving buddy to relay a
         callback (KADEMLIA_CALLBACK_REQ), then adopt the inbound connection
-        the firewalled source makes to us."""
+        the firewalled source makes to us.
+
+        After the 12 s buddy-callback fallback timeout (eMule
+        BaseClient.cpp:3091-3257 — the double-firewalled case cannot
+        relay a TCP callback), fall through to the NAT-T rendezvous path
+        over punched UDP.  Returns (PeerClient | None, closer | None)."""
         from amuled_v2.core.kad.direct_callback import send_kad_callback_req
 
         if self.connection_source is None or not self.callback_identity:
             log.debug("DOWNLOAD buddy-callback unavailable: no listener wiring")
-            return None
+            return None, None
         raw_buddy_id = endpoint.get("buddy_id")
         buddy_ip = endpoint.get("buddy_ip")
         try:
@@ -295,23 +450,93 @@ class DownloadRunner:
                 "DOWNLOAD buddy-callback skipped (no buddy address): %s",
                 endpoint.get("host"),
             )
-            return None
+            return None, None
         ident = self.callback_identity
-        await send_kad_callback_req(
-            buddy_ip,
-            buddy_port,
-            buddy_id,
-            file_hash_bytes,
-            int(ident["tcp_port"]),
+        # Start waiting for the inbound TCP callback BEFORE the UDP request
+        # goes out — dial-backs race the wait (client dials within ms).
+        waiter = asyncio.create_task(
+            self.connection_source(endpoint["host"], 12.0)
         )
-        reader, writer = await self.connection_source(
-            endpoint["host"], 20.0
-        )
+        try:
+            await send_kad_callback_req(
+                buddy_ip,
+                buddy_port,
+                buddy_id,
+                file_hash_bytes,
+                int(ident["tcp_port"]),
+            )
+            try:
+                reader, writer = await waiter
+            except (asyncio.TimeoutError, TimeoutError):
+                log.info(
+                    "DOWNLOAD buddy-callback timed out (12s), trying "
+                    "rendezvous: %s",
+                    endpoint.get("host"),
+                )
+                return await self._connect_via_rendezvous(
+                    endpoint, file_hash_bytes, buddy_id, buddy_ip, buddy_port
+                )
+        except BaseException:
+            waiter.cancel()
+            raise
         from amuled_v2.core.peer.client import PeerClient
 
-        return PeerClient.adopt_connection(
-            reader,
-            writer,
+        return (
+            PeerClient.adopt_connection(
+                reader,
+                writer,
+                local_client_id=self.local_client_id,
+                local_port=int(ident["tcp_port"]),
+                nickname=self.nickname,
+                local_userhash=bytes(ident["user_hash"]),
+                secure_ident=self.secure_ident,
+                traffic_sink=self.traffic_sink,
+            ),
+            None,
+        )
+
+    async def _connect_via_rendezvous(
+        self,
+        endpoint: dict[str, Any],
+        file_hash_bytes: bytes,
+        buddy_id: bytes,
+        buddy_ip: str,
+        buddy_port: int,
+    ):
+        """NAT-T rendezvous (double-firewalled): punch UDP to the source
+        via its buddy, run the CAPS exchange and bring up a uTP stream,
+        then adopt it as a downloader PeerClient."""
+        from amuled_v2.core.natt.session import NattUdpSession, ip_to_u32
+
+        ident = self.callback_identity
+        target_hash = endpoint.get("user_hash")
+        session = NattUdpSession(bytes(ident["user_hash"]))
+        await session.start()
+        try:
+            stream = await session.rendezvous_connect(
+                buddy_host=buddy_ip,
+                buddy_port=buddy_port,
+                buddy_id=buddy_id,
+                target_user_hash=bytes(target_hash),
+                file_hash=file_hash_bytes,
+                our_ext_ip=int(ident.get("ext_ip") or 0),
+                target_addr=(
+                    endpoint["host"],
+                    int(endpoint.get("kad_udp_port") or 0),
+                ),
+            )
+        except Exception as exc:
+            session.close()
+            log.info(
+                "DOWNLOAD rendezvous failed: peer=%s, error=%s",
+                endpoint.get("host"), exc,
+            )
+            return None, None
+        from amuled_v2.core.peer.client import PeerClient
+
+        client = PeerClient.adopt_connection(
+            stream.reader(),
+            stream.writer(),
             local_client_id=self.local_client_id,
             local_port=int(ident["tcp_port"]),
             nickname=self.nickname,
@@ -319,6 +544,7 @@ class DownloadRunner:
             secure_ident=self.secure_ident,
             traffic_sink=self.traffic_sink,
         )
+        return client, session.close
 
     async def _connect_via_direct_callback(self, endpoint: dict[str, Any]):
         """KAD type-6 firewalled source: ask it to TCP-connect back, then
@@ -336,14 +562,20 @@ class DownloadRunner:
             )
             return None
         ident = self.callback_identity
-        await send_direct_callback_req(
-            host,
-            kad_port,
-            int(ident["tcp_port"]),
-            bytes(ident["user_hash"]),
-            connect_options=3,
-        )
-        reader, writer = await self.connection_source(host, 15.0)
+        # Waiter task BEFORE the UDP request (dial-backs race the wait).
+        waiter = asyncio.create_task(self.connection_source(host, 15.0))
+        try:
+            await send_direct_callback_req(
+                host,
+                kad_port,
+                int(ident["tcp_port"]),
+                bytes(ident["user_hash"]),
+                connect_options=3,
+            )
+            reader, writer = await waiter
+        except BaseException:
+            waiter.cancel()
+            raise
         from amuled_v2.core.peer.client import PeerClient
 
         return PeerClient.adopt_connection(
@@ -383,19 +615,29 @@ class DownloadRunner:
         file_hash_bytes = bytes.fromhex(str(entry["hash"]))
         size = int(entry["size"])
         endpoints = sources[: self.max_peers]
+        # Stripe scheduling (stage X): every racing peer gets a disjoint
+        # region so parallel peers stop downloading identical bytes.  The
+        # queue's gap list stays the completion source of truth.
+        region = (size + len(endpoints) - 1) // len(endpoints)
         log.info(
-            "DOWNLOAD race start: hash=%s, peers=%d",
-            file_hash, len(endpoints),
+            "DOWNLOAD race start: hash=%s, peers=%d, stripe=%d",
+            file_hash, len(endpoints), region,
         )
 
         tasks = {
             asyncio.create_task(
                 self._attempt_peer(
-                    endpoint, file_hash, size, file_hash_bytes, progress_callback
+                    endpoint,
+                    file_hash,
+                    size,
+                    file_hash_bytes,
+                    progress_callback,
+                    start_offset=index * region,
+                    end_offset=min(size, (index + 1) * region),
                 ),
                 name=f"dl-peer-{endpoint['host']}:{endpoint['port']}",
             ): endpoint
-            for endpoint in endpoints
+            for index, endpoint in enumerate(endpoints)
         }
         attempts: list[dict] = []
         pending = set(tasks)

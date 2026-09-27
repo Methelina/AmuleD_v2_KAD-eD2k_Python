@@ -8,9 +8,16 @@ the firewalled source then makes an OUTBOUND TCP connection to us, which
 the download side accepts on our advertised port.
 
 src/amuled_v2/core/kad/direct_callback.py
-Version:     0.1.0
+Version:     0.2.0
 Author:      Soror L.'.L.'.
 Updated:     2026-09-27
+
+Patch Notes v0.2.0 (Soror L'.L'.):
+  [+] Rendezvous payload wire-diff fixes (BaseClient.cpp:3147-3196):
+      requester IP in network byte order (:3180 htonl), endpoint tail
+      omitted when ip/port are zero (:3190), transport byte is the
+      NATT_TRANSPORT_* enum (UTP=2 per live log), connect-options
+      constant table for NATT_TRANSPORT_*.
 
 Patch Notes v0.1.0 (Soror L'.L'.):
   [+] OP_DIRECTCALLBACKREQ builder/parser + async UDP sender (stage X).
@@ -42,6 +49,9 @@ REASK_CALLBACK_UDP_OPCODE = 0x94  # Opcodes.h:449 (NAT-T rendezvous request)
 RENDEZVOUS_MARKER = 0xA0  # Opcodes.h:705/704
 CONNECT_OPT_NATT_ENDPOINT_HINT = 0x20  # Opcodes.h:219
 CONNECT_OPT_NAT_TRAVERSAL_UTP = 0x80  # Opcodes.h:221
+NATT_TRANSPORT_NONE = 0  # enum ENatTraversalTransport (live log: UTP=2)
+NATT_TRANSPORT_QUIC = 1
+NATT_TRANSPORT_UTP = 2
 CLIENT_UDP_PROTOCOL = 0xC5
 
 
@@ -210,21 +220,33 @@ def build_rendezvous_req_payload(
     our_ext_udp_port: int,
     transport_hint: int,
 ) -> bytes:
-    """BaseClient.cpp:3147-3196 payload layout (LE where applicable)."""
+    """BaseClient.cpp:3147-3196 payload layout (LE where applicable).
+
+    The requester endpoint tail [ip u32][port u16][transport u8] is only
+    appended when BOTH ip and port are nonzero (:3190) — and the IP goes
+    out in NETWORK byte order (:3180 applies htonl before the LE
+    WriteUInt32).  The transport byte is a NATT_TRANSPORT_* ENUM
+    (NONE=0, QUIC=1, UTP=2 — live log shows transportHint=2 while pinned
+    to uTP), NOT a CONNECT_OPT_* flag byte.
+    """
     if len(buddy_id) != 16 or len(our_user_hash) != 16 or len(file_hash) != 16:
         raise ValueError("rendezvous payload needs three 16-byte ids")
     opts = (connect_options | CONNECT_OPT_NATT_ENDPOINT_HINT) & 0xFF
-    hint = transport_hint | CONNECT_OPT_NAT_TRAVERSAL_UTP
-    return (
+    payload = (
         bytes(buddy_id)
         + b"\x00" * 16
         + bytes((RENDEZVOUS_MARKER,))
         + bytes(our_user_hash)
         + bytes((opts,))
         + bytes(file_hash)
-        + struct.pack("<IH", our_ext_ip & 0xFFFFFFFF, our_ext_udp_port & 0xFFFF)
-        + bytes((hint,))
     )
+    if our_ext_ip and our_ext_udp_port:
+        payload += (
+            struct.pack(">I", our_ext_ip & 0xFFFFFFFF)  # htonl, :3180
+            + struct.pack("<H", our_ext_udp_port & 0xFFFF)
+            + bytes((transport_hint & 0xFF,))
+        )
+    return payload
 
 
 async def send_rendezvous_req(

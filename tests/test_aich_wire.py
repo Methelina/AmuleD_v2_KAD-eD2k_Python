@@ -292,3 +292,72 @@ def test_aich_recovery_data_layout_small_file() -> None:
     (count1,) = struct.unpack("<H", recovery[:2])
     assert count1 == 3  # three blocks, no siblings
     assert struct.unpack("<H", recovery[-2:])[0] == 0
+
+
+def test_aich_client_request_aich_loopback(tmp_path) -> None:
+    """PeerClient.request_aich against the live responder: the client
+    sends OP_AICHREQUEST over an adopted-style session and the answer's
+    recovery data must reconstruct the master from the part bytes
+    (aich_rebuild_master_from_part, client requester side)."""
+    from amuled_v2.core.peer.client import PeerClient
+    from amuled_v2.core.hashes.aich import aich_rebuild_master_from_part
+
+    async def scenario() -> None:
+        size = PARTSIZE * 2 + 5000
+        path = tmp_path / "aich_client_sample.bin"
+        import os
+
+        path.write_bytes(os.urandom(size))
+        hashed = ed2k_hash_file(str(path))
+        shared = SharedFile(
+            file_hash=hashed.file_hash,
+            name=path.name,
+            size=hashed.file_size,
+            path=str(path),
+            hash_result=hashed,
+        )
+        server = IncomingPeerServer(
+            identity=_identity(),
+            resolver=_StaticResolver(shared),
+            upload_queue=UploadQueue(),
+            host="127.0.0.1",
+            port=0,
+            idle_timeout=15.0,
+        )
+        await server.start()
+        try:
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", server.bound_port
+            )
+            client = PeerClient.adopt_connection(
+                reader,
+                writer,
+                local_userhash=bytes.fromhex("8" * 32),
+                nickname="aich-client",
+            )
+            try:
+                # hello() exchange: the client initiates HELLO/EMULEINFO.
+                await client.handshake()
+                result = aich_hash_file(str(path))
+                part = 1
+                got_hash, got_part, master, recovery = (
+                    await client.request_aich(
+                        shared.file_hash, part, result.master_hash
+                    )
+                )
+                assert got_hash == shared.file_hash
+                assert got_part == part
+                assert master == result.master_hash
+                # Client-side verification: the part bytes + recovery blob
+                # must rebuild the claimed master.
+                part_data = path.read_bytes()[PARTSIZE : PARTSIZE * 2]
+                rebuilt = aich_rebuild_master_from_part(
+                    part_data, part, recovery, size
+                )
+                assert rebuilt == master
+            finally:
+                await client.close()
+        finally:
+            await server.close()
+
+    _run(scenario())

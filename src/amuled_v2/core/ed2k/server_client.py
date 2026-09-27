@@ -6,11 +6,16 @@ server identity/status/message parsing, global search, and TCP source lookup.
 The client is loopback-testable and does not perform obfuscation yet.
 
 src/amuled_v2/core/ed2k/server_client.py
-Version:     0.3.0
+Version:     0.4.0
 Author:      Soror L.'.L.'.
-Updated:     2026-09-23
+Updated:     2026-09-27
 
-Patch Notes v0.3.0 (Soror L.'.L'.):
+Patch Notes v0.4.0 (Soror L'.L'.):
+  [+] FoundSource carries per-source serving-buddy endpoint (buddy_ip/
+      buddy_port) so KAD type-3/5 saves keep their own buddies instead of
+      the shared record-level server_ip.
+
+Patch Notes v0.3.0 (Soror L'.L'.):
   [+] Added SearchResultsBatch for persistence and session bookkeeping.
   [+] Search results now expose their full tag set instead of discarding it.
 
@@ -226,6 +231,11 @@ class FoundSource:
     kad_udp_port: Optional[int] = None
     # Serving buddy KadID (type 3/5): addressed by KADEMLIA_CALLBACK_REQ.
     buddy_id: Optional[bytes] = None
+    # Serving buddy UDP endpoint (type 3/5 rendezvous/callback target).
+    # Per-source: the shared server_ip of the save record is only a
+    # fallback, so multi-source KAD saves keep their own buddies.
+    buddy_ip: Optional[str] = None
+    buddy_port: Optional[int] = None
 
     @property
     def low_id(self) -> bool:

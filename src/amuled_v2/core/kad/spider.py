@@ -37,7 +37,17 @@ from amuled_v2.logging_setup import LogTags, get_tagged_logger
 log = get_tagged_logger(LogTags.KAD, "core.kad.spider")
 
 from amuled_v2.core.kad.bootstrap import pick_bootstrap_nodes
+from amuled_v2.core.kad.buddy import (
+    KADEMLIA_CALLBACK_REQ,
+    KADEMLIA_FINDSERVINGBUDDY_REQ,
+)
 from amuled_v2.core.kad.nodes_dat import load_nodes_dat
+
+# Patch Notes v0.2.0 (Soror L'.L'.):
+#   [+] Serving-buddy UDP handlers (stage X): KADEMLIA_FINDSERVINGBUDDY_REQ
+#       answered with 0x5A when TCP-open and below capacity; 0x52 relayed
+#       to the registered served client as OP_CALLBACK via the buddy
+#       registry (KademliaUDPListener.cpp:1681-1866).
 from amuled_v2.core.kad.obfuscation import decode_obfuscated_kad
 from amuled_v2.core.kad.packets import (
     KADEMLIA2_BOOTSTRAP_RES,
@@ -449,6 +459,53 @@ class SpiderEngine:
 
                 key = (addr[0], addr[1])
                 rec = nodes.get(key)
+                if op == KADEMLIA_FINDSERVINGBUDDY_REQ:
+                    # Serving-buddy request (KademliaUDPListener.cpp:1681):
+                    # answer with our RES when TCP-open and below capacity.
+                    from amuled_v2.core.kad.buddy import (
+                        KADEMLIA_FINDSERVINGBUDDY_RES,
+                        buddy_registry,
+                        build_find_serving_buddy_res,
+                        parse_find_serving_buddy_req,
+                    )
+                    try:
+                        served_id, _uh, _tcp, _opts = (
+                            parse_find_serving_buddy_req(payload)
+                        )
+                    except Exception:
+                        continue
+                    if not buddy_registry.can_serve():
+                        continue
+                    res = build_find_serving_buddy_res(
+                        served_id,
+                        self.own.to_bytes(),
+                        buddy_registry.tcp_port,
+                        connect_opts=0x83,
+                    )
+                    await sendto(
+                        bytes((0xE4, KADEMLIA_FINDSERVINGBUDDY_RES)) + res,
+                        addr[0], addr[1],
+                    )
+                    continue
+                if op == KADEMLIA_CALLBACK_REQ:
+                    # Callback relay (KademliaUDPListener.cpp:1813-1866):
+                    # hand the requester endpoint to the served client over
+                    # its buddy TCP channel as OP_CALLBACK (0x99).
+                    from amuled_v2.core.kad.buddy import (
+                        KADEMLIA_CALLBACK_REQ,
+                        buddy_registry,
+                        parse_callback_req,
+                    )
+                    try:
+                        ucheck, fh, req_tcp, ext_ip = parse_callback_req(
+                            payload
+                        )
+                    except Exception:
+                        continue
+                    buddy_registry.relay_op_callback(
+                        ucheck, fh, addr[0], req_tcp
+                    )
+                    continue
                 if op == KADEMLIA2_HELLO_RES:
                     kadabra.reward((addr[0], addr[1]), 0.5)
                     try:

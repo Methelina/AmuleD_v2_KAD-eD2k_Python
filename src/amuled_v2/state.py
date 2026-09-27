@@ -7,9 +7,16 @@ The shared repository supports direct scanning transactions so removed or
 missing files do not leave stale rows behind.
 
 src/amuled_v2/state.py
-Version:     0.6.0
+Version:     0.6.1
 Author:      Soror L.'.L.'.
-Updated:     2026-09-23
+Updated:     2026-09-27
+
+Patch Notes v0.6.1 (Soror L'.L'.):
+  [+] save_found_sources: KAD type-3/5 rows persist their per-source
+      buddy endpoint (FoundSource.buddy_ip/buddy_port) instead of the
+      shared record-level server_ip fallback.
+  [+] Migration 10: aich_masters table + save_aich_master/
+      get_aich_master (AICH requester audit seed).
 
 Patch Notes v0.6.0 (Soror L.'.L'.):
   [+] Added schema migration 4 for persisted search results.
@@ -295,6 +302,23 @@ def _migrate_v9(con: Any) -> None:
     )
 
 
+def _migrate_v10(con: Any) -> None:
+    # Stage X: AICH requester — trusted master hashes verified through the
+    # recovery walk (aich_rebuild_master_from_part) after a completed
+    # download.  Seed for future corrupt-part salvage.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS aich_masters (
+            file_hash VARCHAR PRIMARY KEY,
+            master_hash VARCHAR NOT NULL,
+            first_seen TIMESTAMP NOT NULL DEFAULT get_current_timestamp(),
+            last_seen TIMESTAMP NOT NULL DEFAULT get_current_timestamp()
+        )
+    """)
+    con.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (10)"
+    )
+
+
 def _init_duckdb(con: Any) -> None:
     """Apply all pending schema migrations."""
     log.debug("Initializing DuckDB schema")
@@ -332,6 +356,10 @@ def _init_duckdb(con: Any) -> None:
     if current < 9:
         _migrate_v9(con)
         log.info("DuckDB schema migrated to version 9")
+        current = 9
+    if current < 10:
+        _migrate_v10(con)
+        log.info("DuckDB schema migrated to version 10")
     else:
         log.debug("DuckDB schema is current")
 
@@ -713,6 +741,14 @@ class StateBackend:
             row_type = source_type
             if source.kad_type is not None and source_type.startswith("kad"):
                 row_type = f"kad{source.kad_type}"
+            # KAD type-3/5 rows keep their OWN buddy endpoint: the shared
+            # record-level server_ip is only a fallback for older callers.
+            if row_type in ("kad3", "kad5"):
+                row_buddy_ip = getattr(source, "buddy_ip", None) or server_ip
+                row_buddy_port = getattr(source, "buddy_port", None) or server_port
+            else:
+                row_buddy_ip = server_ip
+                row_buddy_port = server_port
             con.execute(
                 """
                 INSERT INTO file_sources (
@@ -732,8 +768,8 @@ class StateBackend:
                     source.client_id,
                     source.client_port,
                     row_type,
-                    server_ip,
-                    server_port,
+                    row_buddy_ip,
+                    row_buddy_port,
                     source.user_hash.hex().upper() if source.user_hash else None,
                     source.kad_udp_port,
                     source.buddy_id.hex().upper() if source.buddy_id else None,
@@ -742,6 +778,33 @@ class StateBackend:
             count += 1
         log.info(f"Saved file sources to state: file={record.file_hash.hex().upper()}, count={count}")
         return count
+
+    def save_aich_master(self, file_hash: str, master_hash: bytes) -> None:
+        """Store one AICH master hash verified by the recovery walk."""
+        con = self._require_duckdb()
+        con.execute(
+            """
+            INSERT INTO aich_masters (file_hash, master_hash)
+            VALUES (?, ?)
+            ON CONFLICT (file_hash) DO UPDATE SET
+                master_hash = excluded.master_hash,
+                last_seen   = get_current_timestamp()
+            """,
+            (file_hash.upper(), master_hash.hex()),
+        )
+
+    def get_aich_master(self, file_hash: str) -> bytes | None:
+        con = self._require_duckdb()
+        row = con.execute(
+            "SELECT master_hash FROM aich_masters WHERE file_hash = ?",
+            (file_hash.upper(),),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            return bytes.fromhex(str(row[0]))
+        except ValueError:
+            return None
 
     def list_file_sources(
         self,

@@ -29,9 +29,12 @@ Opcodes covered by this module:
     OP_COMPRESSEDPART_I64 0xA1  compressed sending part (u64 start/end)
 
 src/amuled_v2/core/peer/codec.py
-Version:     0.2.0
+Version:     0.3.0
 Author:      Soror L.'.L'.
-Updated:     2026-09-24
+Updated:     2026-09-27
+
+Patch Notes v0.3.0 (Soror L'.L'.):
+  [+] HELLO extra_tags: build_hello_payload/_write_hello_body accept additional tags; _write_hello_tag writes bytes values as TAGTYPE_HASH (0x01) - needed for CT_EMULE_SERVINGBUDDYID (0xBF) served-buddy registration.
 
 Patch Notes v0.1.0 (Soror L.'.L'.):
   [+] Added C2CTCP opcode constants for client-to-client TCP.
@@ -247,6 +250,14 @@ def _write_hello_tag(tag: Ed2kTag, writer: BinaryWriter) -> None:
         writer.write_u16(len(raw))
         writer.write_bytes(raw)
         return
+    if isinstance(tag.value, (bytes, bytearray)):
+        # TAGTYPE_HASH (0x01): 16 raw bytes, no length prefix
+        # (Packets.cpp old CTag format; e.g. CT_EMULE_SERVINGBUDDYID).
+        writer.write_u8(0x01)
+        writer.write_u16(1)
+        writer.write_u8(int(name))
+        writer.write_bytes(bytes(tag.value))
+        return
     if isinstance(tag.value, int) and not isinstance(tag.value, bool):
         if not 0 <= tag.value <= 0xFFFFFFFF:
             raise PeerCodecError(
@@ -271,6 +282,7 @@ def _write_hello_body(
     version: int = 0x3C,
     server_ip: int = 0,
     server_port: int = 0,
+    extra_tags: tuple = (),
 ) -> None:
     if len(user_hash) != _HASH16_SIZE:
         raise PeerCodecError("user hash must contain exactly 16 bytes")
@@ -289,6 +301,7 @@ def _write_hello_body(
     writer.write_u32(client_id)
     writer.write_u16(client_port)
     tags = _build_hello_tags(nickname, version, client_port)
+    tags.extend(extra_tags)
     writer.write_u32(len(tags))
     for tag in tags:
         _write_hello_tag(tag, writer)
@@ -338,10 +351,11 @@ def build_hello_payload(
     client_port: int,
     nickname: str,
     version: int = 0x3C,
+    extra_tags: tuple = (),
 ) -> bytes:
     """Encode an ``OP_HELLO`` payload."""
     writer = BinaryWriter()
-    _write_hello_body(writer, user_hash, client_id, client_port, nickname, version)
+    _write_hello_body(writer, user_hash, client_id, client_port, nickname, version, extra_tags=extra_tags)
     payload = writer.to_bytes()
     log.debug(
         "HELLO payload built: user_hash=%s, client_id=%d, port=%d, name=%r, size=%d",
@@ -1337,6 +1351,15 @@ def miso1_source_exchange(tags: tuple[Ed2kTag, ...]) -> int:
         if tag.name_id == 0xFA and isinstance(tag.value, int):
             return (int(tag.value) >> 12) & 0x0F
     return 0
+
+
+def miso2_source_exchange_v2(tags: tuple[Ed2kTag, ...]) -> bool:
+    """SX2 capability (bit 10) of MISCOPTIONS2 (mirrors our own
+    cap_source_exchange_v2 in build_miscoptions2)."""
+    for tag in tags:
+        if tag.name_id == 0xFE and isinstance(tag.value, int):
+            return bool(int(tag.value) & 0x0400)
+    return False
 
 
 def build_request_sources2_payload(

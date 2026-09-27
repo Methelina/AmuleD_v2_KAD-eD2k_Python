@@ -212,3 +212,57 @@ def test_answer_sources_codec_versions() -> None:
             assert entries[0].user_hash is None
         if version >= 4:
             assert entries[1].connect_options == 0x08
+
+
+def test_request_sources_client_loopback(tmp_path) -> None:
+    """PeerClient.request_sources against the live SX responder: the client
+    sends OP_REQUESTSOURCES2 (peer miso2 bit 10 advertised by our own
+    HELLOANSWER tags) and the ANSWERSOURCES2 entries land in
+    client.collected_sources."""
+
+    async def scenario() -> None:
+        def provider(file_hash: bytes):
+            return list(_SOURCES)
+
+        server = IncomingPeerServer(
+            identity=_identity(),
+            resolver=_EmptyResolver(),
+            upload_queue=UploadQueue(),
+            host="127.0.0.1",
+            port=0,
+            idle_timeout=15.0,
+            source_provider=provider,
+        )
+        await server.start()
+        try:
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", server.bound_port
+            )
+            from amuled_v2.core.peer.client import PeerClient
+
+            client = PeerClient.adopt_connection(
+                reader,
+                writer,
+                local_userhash=bytes.fromhex("D" * 32),
+                nickname="sx-client",
+            )
+            try:
+                await client.handshake()
+                assert client.peer_tags, "peer tags must be learned"
+                await client.request_sources(_FILE_HASH)
+                # Read the answer through the session receive path and
+                # collect it exactly as the wait/transfer loops do.
+                packet = await client._receive(timeout=5.0)
+                assert packet is not None
+                protocol, opcode, payload = packet
+                assert client._collect_answer_sources(protocol, opcode, payload)
+                first = client.collected_sources[0]
+                assert first.client_id == _SOURCES[0].client_id
+                assert first.port == 4662
+                assert first.user_hash == bytes.fromhex("1" * 32)
+            finally:
+                await client.close()
+        finally:
+            await server.close()
+
+    _run(scenario())

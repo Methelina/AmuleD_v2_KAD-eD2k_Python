@@ -16,9 +16,17 @@ tries), in-order reassembly with a small reorder buffer, FIN half-close,
 flow control via a large static advertised window (scale is modest).
 
 src/amuled_v2/core/natt/utp.py
-Version:     0.1.0
+Version:     0.1.1
 Author:      Soror L.'.L.'.
 Updated:     2026-09-27
+
+Patch Notes v0.1.1 (Soror L'.L'.):
+  [+] Writer facade: get_extra_info("peername") so PeerClient.
+      adopt_connection can wrap a uTP stream (NAT-T rendezvous).
+  [+] FIX recv(): the eof/get race consumed TWO queue items per call
+      and silently dropped a chunk when both arrived while waiting.
+  [+] accept(): on_created callback fires before the SYN-ack so the
+      demuxer can register the stream before post-connect DATA lands.
 
 Patch Notes v0.1.0 (Soror L'.L'.):
   [+] Minimal BEP 29 uTP stream over an asyncio datagram transport.
@@ -196,8 +204,14 @@ class UtpStream:
         send_frame,
         remote_addr,
         syn_packet: bytes,
+        *,
+        on_created=None,
     ) -> "UtpStream":
-        """Acceptor: derive ids from the inbound SYN and ack it."""
+        """Acceptor: derive ids from the inbound SYN and ack it.
+
+        ``on_created(stream)`` fires BEFORE the SYN-ack goes out, so the
+        caller can register the stream for demultiplexing first — DATA
+        sent right after the initiator's connect must not be dropped."""
         if len(syn_packet) < _HEADER_LEN:
             raise UtpError("short SYN")
         (syn_conn,) = struct.unpack_from(">H", syn_packet, 2)
@@ -211,6 +225,8 @@ class UtpStream:
         stream._retransmit_task = asyncio.get_running_loop().create_task(
             stream._retransmit_loop()
         )
+        if on_created is not None:
+            on_created(stream)
         await stream._send_ack()
         stream._connected_evt.set()
         log.debug("uTP accepted: endpoint=%s", remote_addr)
@@ -231,22 +247,28 @@ class UtpStream:
         self._sent[seq] = (time.time(), chunk)
 
     async def recv(self, n: int = 65536) -> bytes:
-        if self._incoming.empty():
-            if self._eof_evt.is_set():
-                return b""
-            eof_task = asyncio.get_running_loop().create_task(self._eof_evt.wait())
-            get_task = asyncio.get_running_loop().create_task(self._incoming.get())
-            try:
-                done, _ = await asyncio.wait(
-                    {eof_task, get_task}, return_when=asyncio.FIRST_COMPLETED
-                )
-                if eof_task in done and self._incoming.empty():
-                    return b""
-            finally:
-                eof_task.cancel()
-                if not get_task.done():
-                    get_task.cancel()
-        return await self._incoming.get()
+        if self._eof_evt.is_set() and self._incoming.empty():
+            return b""
+        loop = asyncio.get_running_loop()
+        get_task = loop.create_task(self._incoming.get())
+        eof_task = loop.create_task(self._eof_evt.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {eof_task, get_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if get_task in done:
+                # The retrieved chunk IS the result — consuming the queue
+                # again here would silently drop it.
+                return get_task.result()
+            # EOF signalled: still deliver anything already queued.
+            get_task.cancel()
+            if not self._incoming.empty():
+                return await self._incoming.get()
+            return b""
+        finally:
+            eof_task.cancel()
+            if not get_task.done():
+                get_task.cancel()
 
     async def close(self) -> None:
         if self._closed:
@@ -324,5 +346,15 @@ class UtpStream:
 
             async def wait_closed(self) -> None:
                 await asyncio.sleep(0)
+
+            def get_extra_info(self, name: str, default=None):
+                # PeerClient.adopt_connection asks for "peername".
+                if name == "peername":
+                    return stream.remote_addr
+                return default
+
+            @property
+            def transport(self):
+                return None
 
         return _UtpWriter()

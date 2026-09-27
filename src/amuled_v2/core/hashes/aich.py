@@ -7,11 +7,17 @@ itself a left child.  This module provides whole-file master hashes, ordered
 leaf hashes, verification, and tagged diagnostics without network access.
 
 src/amuled_v2/core/hashes/aich.py
-Version:     0.1.0
+Version:     0.2.0
 Author:      Soror L.'.L.'.
-Updated:     2026-09-22
+Updated:     2026-09-27
 
-Patch Notes v0.1.0 (Soror L.'.L'.):
+Patch Notes v0.2.0 (Soror L'.L'.):
+  [+] AICH requester side (client): aich_parse_recovery_data +
+      aich_rebuild_master_from_part — recompute the file master from one
+      downloaded part plus the peer recovery blob (SHAHashSet.cpp
+      ReadRecoveryData walk).
+
+Patch Notes v0.1.0 (Soror L'.L'.):
   [+] Added SHA1 helpers and streaming AICH master/leaf computation.
   [+] Added exact odd-block left/right segment splitting.
   [+] Added AichHashResult, verification, and tagged HASH diagnostics.
@@ -42,6 +48,8 @@ __all__ = [
     "aich_verify_file",
     "materialize_aich_tree",
     "aich_part_recovery_data",
+    "aich_parse_recovery_data",
+    "aich_rebuild_master_from_part",
 ]
 
 _AICH_HASH_SIZE = 20
@@ -346,3 +354,90 @@ def aich_part_recovery_data(result: AichHashResult, part_index: int) -> bytes:
             out += struct.pack("<H", entry_ident) + entry_hash
         out += struct.pack("<H", 0)
     return bytes(out)
+
+
+# ---------------------------------------------------------------------------
+# Recovery-data consumer (client requester side; SHAHashSet.cpp
+# CAICHRecoveryHashSet::SetAddress / ReadRecoveryData).  Verifies one
+# downloaded part against a peer-provided recovery blob and recomputes the
+# file master from the part bytes alone — the client-side mirror of
+# aich_part_recovery_data.
+# ---------------------------------------------------------------------------
+
+
+def aich_parse_recovery_data(
+    recovery: bytes,
+) -> dict[int, bytes]:
+    """Parse a recovery blob -> {ident: hash} entries."""
+    (count16,) = struct.unpack("<H", recovery[:2])
+    offset = 2
+    entries: dict[int, bytes] = {}
+    for _ in range(count16):
+        (ident,) = struct.unpack("<H", recovery[offset : offset + 2])
+        entries[ident] = bytes(recovery[offset + 2 : offset + 22])
+        offset += 22
+    (count32,) = struct.unpack("<H", recovery[offset : offset + 2])
+    offset += 2
+    for _ in range(count32):
+        (ident,) = struct.unpack("<I", recovery[offset : offset + 4])
+        entries[ident] = bytes(recovery[offset + 4 : offset + 24])
+        offset += 24
+    return entries
+
+
+def aich_rebuild_master_from_part(
+    part_data: bytes,
+    part_index: int,
+    recovery: bytes,
+    file_size: int,
+) -> bytes:
+    """Recompute the file's AICH master hash from one downloaded part plus
+    the peer's recovery blob (SHAHashSet.cpp ReadRecoveryData walk).
+
+    Returns the recomputed master hash; compare it against the peer's
+    claimed master — a match both authenticates the blob AND proves the
+    part bytes are what the source tree covers.  Raises AichError when
+    the recovery data cannot cover the tree.
+    """
+    part_start = part_index * PARTSIZE
+    if part_start < 0 or part_start >= file_size:
+        raise AichError(f"part index out of range: {part_index}")
+    part_size = min(PARTSIZE, file_size - part_start)
+    if len(part_data) != part_size:
+        raise AichError(
+            f"part data size mismatch: got {len(part_data)}, expected {part_size}"
+        )
+    entries = aich_parse_recovery_data(recovery)
+    part_result = aich_hash_data(part_data)
+
+    def resolve(start: int, size: int, is_left: bool, ident: int) -> bytes | None:
+        ident = (ident << 1) | (1 if is_left else 0)
+        if ident in entries and size <= BLOCKSIZE:
+            return entries[ident]
+        if start >= part_start and start + size <= part_start + part_size:
+            rel = start - part_start
+            sub_leaves = part_result.block_hashes[
+                rel // BLOCKSIZE : (rel + size + BLOCKSIZE - 1) // BLOCKSIZE
+            ]
+            return _build_tree(list(sub_leaves), start, size, is_left).hash
+        if ident in entries:
+            return entries[ident]
+        if size <= BLOCKSIZE:
+            return None
+        base = BLOCKSIZE if size <= PARTSIZE else PARTSIZE
+        blocks = (size + base - 1) // base
+        left_blocks = (blocks + 1) // 2 if is_left else blocks // 2
+        left_size = left_blocks * base
+        if left_size >= size:
+            left_size = (blocks // 2) * base
+        right_size = size - left_size
+        left = resolve(start, left_size, True, ident)
+        right = resolve(start + left_size, right_size, False, ident)
+        if left is None or right is None:
+            return None
+        return sha1_digest(left + right)
+
+    master = resolve(0, file_size, True, 0)
+    if master is None:
+        raise AichError("recovery data does not cover the whole tree")
+    return master

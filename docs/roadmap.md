@@ -954,6 +954,228 @@ awaits clean network records (today's type-1 records FIN — stale/poisoned
 userhash at the peer side); NAT-T (item 5) only for double-firewalled
 corners. Commit+push on explicit user command.
 
+## 11m. Session 14c (2026-09-27 night): NAT-T transports [DONE - transports]
+
+1. **QUIC NAT-T transport (aioquic) [DONE]**: quic_transport.py —
+   standard IETF QUIC (aioquic), ALPN "ed2k-ai-natt-quic-v1" (QuicNatConfig
+   .h:12), downloader = QUIC client / source = server bootstrapped from the
+   first Initial (pull_quic_header -> original_destination_connection_id);
+   EAQN1 proof exchange as the first 37 stream bytes (QuicNatSocket.cpp:
+   619-650); all datagrams wrapped OP_UDPRESERVEDPROT2 (0xB2) /
+   OP_NATT_FRAME_QUIC (0x01). Proof/handshake verified over loopback
+   (tests/test_natt_quic.py). Dependency: aioquic>=1.2 (requirements.txt +
+   pyproject.toml).
+2. **uTP NAT-T transport [DONE]**: utp.py — minimal BEP 29 uTP over
+   asyncio (SYN/STATE/FIN, cumulative acks, reorder buffer, retransmit
+   0.6 s x40, 20-byte header ">BBHIIIHH"); asyncio reader/writer adapters
+   for PeerClient. tests/test_natt_utp.py.
+3. **Rendezvous request [DONE]**: OP_REASKCALLBACKUDP (0x94) builder +
+   sender (BaseClient.cpp:3147-3196 layout, RENDEZVOUS 0xA0, ENDPOINT_HINT
+   0x20, UTP 0x80); CONNECT_OPT constants recorded (Opcodes.h:215-221).
+
+Remainder (next session): rendezvous state machine wiring (holepunch burst
++ endpoint-hint handling + expectation table) to connect the transports to
+DownloadRunner; QUIC/wire interop check against a live eMuleAI NAT-T
+session; suite 335 passed / 3 skipped.
+
 Suite: 331 passed, 3 skipped; compileall 0. Remainder: LIVE kernel
 download.run from a real KAD source; commit+push on user command.
+
+## 11n. Session 14d (2026-09-27): NAT-T rendezvous state machine [DONE]
+
+1. **NAT-T UDP session layer [DONE]**: core/natt/session.py —
+   NattUdpSession (asyncio DatagramProtocol) on a client-UDP socket:
+   0xC5 demux of OP_HOLEPUNCH (0xA1, empty), OP_NATT_ENDPOINT_HINT (0xAA,
+   56-byte layout per ClientUDPSocket.cpp:1301-1365) and 0xB2 frames
+   (CAPS 0x02/CAPS_ACK 0x03 — magic 0x43514145, version 1, options byte,
+   three 16-byte hashes, :480-521/:688-793; KEY 0xFF — 16-byte userhash,
+   :397-407/:999-1006; UTP 0x00 / QUIC 0.01 payloads). Expectation table
+   (30 s TTL, max 64, port-window fuzzy match, :141-293).
+2. **Requester flow [DONE]**: rendezvous_connect() — OP_REASKCALLBACKUDP
+   (rendezvous marker) SENT FROM THE SESSION SOCKET (buddy answers are
+   addressed to the sender endpoint — a fresh socket never receives the
+   hint/holepunch; caught in loopback debugging), endpoint-hint wait with
+   3 retries, holepunch burst 12 + port sweep (:1957-2015), CAPS exchange
+   3 + sweep (:523-550) advertising uTP only (0x80; QUIC 0x40 never
+   advertised — ngtcp2 interop unproven), uTP connect + KEY frame.
+3. **Source role [DONE]**: arm_source() — answers holepunch with CAPS and
+   accepts inbound uTP SYNs (on_inbound_utp callback; mirrors
+   :2021-2214), for loopback doubles and the future kernel wiring.
+4. **uTP fixes [DONE]**: recv() eof/get race consumed two queue items per
+   call and silently dropped a chunk (the HELLO packet was eaten and the
+   source session parsed EMULEINFO as first packet — caught in loopback);
+   accept() on_created callback registers the stream BEFORE the SYN-ack
+   so post-connect DATA is not dropped by the demuxer.
+5. **DownloadRunner wiring [DONE]**: kad3/kad5 rows — after the 12 s
+   buddy-callback timeout (was 20 s) fall through to the rendezvous path
+   (_connect_via_rendezvous: NattUdpSession -> uTP stream ->
+   PeerClient.adopt_connection over the stream adapters; session kept
+   alive via a closer callback); callback_identity may carry ext_ip.
+
+Suite: 336 passed, 3 skipped; compileall 0. Remainder: LIVE interop check
+against a real eMuleAI NAT-T session (eMuleAI logs: [NatTraversal] ...,
+HOLEPUNCH: ...); commit+push on user command.
+
+### 11n addendum (same session): live rendezvous probe [network-limited]
+
+1. **Per-source buddy persistence [FIXED]**: FoundSource now carries
+   buddy_ip/buddy_port (server_client.py 0.4.0); `kad sources` populates
+   them (cli.py 0.6.1); save_found_sources writes per-row buddies for
+   kad3/kad5 (state.py 0.6.1). Before: ALL rows of a save got the FIRST
+   source's buddy — the second kad3 row dialed a foreign buddy.
+2. **LIVE probe** (tmp\rendezvous_live.py, file 68D0E10D, two independent
+   kad3 records + live buddies): buddy-callback 0x52 sent (no TCP callback,
+   expected for double-firewalled), 12 s fallback fired, rendezvous 0x94
+   sent FROM THE SESSION SOCKET to both buddies (79.112.136.166:65023,
+   58.38.13.178:54188) — NO OP_HOLEPUNCH / OP_NATT_ENDPOINT_HINT came
+   back within the 22 s hint window on either buddy (three runs).
+3. Interpretation: our 0x94 chain is oracle-verified byte-for-byte
+   (14c), so the silence is either (a) live buddies dead/behind NAT or
+   not rendezvous-capable relays, or (b) a protocol variant difference —
+   eMuleAI's own live log shows "Including REQUESTER endpoint ...
+   transportHint=2 for ephemeral response", i.e. its transport-hint byte
+   carries 0x02, not our 0x80, and it embeds the requester endpoint
+   differently. NEXT: wire-diff our 0x94 against a captured eMuleAI
+   rendezvous request (tshark on tun0) before the next live attempt.
+4. kad1 direct dials: all FIN during BASIC handshake (stale/poisoned
+   records — known condition, unchanged).
+
+Suite: 336 passed, 3 skipped; compileall 0. Commit+push on user command.
+
+### 11n addendum 2 (same session): AICH requester [DONE — core + audit]
+
+1. **Client-side recovery consumer [DONE]**: hashes/aich.py 0.2.0 —
+   aich_parse_recovery_data + aich_rebuild_master_from_part (the client
+   mirror of CreatePartRecoveryData: part bytes + peer recovery blob
+   must rebuild the claimed master; SHAHashSet.cpp ReadRecoveryData
+   walk).
+2. **PeerClient.request_aich [DONE]**: client.py 0.4.0 — OP_AICHREQUEST
+   over the session, OP_AICHANSWER parsing; the responder's master gate
+   (mismatch silently ignored) requires the requester to already know
+   the master, so trust bootstrap = master computed from our own
+   completed download first.  Loopback test: request + rebuild == master
+   (tests/test_aich_wire.py).
+3. **Runner AICH audit [DONE]**: runner.py 0.4.0 — after a complete
+   transfer, cross-check with the peer (part-0 recovery must rebuild our
+   master) and store the verified master (state.py migration 10,
+   aich_masters; save/get API).  End-to-end verified: the rendezvous
+   loopback test now asserts the master lands in aich_masters.
+4. **Listener post-transfer drain [DONE]**: listener.py 0.3.0 — the
+   session no longer dies on transfer_complete; it serves AICH requests
+   until the downloader disconnects (eMule parity: the DOWNLOADER owns
+   the connection lifetime).  Without this the runner audit raced the
+   source's disconnect — caught by the new assertion.
+5. **Trust bootstrap limitation (known)**: full corrupt-part salvage
+   needs the untrusted-master flow (UntrustedHashReceived, 10 IPs/92%
+   majority, SHAHashSet.cpp:178-182, 1320-1388) whose zero-master
+   request gate lives in eMuleAI's packet dispatch (not in
+   SHAHashSet.cpp — extract from UpDownClient.cpp/PartFile.cpp before
+   implementing).  Current audit stores only our own MD4-verified
+   masters — correct, but not yet a majority-trust set.
+
+Suite: 337 passed, 3 skipped; compileall 0. Commit+push on user command.
+
+### 11n addendum 3 (same session): SX requester [DONE]
+
+1. **PeerClient.request_sources [DONE]**: client.py 0.5.0 — SX2
+   (OP_REQUESTSOURCES2) when the peer advertises miso2 bit 10 (new codec
+   helper miso2_source_exchange_v2; MISCOPTIONS2 is tag 0xFE — 0xFB is
+   EMULE_VERSION) or SX1 nibble > 1; legacy OP_REQUESTSOURCES for
+   SX1 == 1.  peer_tags now retained from the handshake.
+2. **Answer collection [DONE]**: OP_ANSWERSOURCES(2) handled in the
+   wait_upload_slot and transfer receive loops (EMULE-protocol packets
+   were silently dropped there before); entries accumulate in
+   client.collected_sources.
+3. **Runner persistence [DONE]**: runner.py — request_sources fired
+   after request_file; collected sources persisted into file_sources
+   (source_type "sx", direct-dialable) in the attempt's finally block —
+   sources survive even when the transfer itself fails.
+4. Loopback test: PeerClient.request_sources vs the live SX responder —
+   answer parsed and collected (tests/test_source_exchange.py).
+
+Suite: 338 passed, 3 skipped; compileall 0. Commit+push on user command.
+
+### 11n addendum 4 (same session): stripe scheduling [DONE]
+
+1. **transfer(start_offset, end_offset) [DONE]**: client.py 0.6.0 — a
+   racing peer downloads only its disjoint region; write offsets stay
+   absolute.  Before: ALL racing peers downloaded identical bytes from
+   offset 0 (verified live: two peers each pulled the same first 600 KB).
+2. **Runner stripes [DONE]**: runner.py 0.5.0 — peer i gets
+   [i*region, min(size, (i+1)*region)), region = ceil(size/peers).
+   Queue gap list stays the completion source of truth.
+3. **Buddy/direct-callback race [FIXED]**: the TCP wait now starts as a
+   task BEFORE the callback request is sent — dial-backs arrive within
+   milliseconds and previously fell through to normal sessions
+   (listener.py 0.3.1: per-IP FIFO waiter queue; the single-future
+   version made two same-IP racing peers share one reader —
+   "readexactly() called while another coroutine is already waiting").
+   Limitation (known): a stalled peer's stripe is not reassigned; the
+   file stays incomplete until the next run() covers the gaps.
+4. e2e: tests/test_download_stripe.py — two kad6 sources, disjoint
+   stripes, full MD4-verified completion; both sources served ~equal
+   halves (traffic_recorder counters).
+
+Suite: 339 passed, 3 skipped; compileall 0. Commit+push on user command.
+
+### 11n addendum 5 (same session): IPv6 NAT-T [DONE — transport]
+
+1. **Dual-stack session [DONE]**: session.py 0.2.0 — start6() opens the
+   IPv6 transport alongside the IPv4 one; _send routes by remote address
+   family.
+2. **Direct-punch rendezvous for IPv6 [DONE]**: the buddy endpoint hint
+   is IPv4-only (ClientUDPSocket.cpp:1276 always writes a 4-byte
+   address), so for an IPv6 target the hint is skipped and
+   holepunch/CAPS/uTP go straight to the endpoint known from the KAD
+   record — mirroring eMuleAI's observed live IPv6 rendezvous.
+3. **Two environment traps [FIXED]**: (a) this CPython/Proactor build
+   silently DROPS asyncio IPv6 datagram sendto (overlapped WSASendTo,
+   WinError 10022) while plain non-blocking sockets work — v6 sends
+   bypass asyncio through a raw socket; (b) Windows IPv6 addrs arrive
+   as 4-tuples — the demux now normalizes to (host, port) or every
+   lookup key misses.
+4. Loopback test: test_natt_rendezvous.py::test_natt_rendezvous_ipv6_
+   direct_punch — full rendezvous + uTP echo over ::1 with a
+   hint-less buddy.
+5. **Runner/data-source integration [BLOCKED]**: our KAD source parser
+   only captures IPv4 tags; IPv6 source records need the eMuleAI KAD
+   listener oracle (same missing file as the buddy item).
+
+Suite: 340 passed, 3 skipped; compileall 0. Commit+push on user command.
+
+### 11o. Serving as KAD buddy [DONE — serving side, loopback]
+
+Oracle files located (the earlier "missing oracle" was a wrong path —
+they live under kademlia\net\, not kademlia\kademlia\):
+O:\Work\Coding\eMuleAI\srchybrid\kademlia\net\KademliaUDPListener.cpp and
+O:\Work\Coding\eMule_0.50a\srchybrid\kademlia\net\KademliaUDPListener.cpp
+(stock 0.50a names the same opcodes KADEMLIA_FINDBUDDY_*).  Recon:
+tmp/recon/emuleai-buddy-udp.recon.md, emuleai-kad-ipv6-tags.recon.md.
+
+1. **Serving-buddy UDP [DONE]**: core/kad/buddy.py 0.1.0 — 0x51 parsed
+   ([ServedBuddyID-XOR 16][userhash 16][tcp u16][opts u8?]), answered
+   with 0x5A ([XOR-ID echo][buddyHash][tcp u16][opts u8?]) when TCP-open
+   and below capacity (gates :1690-1697); 0x52 relayed to the registered
+   served client as OP_CALLBACK (0x99, 0xC5): [kadID-XOR][fileHash]
+   [reqIP u32 LE][reqPort u16 LE] (:1850-1866; XOR-form fallback lookup
+   mirrors :1112-1123).
+2. **Buddy TCP registration [DONE]**: listener.py 0.3.1 — HELLO carrying
+   CT_EMULE_SERVINGBUDDYID (0xBF, TAGTYPE_HASH 0x01, raw KadID;
+   BaseClient.cpp:2005-2013) registers the client in the buddy registry
+   and holds the channel open instead of the upload engine.
+3. **Codec [DONE]**: codec.py 0.3.0 — hello extra_tags + TAGTYPE_HASH
+   writing (bytes tag values).
+4. **Wiring [DONE]**: spider.py 0.2.0 — 0x51/0x52 branches in the KAD
+   receiver; kernel.py — buddy_registry.configure(tcp_port) at startup.
+5. Loopback: tests/test_kad_buddy.py — payload roundtrips + TCP
+   registration and OP_CALLBACK relay with XOR-form lookup.
+6. **[TODO next]**: our own FIREWALLED-customer side (register with an
+   external buddy: send 0x51, TCP-connect, HELLO with 0xBF tag, answer
+   OP_CALLBACK by dialing the requester) and the buddy ping/pong
+   (OP_BUDDYPING 0x9F payload oracle).  IPv6 KAD source tags
+   (TAG_IPV6 "ip6" / TAG_SERVINGBUDDYIPV6 "bi6" — 32-char hex ASCII
+   string tags per Search.cpp:917-922/1195-1202) now have their oracle:
+   implement in source_search.py next.
+
+Suite: 342 passed, 3 skipped; compileall 0. Commit+push on user command.
 

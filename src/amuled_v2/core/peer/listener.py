@@ -28,9 +28,25 @@ Protocol flow (see ``_expect_first_packet``):
        HASHSETREQUEST, REQUESTPARTS/REQUESTPARTS_I64, and END_OF_DOWNLOAD.
 
 src/amuled_v2/core/peer/listener.py
-Version:     0.2.0
-Author:      Soror L.'.L'.
-Updated:     2026-09-26
+Version:     0.3.1
+Author:      Soror L.'.L.'.
+Updated:     2026-09-27
+
+Patch Notes v0.3.1 (Soror L'.L'.):
+  [+] Direct-callback waiters are a FIFO queue per IP (fixes two racing
+      peers sharing one reader — "readexactly() called while another
+      coroutine is already waiting"); expect_connection_from must be
+      started before the callback request is sent.
+  [+] Serving-buddy registration: HELLO with CT_EMULE_SERVINGBUDDYID
+      (0xBF) registers the client in the KAD buddy registry and holds
+      the TCP channel open (_hold_buddy_session) for OP_CALLBACK relays;
+      the upload engine is not started for such sessions.
+
+Patch Notes v0.3.0 (Soror L'.L'.):
+  [+] Post-transfer drain: the session keeps serving AICH requests after
+      the upload completes (eMule parity — the DOWNLOADER owns the
+      connection lifetime); AICH handler extracted to
+      _handle_aich_request, reused by _drain_post_transfer.
 
 Patch Notes v0.2.0 (Soror L'.L'.):
   [+] Incoming obfuscation accept (stage X): non-protocol first byte now
@@ -588,6 +604,32 @@ class IncomingPeerSession:
         session: UploadSession | None = None
         granted_key: tuple[str, str] | None = None
 
+        # Stage X serving-buddy registration: a firewalled client's HELLO
+        # carries CT_EMULE_SERVINGBUDDYID (0xBF) with its raw KadID
+        # (BaseClient.cpp:2005-2013 — "so the buddy can store it and match
+        # future OP_REASKCALLBACKUDP requests").  Such sessions do NOT run
+        # the upload engine: they are held open and the KAD spider relays
+        # OP_CALLBACK (0x99) packets to them via the registry.
+        buddy_tag = next(
+            (t for t in hello.tags if t.name_id == 0xBF), None
+        )
+        if buddy_tag is not None and isinstance(buddy_tag.value, (bytes, bytearray)):
+            from amuled_v2.core.kad.buddy import buddy_registry
+
+            peer_ip = self._peer_name.rsplit(":", 1)[0].strip()
+            buddy_registry.register(
+                bytes(buddy_tag.value), peer_ip, hello.client_port,
+                transport._writer,
+            )
+            try:
+                await self._hold_buddy_session(transport)
+            finally:
+                buddy_registry.unregister_transport(transport._writer)
+            return self._build_report(
+                hello, None, started_at, accepted=True,
+                detail="buddy_session_closed",
+            )
+
         while not started_upload:
             packet = await transport.recv()
             if packet is None:
@@ -728,59 +770,7 @@ class IncomingPeerSession:
                 continue
 
             if opcode == C2CEMULE.AICHREQUEST:
-                # AICH recovery responder (stage X; gate per
-                # SHAHashSet.cpp:715-723: complete file, part in range,
-                # requested master hash must match ours).
-                try:
-                    req_hash, req_part, req_master = parse_aich_request_payload(
-                        payload
-                    )
-                except Exception as exc:
-                    log.debug(
-                        "AICHREQUEST ignored (malformed): peer=%s, error=%s",
-                        self._peer_name, exc,
-                    )
-                    continue
-                shared = self._resolver.resolve(req_hash)
-                if shared is None or not shared.path:
-                    continue
-                try:
-                    from amuled_v2.core.codec.constants import PARTSIZE
-                    from amuled_v2.core.hashes.aich import (
-                        AichError,
-                        aich_hash_file,
-                        aich_part_recovery_data,
-                    )
-
-                    result = aich_hash_file(shared.path)
-                    if bytes(result.master_hash) != bytes(req_master):
-                        log.debug(
-                            "AICHREQUEST master mismatch: peer=%s, hash=%s",
-                            self._peer_name, req_hash.hex().upper(),
-                        )
-                        continue
-                    part_count = (shared.size + PARTSIZE - 1) // PARTSIZE
-                    if req_part >= part_count:
-                        continue
-                    recovery = aich_part_recovery_data(result, req_part)
-                except AichError as exc:
-                    log.debug(
-                        "AICH recovery unavailable: peer=%s, error=%s",
-                        self._peer_name, exc,
-                    )
-                    continue
-                await transport.send(
-                    C2CEMULE.AICHANSWER,
-                    build_aich_answer_payload(
-                        req_hash, req_part, req_master, recovery
-                    ),
-                    protocol=EMULE,
-                )
-                log.debug(
-                    "AICHANSWER sent: peer=%s, hash=%s, part=%d, recovery=%d",
-                    self._peer_name, req_hash.hex().upper(),
-                    req_part, len(recovery),
-                )
+                await self._handle_aich_request(payload, transport)
                 continue
 
             if opcode == C2CTCP.REQUESTFILENAME:
@@ -1111,6 +1101,10 @@ class IncomingPeerSession:
                 if granted_key is not None:
                     self._upload_queue.release_slot(*granted_key)
                     granted_key = None
+                # Post-transfer drain (eMule keeps the session open until
+                # the DOWNLOADER closes it; UploadClient.cpp): serve AICH
+                # requests while the peer stays connected.
+                await self._drain_post_transfer(transport)
                 break
 
             log.debug(
@@ -1132,6 +1126,109 @@ class IncomingPeerSession:
             hello, last_hash_hex, started_at, accepted=True,
             detail="transfer_complete", stats=stats,
         )
+
+    async def _hold_buddy_session(
+        self, transport: StreamTransport, idle: float = 300.0
+    ) -> None:
+        """Hold an open buddy-TCP channel for a served client.
+
+        The session stays readable but deliberately idle: the KAD spider
+        writes OP_CALLBACK (0x99) relays straight to the same writer via
+        the registry.  The channel lives until the served client
+        disconnects or the idle window lapses.  NOTE (wire TODO): the
+        eMuleAI buddy ping/pong (OP_BUDDYPING 0x9F) is not answered yet —
+        live clients may drop us after their ping window; implement when
+        the ping payload oracle is extracted.
+        """
+        while True:
+            try:
+                packet = await transport.recv()
+            except ListenerError:
+                return  # idle timeout
+            if packet is None:
+                return  # served client disconnected
+            opcode, _payload = packet
+            log.debug(
+                "Buddy session packet: peer=%s, opcode=0x%02X",
+                self._peer_name,
+                opcode,
+            )
+
+    async def _handle_aich_request(
+        self, payload: bytes, transport: StreamTransport
+    ) -> None:
+        """AICH recovery responder (stage X; gate per SHAHashSet.cpp:
+        715-723 — complete file, part in range, requested master must
+        match ours)."""
+        try:
+            req_hash, req_part, req_master = parse_aich_request_payload(payload)
+        except Exception as exc:
+            log.debug(
+                "AICHREQUEST ignored (malformed): peer=%s, error=%s",
+                self._peer_name, exc,
+            )
+            return
+        shared = self._resolver.resolve(req_hash)
+        if shared is None or not shared.path:
+            return
+        try:
+            from amuled_v2.core.codec.constants import PARTSIZE
+            from amuled_v2.core.hashes.aich import (
+                AichError,
+                aich_hash_file,
+                aich_part_recovery_data,
+            )
+
+            result = aich_hash_file(shared.path)
+            if bytes(result.master_hash) != bytes(req_master):
+                log.debug(
+                    "AICHREQUEST master mismatch: peer=%s, hash=%s",
+                    self._peer_name, req_hash.hex().upper(),
+                )
+                return
+            part_count = (shared.size + PARTSIZE - 1) // PARTSIZE
+            if req_part >= part_count:
+                return
+            recovery = aich_part_recovery_data(result, req_part)
+        except AichError as exc:
+            log.debug(
+                "AICH recovery unavailable: peer=%s, error=%s",
+                self._peer_name, exc,
+            )
+            return
+        await transport.send(
+            C2CEMULE.AICHANSWER,
+            build_aich_answer_payload(req_hash, req_part, req_master, recovery),
+            protocol=EMULE,
+        )
+        log.debug(
+            "AICHANSWER sent: peer=%s, hash=%s, part=%d, recovery=%d",
+            self._peer_name, req_hash.hex().upper(),
+            req_part, len(recovery),
+        )
+
+    async def _drain_post_transfer(
+        self, transport: StreamTransport, idle: float = 8.0
+    ) -> None:
+        """Serve post-transfer requests (AICH) until the peer disconnects
+        or goes quiet.  eMule parity: the DOWNLOADER owns the connection
+        lifetime; the source must keep answering after the last byte."""
+        while True:
+            try:
+                packet = await transport.recv()
+            except ListenerError:
+                return  # idle timeout or transport error
+            if packet is None:
+                return  # peer closed
+            opcode, payload = packet
+            if opcode == C2CEMULE.AICHREQUEST:
+                await self._handle_aich_request(payload, transport)
+            else:
+                log.debug(
+                    "Ignoring post-transfer opcode: peer=%s, opcode=0x%02X",
+                    self._peer_name,
+                    opcode,
+                )
 
     async def _safe_close(self, transport: StreamTransport) -> None:
         try:
@@ -1257,7 +1354,11 @@ class IncomingPeerServer:
         # Stage X direct-callback: callers (DownloadRunner) reserve inbound
         # connections from a firewalled source by IP; _on_client hands the
         # raw socket to the waiter instead of starting an upload session.
-        self._expected: dict[str, asyncio.Future] = {}
+        # FIFO queue per IP: several racing peers may dial the SAME source
+        # IP, and each dial-back must satisfy exactly one waiter.  Callers
+        # MUST call expect_connection_from() BEFORE sending the callback
+        # request (start it as a task) — dial-backs race the wait.
+        self._expected: dict[str, list[asyncio.Future]] = {}
 
     async def expect_connection_from(
         self, ip: str, timeout: float = 15.0
@@ -1265,16 +1366,22 @@ class IncomingPeerServer:
         """Wait for an inbound TCP connection from ``ip`` (direct-callback).
 
         The connection is NOT served by the upload engine: the waiting
-        caller receives the raw (reader, writer) pair.
+        caller receives the raw (reader, writer) pair.  Waiters form a FIFO
+        queue per IP; each dial-back satisfies exactly one waiter.
         """
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-        self._expected[ip] = future
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._expected.setdefault(ip, []).append(future)
         try:
             return await asyncio.wait_for(future, timeout)
         finally:
-            if self._expected.get(ip) is future:
-                del self._expected[ip]
+            waiters = self._expected.get(ip)
+            if waiters is not None:
+                try:
+                    waiters.remove(future)
+                except ValueError:
+                    pass
+                if not waiters:
+                    self._expected.pop(ip, None)
 
     @property
     def bound_port(self) -> int:
@@ -1333,9 +1440,12 @@ class IncomingPeerServer:
         log.info("Incoming C2C connection: peer=%s", peer_name)
 
         # Direct-callback reservation: hand raw sockets to a waiting
-        # downloader instead of the upload engine (peer IP match).
+        # downloader instead of the upload engine (peer IP match, FIFO).
         peer_ip = peer_name.rsplit(":", 1)[0].strip() if peer_name else ""
-        waiter = self._expected.pop(peer_ip, None)
+        waiters = self._expected.get(peer_ip)
+        waiter = waiters.pop(0) if waiters else None
+        if not waiters:
+            self._expected.pop(peer_ip, None)
         if waiter is not None and not waiter.done():
             waiter.set_result((reader, writer))
             log.info(

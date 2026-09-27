@@ -17,9 +17,13 @@ Dependencies (duckdb, rich) are optional at runtime; ``--help`` works without
 them installed.  Network protocol sessions are not started by share commands.
 
 src/amuled_v2/cli.py
-Version:     0.6.0
+Version:     0.6.1
 Author:      Soror L.'.L.'.
-Updated:     2026-09-23
+Updated:     2026-09-27
+
+Patch Notes v0.6.1 (Soror L'.L'.):
+  [+] kad sources: populate per-source FoundSource.buddy_ip/buddy_port
+      so every KAD type-3/5 row keeps its own serving buddy on save.
 
 Patch Notes v0.6.0 (Soror L.'.L'.):
   [+] Stage U phase 3: search results/sources/download list+add/servers
@@ -1308,14 +1312,9 @@ async def _run_kad_sources(args: argparse.Namespace) -> dict:
         from amuled_v2.core.ed2k import FoundSource, FoundSources
 
         found_sources: list[FoundSource] = []
-        server_ip = "0.0.0.0"
-        server_port = 0
         for src in report.sources:
             if src.ip is None:
                 continue
-            if server_ip == "0.0.0.0" and src.buddy_ip:
-                server_ip = src.buddy_ip
-                server_port = src.buddy_port or 0
             found_sources.append(
                 FoundSource(
                     client_id=int(ipaddress.IPv4Address(src.ip)),
@@ -1327,8 +1326,13 @@ async def _run_kad_sources(args: argparse.Namespace) -> dict:
                         bytes.fromhex(src.buddy_hash)
                         if src.buddy_hash else None
                     ),
+                    buddy_ip=src.buddy_ip or None,
+                    buddy_port=src.buddy_port or None,
                 )
             )
+        first_buddy = next(
+            (s for s in found_sources if s.buddy_ip), None
+        )
         record = FoundSources(
             file_hash=file_hash, sources=tuple(found_sources)
         )
@@ -1337,8 +1341,8 @@ async def _run_kad_sources(args: argparse.Namespace) -> dict:
             state.connect()
             saved = state.save_found_sources(
                 record,
-                server_ip=server_ip,
-                server_port=server_port,
+                server_ip=first_buddy.buddy_ip if first_buddy else "0.0.0.0",
+                server_port=first_buddy.buddy_port or 0 if first_buddy else 0,
                 source_type="kad",
             )
         except Exception as exc:
