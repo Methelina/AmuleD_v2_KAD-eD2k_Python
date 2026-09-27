@@ -180,6 +180,21 @@ class PartFile:
                 updated.append(Gap(end, gap.end))
         self.gaps = _normalize_gaps(updated, self.total_size)
 
+    def punch(self, start: int, end: int) -> None:
+        """Reopen [start, end) as a hole (corrupt-recovery).
+
+        The reverse of a gap fill: bytes stay on disk until overwritten
+        by a re-download, but the range is marked not-downloaded so the
+        runner's gap-driven rounds refetch it (PartFile.cpp AddGap,
+        FlushBuffer:5795)."""
+        start = max(0, start)
+        end = min(self.total_size, end)
+        if end <= start:
+            return
+        self.gaps = _normalize_gaps(
+            self.gaps + [Gap(start, end)], self.total_size
+        )
+
     # -- status --------------------------------------------------------------
 
     @property

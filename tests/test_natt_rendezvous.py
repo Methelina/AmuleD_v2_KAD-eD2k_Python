@@ -106,11 +106,14 @@ class _FakeRendezvousSource:
         self.session: NattUdpSession | None = None
         self.udp_port = 0
 
-    async def start(self) -> None:
+    async def start(self, host: str = "127.0.0.1") -> None:
         self.session = NattUdpSession(
             self.user_hash, on_inbound_utp=self._on_stream
         )
-        self.udp_port = await self.session.start(host="127.0.0.1")
+        if ":" in host:
+            self.udp_port = await self.session.start6(host=host)
+        else:
+            self.udp_port = await self.session.start(host=host)
         self.session.arm_source(self.shared.file_hash)
 
     async def stop(self) -> None:
@@ -323,3 +326,109 @@ def test_natt_rendezvous_ipv6_direct_punch() -> None:
             bt.close()
 
     asyncio.run(main())
+
+
+def test_natt_rendezvous_runner_ipv6_direct_punch(tmp_path) -> None:
+    """Runner-level IPv6 rendezvous: a kad3 row carrying ipv6 ("::1")
+    must take the direct-punch variant (no endpoint hint) and complete
+    the download over uTP with the MD4-verified file."""
+    from amuled_v2 import state as state_module
+    from amuled_v2.core.upload.queue import UploadQueue
+
+    async def scenario() -> None:
+        state_module.DB_FILE = tmp_path / "state.db"
+        backend = state_module.StateBackend()
+        backend.connect()
+
+        path = tmp_path / "natt_v6_sample.bin"
+        data = os.urandom(280_000)
+        path.write_bytes(data)
+        hashed = ed2k_hash_file(str(path))
+        shared = SharedFile(
+            file_hash=hashed.file_hash,
+            name=path.name,
+            size=hashed.file_size,
+            path=str(path),
+            hash_result=hashed,
+        )
+
+        source_user_hash = bytes.fromhex("AB" * 16)
+        source = _FakeRendezvousSource(shared, source_user_hash)
+        await source.start(host="::1")
+
+        loop = asyncio.get_running_loop()
+        buddy = _FakeBuddy(
+            ("::1", source.udp_port),
+            target_user_hash=source_user_hash,
+            buddy_id=bytes.fromhex("CD" * 16),
+        )
+        buddy_transport, _ = await loop.create_datagram_endpoint(
+            lambda: buddy, local_addr=("127.0.0.1", 0)
+        )
+        buddy.transport = buddy_transport
+        buddy_port = buddy_transport.get_extra_info("sockname")[1]
+
+        listener = IncomingPeerServer(
+            identity=LocalIdentity(
+                user_hash=_LOCAL_HASH,
+                client_id=1,
+                tcp_port=0,
+                nickname="AmuleD-dl",
+            ),
+            resolver=_StaticResolver(None),
+            upload_queue=UploadQueue(),
+            host="127.0.0.1",
+            port=0,
+            idle_timeout=30.0,
+        )
+        await listener.start()
+
+        queue = DownloadQueue(
+            state=backend,
+            temp_dir=tmp_path / "temp",
+            incoming_dir=tmp_path / "inc",
+        )
+        queue.add(
+            file_hash=shared.file_hash.hex(),
+            name=shared.name,
+            size=shared.size,
+        )
+
+        our_hash = bytes.fromhex("7" * 32)
+        runner = DownloadRunner(
+            queue,
+            local_port=listener.bound_port,
+            max_peers=2,
+            plain_dial_ok=False,
+            connection_source=listener.expect_connection_from,
+            callback_identity={
+                "tcp_port": listener.bound_port,
+                "user_hash": our_hash,
+            },
+        )
+        runner.source_provider = lambda h, limit: [
+            {
+                "client_id": 0x7F000001,
+                "client_port": 12345,
+                "user_hash": source_user_hash.hex(),
+                "source_type": "kad3",
+                "kad_udp_port": source.udp_port,
+                "ipv6": "::1",
+                "buddy_id": "CD" * 16,
+                "buddy_ip": "127.0.0.1",
+                "buddy_port": buddy_port,
+            }
+        ]
+
+        try:
+            result = await asyncio.wait_for(
+                runner.run(shared.file_hash.hex()), _IO_TIMEOUT
+            )
+            assert result.get("status") == "complete", result
+            assert result["finalized"]["verified"] is True, result
+        finally:
+            await listener.close()
+            buddy_transport.close()
+            await source.stop()
+
+    asyncio.run(scenario())

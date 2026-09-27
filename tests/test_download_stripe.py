@@ -57,9 +57,9 @@ class _SourceUDP(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr) -> None:
         if data[0] != 0xC5 or data[5] != 0x95:
             return
-        if self.owner._dialed:
-            return  # one callback per source, like a real client
-        self.owner._dialed = True
+        if self.owner._conn_open:
+            return  # one live callback session per source
+        self.owner._conn_open = True
         (length,) = (int.from_bytes(data[1:5], "little"),)
         payload = data[6 : 5 + length]
         tcp_port, _user_hash, _opts = parse_direct_callback_payload(payload)
@@ -80,6 +80,7 @@ class _FakeSource:
         self.transport: asyncio.DatagramTransport | None = None
         self.protocol: _SourceUDP | None = None
         self._dialed = False
+        self._conn_open = False
         self._served_box = [0]
 
     async def start(self) -> None:
@@ -121,6 +122,7 @@ class _FakeSource:
         except Exception:
             pass
         finally:
+            self._conn_open = False
             writer.close()
 
 
@@ -218,5 +220,206 @@ def test_stripe_download_two_peers(tmp_path) -> None:
             await listener.close()
             await source_a.stop()
             await source_b.stop()
+
+    asyncio.run(scenario())
+
+
+def test_stripe_reassignment_dead_peer(tmp_path) -> None:
+    """Stalled-stripe reassignment: peer B is dead (immediate connect
+    failure); round 2 must re-stripe the remaining hole onto peer A and
+    still complete with MD4 verified."""
+    from amuled_v2 import state as state_module
+    from amuled_v2.core.upload.queue import UploadQueue
+
+    async def scenario() -> None:
+        state_module.DB_FILE = tmp_path / "state.db"
+        backend = state_module.StateBackend()
+        backend.connect()
+
+        path = tmp_path / "reassign_sample.bin"
+        data = os.urandom(600_000)
+        path.write_bytes(data)
+        hashed = ed2k_hash_file(str(path))
+        shared = SharedFile(
+            file_hash=hashed.file_hash,
+            name=path.name,
+            size=hashed.file_size,
+            path=str(path),
+            hash_result=hashed,
+        )
+
+        source_a = _FakeSource(shared)
+        await source_a.start()
+
+        listener = IncomingPeerServer(
+            identity=LocalIdentity(
+                user_hash=_LOCAL_HASH,
+                client_id=1,
+                tcp_port=0,
+                nickname="AmuleD-reassign",
+            ),
+            resolver=_StaticResolver(None),
+            upload_queue=UploadQueue(),
+            host="127.0.0.1",
+            port=0,
+            idle_timeout=30.0,
+        )
+        await listener.start()
+
+        queue = DownloadQueue(
+            state=backend,
+            temp_dir=tmp_path / "temp",
+            incoming_dir=tmp_path / "inc",
+        )
+        queue.add(
+            file_hash=shared.file_hash.hex(),
+            name=shared.name,
+            size=shared.size,
+        )
+
+        our_hash = bytes.fromhex("7" * 32)
+        runner = DownloadRunner(
+            queue,
+            local_port=listener.bound_port,
+            max_peers=2,
+            plain_dial_ok=True,
+            connection_source=listener.expect_connection_from,
+            callback_identity={
+                "tcp_port": listener.bound_port,
+                "user_hash": our_hash,
+            },
+        )
+        runner.source_provider = lambda h, limit: [
+            {
+                "client_id": 0x7F000001,
+                "client_port": 1,
+                "user_hash": "A1" * 16,
+                "source_type": "kad6",
+                "kad_udp_port": source_a.udp_port,
+            },
+            {
+                # Dead direct endpoint: nothing listens on this port.
+                "client_id": 0x7F000001,
+                "client_port": 2,
+                "user_hash": None,
+                "source_type": "ed2k",
+            },
+        ]
+
+        try:
+            result = await asyncio.wait_for(
+                runner.run(shared.file_hash.hex()), _IO_TIMEOUT
+            )
+            assert result.get("status") == "complete", result
+            assert result["finalized"]["verified"] is True, result
+            # Peer A covered the dead peer's stripe in round 2: served
+            # more than its own half of the file.
+            assert source_a._served_box[0] >= shared.size
+        finally:
+            await listener.close()
+            await source_a.stop()
+
+    asyncio.run(scenario())
+
+
+def test_corrupt_part_salvage(tmp_path) -> None:
+    """Corrupt-part salvage: one block arrives corrupted; the part-MD4
+    verification punches it as a gap and the next round refetches it —
+    the file still completes MD4-verified."""
+    from amuled_v2 import state as state_module
+    from amuled_v2.core.upload.queue import UploadQueue
+
+    async def scenario() -> None:
+        state_module.DB_FILE = tmp_path / "state.db"
+        backend = state_module.StateBackend()
+        backend.connect()
+
+        path = tmp_path / "salvage_sample.bin"
+        data = os.urandom(300_000)  # single part, 2 blocks
+        path.write_bytes(data)
+        hashed = ed2k_hash_file(str(path))
+        shared = SharedFile(
+            file_hash=hashed.file_hash,
+            name=path.name,
+            size=hashed.file_size,
+            path=str(path),
+            hash_result=hashed,
+        )
+
+        source = _FakeSource(shared)
+        await source.start()
+
+        listener = IncomingPeerServer(
+            identity=LocalIdentity(
+                user_hash=_LOCAL_HASH,
+                client_id=1,
+                tcp_port=0,
+                nickname="AmuleD-salvage",
+            ),
+            resolver=_StaticResolver(None),
+            upload_queue=UploadQueue(),
+            host="127.0.0.1",
+            port=0,
+            idle_timeout=30.0,
+        )
+        await listener.start()
+
+        queue = DownloadQueue(
+            state=backend,
+            temp_dir=tmp_path / "temp",
+            incoming_dir=tmp_path / "inc",
+        )
+        queue.add(
+            file_hash=shared.file_hash.hex(),
+            name=shared.name,
+            size=shared.size,
+        )
+
+        # Corrupt exactly one byte of the FIRST written block (once).
+        orig_record_block = queue.record_block
+        poisoned = {"done": False}
+
+        def poisoned_record_block(file_hash: str, start: int, data: bytes):
+            if not poisoned["done"]:
+                poisoned["done"] = True
+                data = bytes([data[0] ^ 0xFF]) + data[1:]
+            return orig_record_block(file_hash, start, data)
+
+        queue.record_block = poisoned_record_block
+
+        our_hash = bytes.fromhex("7" * 32)
+        runner = DownloadRunner(
+            queue,
+            local_port=listener.bound_port,
+            max_peers=1,
+            plain_dial_ok=False,
+            connection_source=listener.expect_connection_from,
+            callback_identity={
+                "tcp_port": listener.bound_port,
+                "user_hash": our_hash,
+            },
+        )
+        runner.source_provider = lambda h, limit: [
+            {
+                "client_id": 0x7F000001,
+                "client_port": 1,
+                "user_hash": "A1" * 16,
+                "source_type": "kad6",
+                "kad_udp_port": source.udp_port,
+            }
+        ]
+
+        try:
+            result = await asyncio.wait_for(
+                runner.run(shared.file_hash.hex()), _IO_TIMEOUT
+            )
+            assert result.get("status") == "complete", result
+            assert result["finalized"]["verified"] is True, result
+            # The corrupted round-1 write must have been refetched: the
+            # source served the file content twice (round 1 + salvage).
+            assert source._served_box[0] >= shared.size
+        finally:
+            await listener.close()
+            await source.stop()
 
     asyncio.run(scenario())

@@ -236,6 +236,10 @@ class FoundSource:
     # fallback, so multi-source KAD saves keep their own buddies.
     buddy_ip: Optional[str] = None
     buddy_port: Optional[int] = None
+    # Optional IPv6 endpoints (eMuleAI "ip6"/"bi6" tags) — IPv6 NAT-T
+    # rendezvous target/buddy (roadmap 11o).
+    ipv6: Optional[str] = None
+    buddy_ipv6: Optional[str] = None
 
     @property
     def low_id(self) -> bool:

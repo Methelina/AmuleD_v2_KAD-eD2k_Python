@@ -17,6 +17,7 @@ Patch Notes v0.6.1 (Soror L'.L'.):
       shared record-level server_ip fallback.
   [+] Migration 10: aich_masters table + save_aich_master/
       get_aich_master (AICH requester audit seed).
+  [+] Migration 11: file_sources gains ipv6/buddy_ipv6 (IPv6 NAT-T).
 
 Patch Notes v0.6.0 (Soror L.'.L'.):
   [+] Added schema migration 4 for persisted search results.
@@ -319,6 +320,21 @@ def _migrate_v10(con: Any) -> None:
     )
 
 
+def _migrate_v11(con: Any) -> None:
+    # Stage X: IPv6 NAT-T — KAD source rows carry the optional IPv6
+    # endpoint of the target and of its serving buddy (eMuleAI "ip6"/"bi6"
+    # tags, Search.cpp:915-923).
+    con.execute("""
+        ALTER TABLE file_sources ADD COLUMN IF NOT EXISTS ipv6 VARCHAR
+    """)
+    con.execute("""
+        ALTER TABLE file_sources ADD COLUMN IF NOT EXISTS buddy_ipv6 VARCHAR
+    """)
+    con.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (11)"
+    )
+
+
 def _init_duckdb(con: Any) -> None:
     """Apply all pending schema migrations."""
     log.debug("Initializing DuckDB schema")
@@ -360,6 +376,10 @@ def _init_duckdb(con: Any) -> None:
     if current < 10:
         _migrate_v10(con)
         log.info("DuckDB schema migrated to version 10")
+        current = 10
+    if current < 11:
+        _migrate_v11(con)
+        log.info("DuckDB schema migrated to version 11")
     else:
         log.debug("DuckDB schema is current")
 
@@ -753,14 +773,17 @@ class StateBackend:
                 """
                 INSERT INTO file_sources (
                     file_hash, client_id, client_port, source_type,
-                    server_ip, server_port, user_hash, kad_udp_port, buddy_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    server_ip, server_port, user_hash, kad_udp_port, buddy_id,
+                    ipv6, buddy_ipv6
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (file_hash, client_id, client_port, source_type) DO UPDATE SET
                     server_ip   = excluded.server_ip,
                     server_port = excluded.server_port,
                     user_hash   = excluded.user_hash,
                     kad_udp_port = excluded.kad_udp_port,
                     buddy_id    = excluded.buddy_id,
+                    ipv6        = excluded.ipv6,
+                    buddy_ipv6  = excluded.buddy_ipv6,
                     last_seen   = get_current_timestamp()
                 """,
                 (
@@ -773,6 +796,8 @@ class StateBackend:
                     source.user_hash.hex().upper() if source.user_hash else None,
                     source.kad_udp_port,
                     source.buddy_id.hex().upper() if source.buddy_id else None,
+                    getattr(source, "ipv6", None),
+                    getattr(source, "buddy_ipv6", None),
                 ),
             )
             count += 1
@@ -825,7 +850,7 @@ class StateBackend:
                 """
                 SELECT file_hash, client_id, client_port, source_type,
                        server_ip, server_port, user_hash, first_seen, last_seen,
-                       kad_udp_port, buddy_id
+                       kad_udp_port, buddy_id, ipv6, buddy_ipv6
                 FROM file_sources
                 WHERE lower(file_hash) = ?
                 ORDER BY client_id, client_port
@@ -838,7 +863,7 @@ class StateBackend:
                 """
                 SELECT file_hash, client_id, client_port, source_type,
                        server_ip, server_port, user_hash, first_seen, last_seen,
-                       kad_udp_port, buddy_id
+                       kad_udp_port, buddy_id, ipv6, buddy_ipv6
                 FROM file_sources
                 ORDER BY file_hash, client_id, client_port
                 LIMIT ?
@@ -858,6 +883,8 @@ class StateBackend:
                 "last_seen": str(row[8]),
                 "kad_udp_port": row[9],
                 "buddy_id": row[10],
+                "ipv6": row[11],
+                "buddy_ipv6": row[12],
             }
             for row in rows
         ]

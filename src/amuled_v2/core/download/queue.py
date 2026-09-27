@@ -5,9 +5,13 @@ paused, complete, error), and the on-disk part-file state.  Adding a download
 requires a real ED2K file link; the queue itself never fakes transfer data.
 
 src/amuled_v2/core/download/queue.py
-Version:     0.1.0
+Version:     0.2.0
 Author:      Soror L.'.L.'.
-Updated:     2026-09-23
+Updated:     2026-09-27
+
+Patch Notes v0.2.0 (Soror L'.L'.):
+  [+] gap_ranges(): remaining hole ranges of the part file - input for
+      the runner's stalled-stripe reassignment rounds.
 
 Patch Notes v0.1.0 (Soror L.'.L'.):
   [+] Added DuckDB download queue schema helpers and lifecycle transitions.
@@ -203,6 +207,47 @@ class DownloadQueue:
             "complete": part.is_complete,
             "status": status,
         }
+
+    def gap_ranges(self, file_hash: str) -> list[tuple[int, int]]:
+        """Remaining hole ranges [start, end) of the part file, ascending."""
+        normalized = self._normalize_hash(file_hash)
+        entry = self.get(normalized)
+        if entry is None:
+            raise DownloadQueueError(f"download not found: {normalized}")
+        from amuled_v2.core.download.partfile import PartFile
+
+        part = PartFile.resume(Path(str(entry["part_path"])))
+        try:
+            return [(gap.start, gap.end) for gap in part.gaps]
+        finally:
+            part.close()
+
+    def punch_gaps(
+        self, file_hash: str, ranges: list[tuple[int, int]]
+    ) -> None:
+        """Reopen [start, end) ranges of the part file as holes — the
+        corrupt-recovery re-download trigger (PartFile.cpp AddGap,
+        FlushBuffer:5795)."""
+        normalized = self._normalize_hash(file_hash)
+        entry = self.get(normalized)
+        if entry is None:
+            raise DownloadQueueError(f"download not found: {normalized}")
+        from amuled_v2.core.download.partfile import PartFile
+
+        part = PartFile.resume(Path(str(entry["part_path"])))
+        try:
+            for start, end in ranges:
+                part.punch(int(start), int(end))
+            part.save()
+            # The DB status may already say COMPLETE (the corrupt bytes
+            # were written); downgrade so the rounds loop keeps going.
+            self.state.update_download_progress(
+                normalized,
+                downloaded_bytes=part.downloaded_bytes,
+                status=DownloadStatus.DOWNLOADING,
+            )
+        finally:
+            part.close()
 
     def finalize(self, file_hash: str, *, verify: bool = True) -> dict[str, object]:
         """Move a complete part file into incoming, optionally verifying MD4."""

@@ -96,3 +96,38 @@ def test_search_res_source_entries_ipv6_tags() -> None:
     )
     _sid, bad_fields = parse_search_res_source_entries(bad_payload)[0]
     assert bad_fields["ipv6"] is None
+
+
+def test_state_ipv6_source_roundtrip(tmp_path) -> None:
+    """file_sources persists ipv6/buddy_ipv6 alongside the IPv4 buddy."""
+    from amuled_v2 import state as state_module
+    from amuled_v2.core.ed2k.server_client import FoundSource, FoundSources
+
+    state_module.DB_FILE = tmp_path / "state.db"
+    backend = state_module.StateBackend()
+    backend.connect()
+    file_hash = bytes.fromhex("5" * 32)
+    record = FoundSources(
+        file_hash=file_hash,
+        sources=(
+            FoundSource(
+                client_id=0x0A000001,
+                client_port=4662,
+                user_hash=bytes.fromhex("1" * 16),
+                kad_type=3,
+                kad_udp_port=5678,
+                buddy_id=bytes.fromhex("CD" * 16),
+                buddy_ip="10.0.0.9",
+                buddy_port=9999,
+                ipv6="2001:db8::1",
+                buddy_ipv6="2a0c:5704::1",
+            ),
+        ),
+    )
+    assert backend.save_found_sources(
+        record, server_ip="10.0.0.9", server_port=9999, source_type="kad"
+    ) == 1
+    rows = backend.list_file_sources(file_hash.hex())
+    assert rows[0]["source_type"] == "kad3"
+    assert rows[0]["ipv6"] == "2001:db8::1"
+    assert rows[0]["buddy_ipv6"] == "2a0c:5704::1"

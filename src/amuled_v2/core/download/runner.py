@@ -8,9 +8,29 @@ part file via ``record_block`` and completion is finalized only when a
 peer delivers the whole file.
 
 src/amuled_v2/core/download/runner.py
-Version:     0.5.0
+Version:     0.7.0
 Author:      Soror L.'.L.'.
 Updated:     2026-09-27
+
+Patch Notes v0.7.0 (Soror L'.L'.):
+  [+] Corrupt-part salvage (stage X; PartFile.cpp HashSinglePart
+      :4399-4474 + FlushBuffer:5793-5804): after a full-file transfer,
+      every PART's MD4 is verified against the peer's hashset; corrupt
+      parts are punched as gaps (queue.punch_gaps -> PartFile.punch)
+      and the rounds loop refetches them before finalize.
+
+Patch Notes v0.6.0 (Soror L'.L'.):
+  [+] Stalled-stripe reassignment: run() races up to 3 rounds; later
+      rounds re-stripe the CURRENT gap list (queue.gap_ranges), and
+      peers that delivered zero bytes in a round are pruned from later
+      rounds (their slice goes to the survivors).
+
+Patch Notes v0.5.1 (Soror L'.L'.):
+  [+] IPv6 rendezvous: endpoint rows may carry ipv6/buddy_ipv6 (eMuleAI
+      "ip6"/"bi6"); an ipv6 target starts the dual-stack NAT-T session
+      (start6) and drives the direct-punch variant (endpoint hints are
+      IPv4-only).
+  [+] resolve_sources carries ipv6/buddy_ipv6 through to endpoints.
 
 Patch Notes v0.5.0 (Soror L'.L'.):
   [+] Stripe scheduling: racing peers get disjoint file regions
@@ -82,6 +102,37 @@ def _row_is_kad_callback(row: dict) -> bool:
 def _row_not_directly_dialable(row: dict) -> bool:
     """True when a row may not be used for a DIRECT (SX answer) endpoint."""
     return str(row.get("source_type") or "").lower() in _KAD_UNDIALABLE_TYPES
+
+
+def _regions_from_gaps(
+    gaps: list[tuple[int, int]], peers: int
+) -> list[tuple[int, int]]:
+    """Split the gap space into ``peers`` contiguous [start, end) regions.
+
+    Regions may span a filled sub-range inside a gap boundary — the
+    transfer then re-requests those bytes (bounded duplication, correct
+    by construction; the queue's gap list stays the source of truth).
+    """
+    if not gaps or peers <= 0:
+        return []
+    total = sum(end - start for start, end in gaps)
+    per = (total + peers - 1) // peers
+    regions: list[tuple[int, int]] = []
+    idx = 0
+    pos = gaps[0][0]
+    for _ in range(peers):
+        budget = per
+        start = pos
+        while budget > 0 and idx < len(gaps):
+            gap_start, gap_end = gaps[idx]
+            take = min(gap_end - pos, budget)
+            pos += take
+            budget -= take
+            if pos >= gap_end and idx + 1 < len(gaps):
+                idx += 1
+                pos = gaps[idx][0]
+        regions.append((start, pos))
+    return regions
 
 
 class DownloadRunnerError(RuntimeError):
@@ -200,6 +251,11 @@ class DownloadRunner:
                     "buddy_ip": row.get("buddy_ip") or row.get("server_ip"),
                     "buddy_port": row.get("buddy_port")
                     or row.get("server_port"),
+                    # Optional IPv6 endpoints (eMuleAI "ip6"/"bi6" tags);
+                    # an ipv6 target drives the rendezvous direct-punch
+                    # variant (endpoint hints are IPv4-only).
+                    "ipv6": row.get("ipv6"),
+                    "buddy_ipv6": row.get("buddy_ipv6"),
                 }
             )
         if skipped:
@@ -274,7 +330,7 @@ class DownloadRunner:
                 )
                 await client.connect()
             await client.handshake()
-            await client.request_file(file_hash_bytes)
+            hashset = await client.request_file(file_hash_bytes)
             try:
                 # Stage X source exchange: ask the peer for additional
                 # sources; answers are collected asynchronously and
@@ -295,6 +351,37 @@ class DownloadRunner:
                 start_offset=start_offset,
                 end_offset=end_offset,
             )
+            if (
+                outcome.complete
+                and hashset is not None
+                and start_offset == 0
+                and (end_offset is None or end_offset >= size)
+            ):
+                # Corrupt-part salvage (stage X; PartFile.cpp
+                # HashSinglePart:4399-4474, FlushBuffer:5793-5804): verify
+                # each PART's MD4 against the peer's hashset; punch corrupt
+                # parts as gaps so the rounds loop refetches them.  Only
+                # for full-file regions (partial regions have incomplete
+                # parts whose MD4 is meaningless).
+                try:
+                    corrupt = self._verify_parts_against_hashset(
+                        file_hash, file_hash_bytes, size, hashset
+                    )
+                except Exception as exc:
+                    corrupt = []
+                    log.debug(
+                        "DOWNLOAD part verification skipped: hash=%s, "
+                        "error=%s",
+                        file_hash, exc,
+                    )
+                if corrupt:
+                    self.queue.punch_gaps(file_hash, corrupt)
+                    outcome.complete = False
+                    outcome.detail = f"corrupt parts punched: {corrupt}"
+                    log.warning(
+                        "DOWNLOAD corrupt parts punched: hash=%s, %s",
+                        file_hash, corrupt,
+                    )
             if outcome.complete and start_offset == 0 and self.aich_audit:
                 # AICH audit (stage X): the file just completed with MD4
                 # pending; verify the AICH tree against the peer and store
@@ -367,6 +454,58 @@ class DownloadRunner:
             file_hash_bytes.hex().upper(),
             len(sources),
         )
+
+    def _verify_parts_against_hashset(
+        self,
+        file_hash: str,
+        file_hash_bytes: bytes,
+        size: int,
+        hashset: Any,
+    ) -> list[tuple[int, int]]:
+        """Verify every PART's MD4 on disk against the peer's hashset
+        (PartFile.cpp HashSinglePart:4399-4474, MD4 branch).
+
+        chunk_hashes[0] is the file hash, the rest are part hashes.
+        Returns the corrupt part ranges [start, end) — empty when all
+        parts verify or the hashset does not cover the part count.
+        """
+        from Crypto.Hash import MD4 as _MD4
+
+        from amuled_v2.core.codec.constants import PARTSIZE
+
+        parts = (size + PARTSIZE - 1) // PARTSIZE
+        expected = list(hashset.chunk_hashes[1:])
+        if not expected and parts == 1 and hashset.chunk_hashes:
+            # Single-part files: the part hash IS the file hash (eD2K
+            # convention; eMuleAI sends [file hash][count] for them).
+            expected = [hashset.chunk_hashes[0]]
+        log.debug(
+            "DOWNLOAD hashset dump: hash=%s, parts=%d, chunks=%s",
+            file_hash, parts, hashset.to_dict(),
+        )
+        if len(expected) != parts:
+            log.debug(
+                "DOWNLOAD hashset part count mismatch: hash=%s, "
+                "expected=%d, got=%d",
+                file_hash, parts, len(expected),
+            )
+            return []
+        entry = self.queue.get(file_hash)
+        if entry is None:
+            return []
+        part_path = str(entry["part_path"])
+        corrupt: list[tuple[int, int]] = []
+        with open(part_path, "rb") as handle:
+            for index in range(parts):
+                handle.seek(index * PARTSIZE)
+                data = handle.read(
+                    min(PARTSIZE, size - index * PARTSIZE)
+                )
+                digest = _MD4.new(data).digest()
+                if digest != expected[index]:
+                    start = index * PARTSIZE
+                    corrupt.append((start, start + len(data)))
+        return corrupt
 
     async def _aich_audit(
         self,
@@ -510,8 +649,15 @@ class DownloadRunner:
 
         ident = self.callback_identity
         target_hash = endpoint.get("user_hash")
+        ipv6_target = endpoint.get("ipv6")
+        kad_udp_port = int(endpoint.get("kad_udp_port") or 0)
         session = NattUdpSession(bytes(ident["user_hash"]))
         await session.start()
+        if ipv6_target:
+            # IPv6 target (eMuleAI "ip6" tag): dual-stack session and the
+            # direct-punch rendezvous variant — endpoint hints are
+            # IPv4-only (ClientUDPSocket.cpp:1276).
+            await session.start6()
         try:
             stream = await session.rendezvous_connect(
                 buddy_host=buddy_ip,
@@ -521,8 +667,8 @@ class DownloadRunner:
                 file_hash=file_hash_bytes,
                 our_ext_ip=int(ident.get("ext_ip") or 0),
                 target_addr=(
-                    endpoint["host"],
-                    int(endpoint.get("kad_udp_port") or 0),
+                    ipv6_target if ipv6_target else endpoint["host"],
+                    kad_udp_port,
                 ),
             )
         except Exception as exc:
@@ -615,66 +761,115 @@ class DownloadRunner:
         file_hash_bytes = bytes.fromhex(str(entry["hash"]))
         size = int(entry["size"])
         endpoints = sources[: self.max_peers]
-        # Stripe scheduling (stage X): every racing peer gets a disjoint
-        # region so parallel peers stop downloading identical bytes.  The
-        # queue's gap list stays the completion source of truth.
-        region = (size + len(endpoints) - 1) // len(endpoints)
-        log.info(
-            "DOWNLOAD race start: hash=%s, peers=%d, stripe=%d",
-            file_hash, len(endpoints), region,
-        )
 
-        tasks = {
-            asyncio.create_task(
-                self._attempt_peer(
-                    endpoint,
-                    file_hash,
-                    size,
-                    file_hash_bytes,
-                    progress_callback,
-                    start_offset=index * region,
-                    end_offset=min(size, (index + 1) * region),
-                ),
-                name=f"dl-peer-{endpoint['host']}:{endpoint['port']}",
-            ): endpoint
-            for index, endpoint in enumerate(endpoints)
-        }
         attempts: list[dict] = []
-        pending = set(tasks)
-        try:
-            while pending:
-                done, pending = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in done:
-                    attempts.append(task.result())
-                refreshed = self.queue.get(file_hash)
-                if refreshed is not None and refreshed["status"] == "complete":
-                    # First winner takes the file; the losing peers are
-                    # cancelled mid-transfer.
-                    for task in pending:
+        max_rounds = 3
+        active = list(enumerate(endpoints))
+        for round_no in range(max_rounds):
+            refreshed = self.queue.get(file_hash)
+            if refreshed is not None and refreshed["status"] == "complete":
+                break
+            if not active:
+                break
+            # Round 1 covers the whole file; later rounds re-stripe only
+            # the CURRENT holes (stalled-peer reassignment): each round's
+            # regions are rebuilt from the live gap list, so a peer that
+            # died mid-region gets its bytes reassigned to the survivors.
+            gaps = (
+                [(0, size)]
+                if round_no == 0
+                else self.queue.gap_ranges(file_hash)
+            )
+            if not gaps:
+                break
+            regions = _regions_from_gaps(gaps, len(active))
+            log.info(
+                "DOWNLOAD race start: hash=%s, round=%d, peers=%d, "
+                "gaps=%d, covered=%d",
+                file_hash, round_no + 1, len(active), len(gaps),
+                sum(e - s for s, e in regions),
+            )
+
+            tasks = {
+                asyncio.create_task(
+                    self._attempt_peer(
+                        endpoint,
+                        file_hash,
+                        size,
+                        file_hash_bytes,
+                        progress_callback,
+                        start_offset=start,
+                        end_offset=end,
+                    ),
+                    name=(
+                        f"dl-peer-{endpoint['host']}:{endpoint['port']}"
+                        f"-r{round_no}"
+                    ),
+                ): index
+                for (index, endpoint), (start, end) in zip(active, regions)
+                if end > start
+            }
+            pending = set(tasks)
+            try:
+                while pending:
+                    done, pending = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in done:
+                        attempts.append(task.result())
+                    refreshed = self.queue.get(file_hash)
+                    if refreshed is not None and refreshed["status"] == "complete":
+                        # First winner takes the file; the losing peers are
+                        # cancelled mid-transfer.
+                        for task in pending:
+                            task.cancel()
+                        if pending:
+                            await asyncio.gather(
+                                *pending, return_exceptions=True
+                            )
+                        finalized = self.queue.finalize(
+                            file_hash, verify=verify
+                        )
+                        winner = next(
+                            (a for a in attempts if a.get("complete")),
+                            attempts[-1] if attempts else {},
+                        )
+                        log.info(
+                            "DOWNLOAD race won: hash=%s, rounds=%d",
+                            file_hash, round_no + 1,
+                        )
+                        return {
+                            "status": "complete",
+                            "outcome": winner,
+                            "finalized": finalized,
+                        }
+                # Peers that delivered nothing this round are dead for
+                # this run — their slice is reassigned to the survivors.
+                survivors = []
+                for index, endpoint in active:
+                    task = next(
+                        (t for t, i in tasks.items() if i == index), None
+                    )
+                    res = (
+                        task.result()
+                        if task is not None
+                        and task.done()
+                        and not task.cancelled()
+                        else None
+                    )
+                    if (
+                        isinstance(res, dict)
+                        and res.get("bytes_received", 0) == 0
+                        and not res.get("complete")
+                    ):
+                        continue
+                    survivors.append((index, endpoint))
+                active = survivors
+            finally:
+                for task in tasks:
+                    if not task.done():
                         task.cancel()
-                    if pending:
-                        await asyncio.gather(*pending, return_exceptions=True)
-                    finalized = self.queue.finalize(file_hash, verify=verify)
-                    winner = next(
-                        (a for a in attempts if a.get("complete")),
-                        attempts[-1] if attempts else {},
-                    )
-                    log.info(
-                        "DOWNLOAD race won: hash=%s, attempts=%d", file_hash,
-                        len(attempts),
-                    )
-                    return {
-                        "status": "complete",
-                        "outcome": winner,
-                        "finalized": finalized,
-                    }
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         return {
             "status": "incomplete",

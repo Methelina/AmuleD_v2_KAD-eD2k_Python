@@ -1328,6 +1328,8 @@ async def _run_kad_sources(args: argparse.Namespace) -> dict:
                     ),
                     buddy_ip=src.buddy_ip or None,
                     buddy_port=src.buddy_port or None,
+                    ipv6=getattr(src, "ipv6", None),
+                    buddy_ipv6=getattr(src, "buddy_ipv6", None),
                 )
             )
         first_buddy = next(
