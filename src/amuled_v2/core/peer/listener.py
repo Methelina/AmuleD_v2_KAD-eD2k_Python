@@ -389,8 +389,16 @@ class _PreambleTransport:
             return self._pending.pop(0)
         return await self._delegate.recv()
 
-    async def send(self, opcode: int, payload: bytes) -> None:
-        await self._delegate.send(opcode, payload)
+    async def send(
+        self, opcode: int, payload: bytes, protocol: int | None = None
+    ) -> None:
+        # ``protocol`` accepted for signature parity with StreamTransport
+        # (the AICH responder sends EMULE-protocol packets through it);
+        # the preamble is finished, so the delegate's own framing applies.
+        if protocol is None:
+            await self._delegate.send(opcode, payload)
+        else:
+            await self._delegate.send(opcode, payload, protocol=protocol)
 
     def close(self) -> None:
         self._delegate.close()
@@ -1087,6 +1095,7 @@ class IncomingPeerSession:
                     throttle=self._throttle,
                     allow_compression=self._allow_compression,
                     on_start_upload_request=_on_start_upload_request,
+                    aich_handler=self._handle_aich_request,
                 )
                 try:
                     await _run_upload_engine(

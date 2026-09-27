@@ -50,6 +50,9 @@ __all__ = [
     "aich_part_recovery_data",
     "aich_parse_recovery_data",
     "aich_rebuild_master_from_part",
+    "aich_part_path_ident",
+    "aich_subtree_leaf_idents",
+    "aich_verified_part_blocks",
 ]
 
 _AICH_HASH_SIZE = 20
@@ -354,6 +357,139 @@ def aich_part_recovery_data(result: AichHashResult, part_index: int) -> bytes:
             out += struct.pack("<H", entry_ident) + entry_hash
         out += struct.pack("<H", 0)
     return bytes(out)
+
+
+def aich_part_path_ident(part_index: int, file_size: int) -> tuple[int, int, int]:
+    """Walk the size-only split from the root to the part node.
+
+    Returns ``(part_ident, part_size, part_is_left)`` — the ident encoding
+    matches aich_part_recovery_data (MSB-first, leading root bit).
+    """
+    part_start = part_index * PARTSIZE
+    if part_start < 0 or part_start >= file_size:
+        raise AichError(f"part index out of range: {part_index}")
+    part_size = min(PARTSIZE, file_size - part_start)
+
+    node_start, node_size, ident = 0, file_size, 1
+    while not (node_start == part_start and node_size == part_size):
+        base_size = BLOCKSIZE if node_size <= PARTSIZE else PARTSIZE
+        block_count = (node_size + base_size - 1) // base_size
+        left_block_count = (
+            (block_count + 1) // 2 if ident & 1 else block_count // 2
+        )
+        left_size = left_block_count * base_size
+        if left_size >= node_size:
+            left_size = (block_count // 2) * base_size
+        go_left = part_start < node_start + left_size
+        if go_left:
+            ident = (ident << 1) | 1
+            node_size = left_size
+        else:
+            ident = (ident << 1) | 0
+            node_start += left_size
+            node_size -= left_size
+    return ident, part_size, bool(ident & 1)
+
+
+def aich_subtree_leaf_idents(
+    part_ident: int, part_size: int, part_is_left: bool
+) -> list[int]:
+    """Leaf idents of the part subtree, left-to-right.
+
+    Mirrors the builder's _emit: entering a node shifts in the NODE's own
+    is_left bit (root's children of a single-part file get 0x3/0x2 from
+    ident 1, their children 0x7/0x6, etc.).
+    """
+    idents: list[int] = []
+
+    def _emit(cur_ident: int, cur_count: int, cur_is_left: bool) -> None:
+        cur_ident = (cur_ident << 1) | (1 if cur_is_left else 0)
+        if cur_count == 1:
+            idents.append(cur_ident)
+            return
+        left_count = (cur_count + 1) // 2 if cur_is_left else cur_count // 2
+        _emit(cur_ident, left_count, True)
+        _emit(cur_ident, cur_count - left_count, False)
+
+    _emit(
+        part_ident, (part_size + BLOCKSIZE - 1) // BLOCKSIZE, part_is_left
+    )
+    return idents
+
+
+def aich_verified_part_blocks(
+    recovery: bytes,
+    part_index: int,
+    file_size: int,
+    expected_master: bytes,
+) -> list[bytes]:
+    """Extract and AUTHENTICATE the part's verified block hashes from a
+    peer recovery blob (client-side counterpart of CreatePartRecoveryData).
+
+    The blob's sibling hashes + the extracted part leaves must rebuild the
+    ``expected_master`` (SHA1 chain) — otherwise the blob is rejected with
+    AichError.  Returns the part's block hashes left-to-right.
+    """
+    part_ident, part_size, part_is_left = aich_part_path_ident(
+        part_index, file_size
+    )
+    entries = aich_parse_recovery_data(recovery)
+
+    leaf_idents = aich_subtree_leaf_idents(part_ident, part_size, part_is_left)
+    part_blocks: list[bytes] = []
+    for leaf_ident in leaf_idents:
+        digest = entries.get(leaf_ident)
+        if digest is None:
+            raise AichError(
+                f"recovery blob misses part leaf ident {leaf_ident:#x}"
+            )
+        part_blocks.append(digest)
+
+    # Authenticate: rebuild the master from the part subtree + siblings.
+    part_hash = _build_tree(
+        part_blocks, part_index * PARTSIZE, part_size, part_is_left
+    ).hash
+    # Re-walk collecting the sibling chain (ident -> which side the
+    # part-side took), bottom-up: reverse of the top-down walk.
+    node_start, node_size, ident = 0, file_size, 1
+    chain: list[tuple[bool, int]] = []  # (part_side_is_left, sibling_ident)
+    while not (node_start == part_index * PARTSIZE and node_size == part_size):
+        base_size = BLOCKSIZE if node_size <= PARTSIZE else PARTSIZE
+        block_count = (node_size + base_size - 1) // base_size
+        left_block_count = (
+            (block_count + 1) // 2 if ident & 1 else block_count // 2
+        )
+        left_size = left_block_count * base_size
+        if left_size >= node_size:
+            left_size = (block_count // 2) * base_size
+        go_left = part_index * PARTSIZE < node_start + left_size
+        if go_left:
+            sibling_ident = (ident << 1) | 0
+            chain.append((True, sibling_ident))
+            node_size = left_size
+        else:
+            sibling_ident = (ident << 1) | 1
+            chain.append((False, sibling_ident))
+            node_start += left_size
+            node_size -= left_size
+        ident = (ident << 1) | (1 if go_left else 0)
+    combined = part_hash
+    for part_side_left, sibling_ident in reversed(chain):
+        sibling_hash = entries.get(sibling_ident)
+        if sibling_hash is None:
+            raise AichError(
+                f"recovery blob misses sibling ident {sibling_ident:#x}"
+            )
+        combined = (
+            sha1_digest(combined + sibling_hash)
+            if part_side_left
+            else sha1_digest(sibling_hash + combined)
+        )
+    if combined != expected_master:
+        raise AichError(
+            "recovery blob does not rebuild the trusted master"
+        )
+    return part_blocks
 
 
 # ---------------------------------------------------------------------------

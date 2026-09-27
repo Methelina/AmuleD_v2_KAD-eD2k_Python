@@ -35,7 +35,7 @@ import zlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Protocol, runtime_checkable
+from typing import Awaitable, Callable, Optional, Protocol, runtime_checkable
 
 from amuled_v2.core.codec.binary import BinaryWriter
 from amuled_v2.core.hashes.ed2k import Ed2kHashResult, PARTSIZE, ed2k_hash_file
@@ -457,6 +457,7 @@ class UploadSession:
         throttle: Optional[UploadThrottle] = None,
         allow_compression: bool = True,
         on_start_upload_request: Optional[StartUploadHook] = None,
+        aich_handler: Optional[Callable[[bytes, UploadTransport], Awaitable[None]]] = None,
     ) -> None:
         self.transport: UploadTransport = transport
         self.block_source: BlockSource = block_source
@@ -465,6 +466,10 @@ class UploadSession:
         # Hook deciding STARTUPLOADREQ: accept (slot granted) or queue(rank).
         # Wired to core.upload.queue.UploadQueue by the incoming listener.
         self.on_start_upload_request: Optional[StartUploadHook] = on_start_upload_request
+        # AICH responder hook (stage X): called for OP_AICHREQUEST inside
+        # the engine loop, so recovery data is served while the upload
+        # session is still open.
+        self.aich_handler = aich_handler
         self.stats: UploadSessionStats = UploadSessionStats()
 
     async def _send(self, opcode: int, payload: bytes) -> None:
@@ -751,6 +756,18 @@ class UploadSession:
                         break
                     elif opcode == OP_STARTUPLOADREQ:
                         await self._handle_start_upload_request(payload)
+                    elif opcode == 0x9B and self.aich_handler is not None:
+                        # OP_AICHREQUEST inside the engine loop (stage X):
+                        # the served client asks for recovery data while
+                        # the upload session is still open.
+                        try:
+                            await self.aich_handler(payload, self.transport)
+                        except Exception as exc:
+                            log.error(
+                                "AICH handler failed inside engine loop: "
+                                "%r",
+                                exc,
+                            )
                     else:
                         log.debug(
                             "Ignoring unsupported upload opcode: 0x%02X", opcode

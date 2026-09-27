@@ -476,3 +476,133 @@ def test_resolve_sources_self_record_filter() -> None:
     endpoints = runner.resolve_sources("6" * 32)
     assert len(endpoints) == 1
     assert endpoints[0]["port"] == 3
+
+
+def test_aich_block_narrowing_salvage(tmp_path) -> None:
+    """AICH block-level narrowing: a PRIOR clean download stores the
+    trusted master; a second corrupted download of the same file must
+    punch only the corrupt 180 KB block (not the whole part) — proven by
+    the served-bytes bound (< size + one block + slack)."""
+    from amuled_v2 import state as state_module
+    from amuled_v2.core.upload.queue import UploadQueue
+
+    async def scenario() -> None:
+        state_module.DB_FILE = tmp_path / "state.db"
+        backend = state_module.StateBackend()
+        backend.connect()
+
+        path = tmp_path / "narrow_sample.bin"
+        data = os.urandom(300_000)  # 2 blocks: 184320 + 115680
+        path.write_bytes(data)
+        hashed = ed2k_hash_file(str(path))
+        shared = SharedFile(
+            file_hash=hashed.file_hash,
+            name=path.name,
+            size=hashed.file_size,
+            path=str(path),
+            hash_result=hashed,
+        )
+
+        source = _FakeSource(shared)
+        await source.start()
+
+        listener = IncomingPeerServer(
+            identity=LocalIdentity(
+                user_hash=_LOCAL_HASH,
+                client_id=1,
+                tcp_port=0,
+                nickname="AmuleD-narrow",
+            ),
+            resolver=_StaticResolver(None),
+            upload_queue=UploadQueue(),
+            host="127.0.0.1",
+            port=0,
+            idle_timeout=30.0,
+        )
+        await listener.start()
+
+        def make_runner(queue) -> DownloadRunner:
+            runner = DownloadRunner(
+                queue,
+                local_port=listener.bound_port,
+                max_peers=1,
+                plain_dial_ok=False,
+                connection_source=listener.expect_connection_from,
+                callback_identity={
+                    "tcp_port": listener.bound_port,
+                    "user_hash": bytes.fromhex("7" * 32),
+                },
+            )
+            runner.source_provider = lambda h, limit: [
+                {
+                    "client_id": 0x7F000001,
+                    "client_port": 1,
+                    "user_hash": "A1" * 16,
+                    "source_type": "kad6",
+                    "kad_udp_port": source.udp_port,
+                }
+            ]
+            return runner
+
+        try:
+            # Pass 1: clean download -> the AICH audit stores the master.
+            queue1 = DownloadQueue(
+                state=backend,
+                temp_dir=tmp_path / "temp1",
+                incoming_dir=tmp_path / "inc1",
+            )
+            queue1.add(
+                file_hash=shared.file_hash.hex(),
+                name=shared.name,
+                size=shared.size,
+            )
+            r1 = await asyncio.wait_for(
+                make_runner(queue1).run(shared.file_hash.hex()), _IO_TIMEOUT
+            )
+            assert r1.get("status") == "complete", r1
+            assert backend.get_aich_master(shared.file_hash.hex()) is not None
+            served_clean = source._served_box[0]
+
+            # Reset the download (keep the finalized incoming copy) so
+            # pass 2 starts from a fresh queue entry.
+            queue1.cancel(shared.file_hash.hex(), keep_files=True)
+
+            # Pass 2: same file, fresh queue, corrupted first block.
+            queue2 = DownloadQueue(
+                state=backend,
+                temp_dir=tmp_path / "temp2",
+                incoming_dir=tmp_path / "inc2",
+            )
+            queue2.add(
+                file_hash=shared.file_hash.hex(),
+                name=shared.name,
+                size=shared.size,
+            )
+            orig_record_block = queue2.record_block
+            poisoned = {"done": False}
+
+            def poisoned_record_block(file_hash: str, start: int, data: bytes):
+                if not poisoned["done"]:
+                    poisoned["done"] = True
+                    data = bytes([data[0] ^ 0xFF]) + data[1:]
+                return orig_record_block(file_hash, start, data)
+
+            queue2.record_block = poisoned_record_block
+
+            r2 = await asyncio.wait_for(
+                make_runner(queue2).run(shared.file_hash.hex()), _IO_TIMEOUT
+            )
+            assert r2.get("status") == "complete", r2
+            assert r2["finalized"]["verified"] is True, r2
+            # eMuleAI semantics (PartFile.cpp AICHRecoveryDataAvailable
+            # :7108-7221): the corrupt 180 KB block is refetched while the
+            # good blocks are kept - the winning round-2 transfer must
+            # cover exactly the narrowed range, not the whole file.
+            winner = r2["outcome"]
+            assert winner["bytes_received"] == 184320, winner
+            assert winner["detail"] == "transfer finished", winner
+        finally:
+            await listener.close()
+            await source.stop()
+
+    asyncio.run(scenario())
