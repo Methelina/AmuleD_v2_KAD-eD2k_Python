@@ -29,9 +29,15 @@ Wire framing and opcode semantics are defined in
 ``src/amuled_v2/core/kad/routing.py``.
 
 src/amuled_v2/core/kad/source_search.py
-Version:     0.1.0
+Version:     0.2.0
 Author:      Soror L.'.L'.
-Updated:     2026-09-23
+Updated:     2026-09-27
+
+Patch Notes v0.2.0 (Soror L'.L'.):
+  [+] Capture TAG_IPV6 ("ip6") and TAG_SERVINGBUDDYIPV6 ("bi6") source-record
+      tags as ipv6/buddy_ipv6 fields (Search.cpp:915-923 write, :1195-1209 parse).
+  [+] Add ipv6, buddy_ipv6 to KadFileSource + to_dict(); pass through from
+      parse_search_res_source_entries fields.
 
 Patch Notes v0.1.0 (Soror L'.L'.):
   [+] Kad2 file source search: KadFileSource, KadSourceSearchReport,
@@ -48,6 +54,7 @@ import struct
 import time
 import zlib
 from dataclasses import dataclass, field
+from ipaddress import AddressValueError
 from typing import Callable, Optional, Tuple
 
 from amuled_v2.core.kad.packets import (
@@ -100,6 +107,29 @@ _TAGNAME_SERVERIP = b"\xFB"
 _TAGNAME_SERVERPORT = b"\xFA"
 _TAGNAME_BUDDYHASH = b"\xF8"
 _TAGNAME_ENCRYPTION = b"\xF3"
+_TAGNAME_IPV6 = b"ip6"
+_TAGNAME_BUDDYIPV6 = b"bi6"
+
+
+def _parse_ipv6_hex(hex_val: str) -> Optional[str]:
+    """Canonicalize a 32-char hex IPv6 (network/big-endian) to a compressed str.
+
+    Mirrors ``strmd4`` decoding on parse (Search.cpp:1195-1209): the 32-char
+    hex string is the 16 raw bytes in big-endian/network order.  Returns None
+    and logs a debug on malformed input rather than raising.
+    """
+    if len(hex_val) != 32:
+        log.debug(
+            "KAD/CODEC malformed TAG_IPV6 value: length=%d (expected 32)",
+            len(hex_val),
+        )
+        return None
+    try:
+        raw = bytes.fromhex(hex_val)
+        return str(ipaddress.IPv6Address(raw))
+    except (ValueError, AddressValueError) as exc:
+        log.debug("KAD/CODEC malformed TAG_IPV6 value: %r error=%s", hex_val, exc)
+        return None
 
 
 @dataclass(frozen=False)
@@ -123,6 +153,8 @@ class KadFileSource:
     buddy_port: int = 0
     buddy_hash: Optional[str] = None
     crypt_options: int = 0
+    ipv6: Optional[str] = None
+    buddy_ipv6: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Return a JSON-serializable dict of all fields."""
@@ -137,6 +169,8 @@ class KadFileSource:
             "buddy_port": self.buddy_port,
             "buddy_hash": self.buddy_hash,
             "crypt_options": self.crypt_options,
+            "ipv6": self.ipv6,
+            "buddy_ipv6": self.buddy_ipv6,
             "dialable": self.ip is not None and self.tcp_port > 0,
         }
 
@@ -195,6 +229,13 @@ def parse_search_res_source_entries(
     - ``0xF8`` BUDDYHASH  -- string; the buddy's KadID hash (raw string).
     - ``0xF3`` ENCRYPTION  -- uint8; encryption options bitmask.
 
+    eMuleAI also publishes IPv6 source/buddy addresses as string-typed tags
+    (Search.cpp:915-923 write, :1195-1209 parse):
+
+    - ``b"ip6"`` TAG_IPV6            -- 32-char hex of the 16-byte IPv6 address
+      (network/big-endian order).  ``b"bi6"`` TAG_SERVINGBUDDYIPV6 -- same
+      encoding for the serving buddy's IPv6 (the buddy counterpart of SERVERIP).
+
     FILESIZE / FILENAME tags, if present, are ignored.
     """
     raw = bytes(payload)
@@ -228,6 +269,8 @@ def parse_search_res_source_entries(
             "buddy_port": 0,
             "buddy_hash": None,
             "crypt_options": 0,
+            "ipv6": None,
+            "buddy_ipv6": None,
         }
         for t_name, _t_type, t_value in tags:
             if t_name == _TAGNAME_SOURCETYPE and isinstance(t_value, int):
@@ -259,6 +302,10 @@ def parse_search_res_source_entries(
                 fields["buddy_hash"] = t_value
             elif t_name == _TAGNAME_ENCRYPTION and isinstance(t_value, int):
                 fields["crypt_options"] = t_value
+            elif t_name == _TAGNAME_IPV6 and isinstance(t_value, str):
+                fields["ipv6"] = _parse_ipv6_hex(t_value)
+            elif t_name == _TAGNAME_BUDDYIPV6 and isinstance(t_value, str):
+                fields["buddy_ipv6"] = _parse_ipv6_hex(t_value)
         entries.append((source_id, fields))
     return entries
 
@@ -545,6 +592,8 @@ async def kad_file_source_search(
                         buddy_port=fields["buddy_port"],
                         buddy_hash=fields["buddy_hash"],
                         crypt_options=fields["crypt_options"],
+                        ipv6=fields["ipv6"],
+                        buddy_ipv6=fields["buddy_ipv6"],
                     )
                     last_progress = time.monotonic()
                     if len(sources) >= max_sources:
@@ -682,6 +731,8 @@ async def kad_file_source_search(
                         buddy_port=fields["buddy_port"],
                         buddy_hash=fields["buddy_hash"],
                         crypt_options=fields["crypt_options"],
+                        ipv6=fields["ipv6"],
+                        buddy_ipv6=fields["buddy_ipv6"],
                     )
                     if len(sources) >= max_sources:
                         break

@@ -565,6 +565,10 @@ class AmuleDKernel:
                 ROOT,
                 state_backend=self.state,
                 verbose=False,
+                # Serving-buddy customer (stage X): our own userhash lets
+                # the spider register with an external buddy once accepted.
+                buddy_tcp_port=self._tcp_port,
+                buddy_userhash=bytes(self.identity.user_hash),
             )
             spider_task = asyncio.create_task(self.spider.run(self.stop))
         else:
