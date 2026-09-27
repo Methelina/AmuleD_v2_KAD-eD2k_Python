@@ -65,6 +65,10 @@ BATCH = 24
 DEFAULT_PORT = int(os.environ.get("AMULED_KAD_SPIDER_PORT", "4672"))
 STALE_DAYS = int(os.environ.get("AMULED_KAD_SPIDER_STALE_DAYS", "7"))
 MAX_POOL = int(os.environ.get("AMULED_KAD_SPIDER_MAX_POOL", "2000"))
+# Stage X rotation: a hello/ping left unanswered for this long counts as a
+# fail; a node with MAX_NODE_FAILS fails is evicted from the pool.
+HELLO_PING_TIMEOUT_S = float(os.environ.get("AMULED_KAD_SPIDER_REQ_TIMEOUT", "90"))
+MAX_NODE_FAILS = int(os.environ.get("AMULED_KAD_SPIDER_MAX_FAILS", "3"))
 
 
 def is_routable_ipv4(ip: str) -> bool:
@@ -99,6 +103,7 @@ def build_pool(root: Path, cache: Dict[str, Any]) -> Dict[Tuple[str, int], Dict[
             "ver": int(rec.get("ver", 0)),
             "hellos": int(rec.get("hellos", 0)),
             "pings": int(rec.get("pings", 0)),
+            "fails": int(rec.get("fails", 0)),
             "last_seen": float(rec.get("last_seen", 0)),
             "udp_key": rec.get("udp_key", ""),
         }
@@ -115,6 +120,7 @@ def build_pool(root: Path, cache: Dict[str, Any]) -> Dict[Tuple[str, int], Dict[
                     "ver": n.contact_version,
                     "hellos": 0,
                     "pings": 0,
+                    "fails": 0,
                     "last_seen": 0.0,
                     "udp_key": "",
                 },
@@ -185,6 +191,10 @@ class SpiderEngine:
         self.vivaldi = LocalVivaldi()
         self.strategy_name = active_strategy_name()
         self.ping_sent: Dict[Tuple[str, int], float] = {}
+        # Stage X rotation: hello requests awaiting HELLO_RES; both maps are
+        # swept once a cycle — an entry older than HELLO_PING_TIMEOUT_S
+        # without an answer counts as a fail against the node.
+        self.hello_sent: Dict[Tuple[str, int], float] = {}
         self.state: Dict[str, Any] = {
             "alive": 0,
             "cycle": 0,
@@ -217,6 +227,7 @@ class SpiderEngine:
                     "ver": r["ver"],
                     "hellos": r["hellos"],
                     "pings": r["pings"],
+                    "fails": int(r.get("fails", 0)),
                     "udp_key": r.get("udp_key", ""),
                     "last_seen": r["last_seen"],
                 }
@@ -455,14 +466,17 @@ class SpiderEngine:
                     rec["ver"] = h.version
                     rec["hellos"] = int(rec["hellos"]) + 1
                     rec["last_seen"] = time.time()
+                    rec["fails"] = 0
+                    self.hello_sent.pop(key, None)
                     if rec["hellos"] == 1:
                         state["alive"] += 1
                 elif op == KADEMLIA2_PONG:
                     kadabra.reward((addr[0], addr[1]), 0.2)
                     if rec is not None:
+                        sent_at = self.ping_sent.pop(key, None)
                         rec["pings"] = int(rec["pings"]) + 1
                         rec["last_seen"] = time.time()
-                        sent_at = self.ping_sent.get(key)
+                        rec["fails"] = 0
                         if sent_at:
                             rtt = (time.time() - sent_at) * 1000.0
                             rec["rtt_ewma"] = self.rtt.update(key, rtt)
@@ -532,6 +546,7 @@ class SpiderEngine:
                         pings=int(r["pings"]),
                         rtt_ewma=float(r.get("rtt_ewma", 0.0)),
                         last_seen=float(r["last_seen"]),
+                        fails=int(r.get("fails", 0)),
                     )
 
                 pool = sorted(
@@ -547,11 +562,32 @@ class SpiderEngine:
                     if stop.is_set():
                         break
                     await sendto(build_hello_req(self.own, 4662), ip, port)
+                    self.hello_sent.setdefault((ip, port), time.time())
                     sent += 1
                     if sent % 3 == 0:
-                        self.ping_sent[(ip, port)] = time.time()
+                        self.ping_sent.setdefault((ip, port), time.time())
                         await sendto(build_ping(), ip, port)
                     await asyncio.sleep(0.05)
+
+                # Stage X rotation: sweep outstanding hello/ping requests —
+                # an answer older than HELLO_PING_TIMEOUT_S counts as a fail;
+                # nodes at MAX_NODE_FAILS fails are evicted from the pool.
+                now = time.time()
+                for pending in (self.hello_sent, self.ping_sent):
+                    for key, sent_at in list(pending.items()):
+                        if now - sent_at <= HELLO_PING_TIMEOUT_S:
+                            continue
+                        del pending[key]
+                        rec = nodes.get(key)
+                        if rec is None:
+                            continue
+                        rec["fails"] = int(rec.get("fails", 0)) + 1
+                        if rec["fails"] >= MAX_NODE_FAILS:
+                            del nodes[key]
+                            log.debug(
+                                "node evicted (fails): node=%s:%d fails=%d",
+                                key[0], key[1], rec["fails"],
+                            )
 
                 if (
                     state["cycle"] > 0
@@ -563,6 +599,22 @@ class SpiderEngine:
                     for n in seeds:
                         if not is_routable_ipv4(n.ip):
                             continue
+                        # Stage X rotation: the seed itself enters the pool (fresh
+                        # replacement candidate); dead seeds accumulate fails and
+                        # are evicted by the sweep, keeping the pool breathing.
+                        nodes.setdefault(
+                            (n.ip, n.udp_port),
+                            {
+                                "kad_id": n.kad_id.hex() if isinstance(n.kad_id, bytes) else n.kad_id,
+                                "tcp": n.tcp_port,
+                                "ver": n.contact_version,
+                                "hellos": 0,
+                                "pings": 0,
+                                "fails": 0,
+                                "last_seen": 0.0,
+                                "udp_key": "",
+                            },
+                        )
                         await sendto(build_bootstrap_req(self.own), n.ip, n.udp_port)
                         sent_boot += 1
                     state["last_bootstrap"] = time.time()

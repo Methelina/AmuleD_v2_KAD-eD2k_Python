@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -39,6 +40,8 @@ __all__ = [
     "aich_hash_file",
     "aich_verify_data",
     "aich_verify_file",
+    "materialize_aich_tree",
+    "aich_part_recovery_data",
 ]
 
 _AICH_HASH_SIZE = 20
@@ -202,3 +205,144 @@ def aich_verify_file(path: str | Path, expected_master_hash: bytes) -> bool:
     if len(expected_master_hash) != _AICH_HASH_SIZE:
         raise AichError("expected AICH master hash must contain 20 bytes")
     return aich_hash_file(path).master_hash == bytes(expected_master_hash)
+
+
+# ---------------------------------------------------------------------------
+# Recovery-data builder (stage X wire responder; SHAHashSet.cpp
+# CAICHRecoveryHashSet::CreatePartRecoveryData / CAICHHashTree::WriteHash /
+# WriteLowestLevelHashes).  The wire needs, for one PARTSIZE chunk: the
+# sibling hashes along the path from the tree root to that chunk plus the
+# chunk's own block hashes, each tagged with a MSB-first path identifier
+# (1 = left branch; the identifier's highest set bit marks the root level).
+# ---------------------------------------------------------------------------
+
+
+class _AichNode:
+    """One node of the materialized AICH tree ( wire responder)."""
+
+    __slots__ = ("start", "size", "is_left", "hash", "left", "right")
+
+    def __init__(
+        self,
+        start: int,
+        size: int,
+        is_left: bool,
+        digest: bytes,
+        left: "_AichNode | None" = None,
+        right: "_AichNode | None" = None,
+    ) -> None:
+        self.start = start
+        self.size = size
+        self.is_left = is_left
+        self.hash = digest
+        self.left = left
+        self.right = right
+
+    @property
+    def is_leaf(self) -> bool:
+        return self.left is None and self.right is None
+
+
+def _build_tree(leaves: list[bytes], start: int, size: int, is_left: bool) -> _AichNode:
+    """Materialize the exact splitting tree of _hash_aich_segment from the
+    precomputed leaf (block) hashes — no file access needed."""
+    if size <= BLOCKSIZE:
+        return _AichNode(start, size, is_left, leaves[0])
+    base_size = BLOCKSIZE if size <= PARTSIZE else PARTSIZE
+    block_count = (size + base_size - 1) // base_size
+    left_block_count = (
+        (block_count + 1) // 2 if is_left else block_count // 2
+    )
+    left_size = left_block_count * base_size
+    if left_size >= size:
+        left_size = (block_count // 2) * base_size
+    right_size = size - left_size
+    if left_size <= 0 or right_size <= 0:
+        raise AichError(
+            f"invalid AICH split: size={size}, base={base_size}, "
+            f"left={left_size}, right={right_size}"
+        )
+    # Leaf counts of the subtrees at the CURRENT base granularity.
+    left_leaf_count = (left_size + BLOCKSIZE - 1) // BLOCKSIZE
+    left = _build_tree(leaves[:left_leaf_count], start, left_size, True)
+    right = _build_tree(
+        leaves[left_leaf_count:], start + left_size, right_size, False
+    )
+    return _AichNode(
+        start, size, is_left, sha1_digest(left.hash + right.hash), left, right
+    )
+
+
+def materialize_aich_tree(result: AichHashResult) -> _AichNode:
+    """Rebuild the full AICH tree from a computed hash result."""
+    return _build_tree(
+        list(result.block_hashes), 0, result.file_size, True
+    )
+
+
+def aich_part_recovery_data(result: AichHashResult, part_index: int) -> bytes:
+    """CAICHRecoveryHashSet::CreatePartRecoveryData wire blob for one part.
+
+    Layout (SHAHashSet.cpp:712-758, 766-771):
+        small file: [count16 u16][count16 x (ident u16, hash 20)][u16 0]
+        large file: [u16 0][count32 u16][count32 x (ident u32, hash 20)]
+    Entries: sibling hashes along the root->part path (emitted top-down),
+    then the part's block hashes left-to-right.
+    """
+    file_size = result.file_size
+    if file_size <= BLOCKSIZE:
+        raise AichError("file fits in one block; no AICH recovery data")
+    part_start = part_index * PARTSIZE
+    if part_start < 0 or part_start >= file_size:
+        raise AichError(f"part index out of range: {part_index}")
+    part_size = min(PARTSIZE, file_size - part_start)
+
+    root = materialize_aich_tree(result)
+    if root.hash != bytes(result.master_hash):
+        raise AichError("materialized tree master hash mismatch")
+
+    # Walk root -> the node covering the requested part, collecting the
+    # sibling hashes (emitted top-down, before the part's own leaves).
+    # ident bits accumulate MSB-first; 1 = left branch; the root's own
+    # branch bit is the leading 1 (WriteHash, SHAHashSet.cpp:497-509).
+    entries: list[tuple[int, bytes]] = []
+    node = root
+    ident = 1 if root.is_left else 0
+    while not (node.start == part_start and node.size == part_size):
+        if node.left is None or node.right is None:
+            raise AichError("AICH tree walk hit a leaf before the part node")
+        go_left = part_start < node.left.start + node.left.size
+        sibling = node.right if go_left else node.left
+        sib_ident = (ident << 1) | (1 if sibling.is_left else 0)
+        entries.append((sib_ident, bytes(sibling.hash)))
+        node = node.left if go_left else node.right
+        ident = (ident << 1) | (1 if node.is_left else 0)
+
+    # The part node's own block hashes, left-to-right
+    # (WriteLowestLevelHashes, SHAHashSet.cpp:512-537).
+    def _emit(leaf_node: _AichNode, leaf_ident: int) -> None:
+        leaf_ident = (leaf_ident << 1) | (1 if leaf_node.is_left else 0)
+        if leaf_node.is_leaf:
+            entries.append((leaf_ident, bytes(leaf_node.hash)))
+            return
+        assert leaf_node.left is not None and leaf_node.right is not None
+        _emit(leaf_node.left, leaf_ident)
+        _emit(leaf_node.right, leaf_ident)
+
+    _emit(node, ident)
+
+    use_32bit = file_size > 0xFFFFFFFF  # IsLargeFile()
+    out = bytearray()
+    if use_32bit:
+        out += struct.pack("<H", 0)
+        out += struct.pack("<H", len(entries))
+        for entry_ident, entry_hash in entries:
+            out += struct.pack("<I", entry_ident) + entry_hash
+    else:
+        out += struct.pack("<H", len(entries))
+        for entry_ident, entry_hash in entries:
+            if entry_ident > 0xFFFF:
+                raise AichError(f"AICH identifier exceeds 16 bits: {entry_ident:#x}")
+            out += struct.pack("<H", entry_ident) + entry_hash
+        out += struct.pack("<H", 0)
+    return bytes(out)

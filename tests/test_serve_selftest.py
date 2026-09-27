@@ -9,15 +9,15 @@ ladder over real TCP loopback (127.0.0.1, ephemeral ports):
     -> transfer (REQUESTPARTS -> SENDINGPART/COMPRESSEDPART blocks)
     -> reassembled bytes hashed with MD4 must equal the ED2K file hash.
 
-This is NOT a live acceptance test against a real eMule client: the
-encrypted transport is pending external work (``WIP by external developer``
-markers in core/peer/listener.py).  A real-file variant against the actual
-Incoming folder can be run manually with AMULED_SELFTEST_REAL=1 and
+This is NOT a live acceptance test against a real eMule client: live
+obfuscated acceptance against real peers is verified separately (real since
+session 11, docs/roadmap.md 11h/11i).  A real-file variant against the
+actual Incoming folder can be run manually with AMULED_SELFTEST_REAL=1 and
 AMULED_REAL_INCOMING pointing at a shared file.
 
 tests/test_serve_selftest.py
 Author:      Soror L.'.L.'.
-Updated:     2026-09-25
+Updated:     2026-09-27
 """
 
 from __future__ import annotations

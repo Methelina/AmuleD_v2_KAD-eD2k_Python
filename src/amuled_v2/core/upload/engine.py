@@ -400,7 +400,8 @@ class BlockSource:
 class UploadTransport(Protocol):
     """Abstract transport for an accepted upload peer.
 
-    # WIP by external developer: encrypted transport (BASIC obfuscation / DH) is implemented externally; this session assumes an established transport.
+    The transport may be plain or obfuscated (BASIC/DH): the listener
+    establishes the mode in _expect_first_packet before the engine starts.
     """
 
     async def recv(self) -> Optional[tuple[int, bytes]]:
@@ -438,7 +439,8 @@ class UploadSessionStats:
 class UploadSession:
     """Serves blocks of one :class:`SharedFile` to one peer over a transport.
 
-    # WIP by external developer: encrypted transport (BASIC obfuscation / DH) is implemented externally; this session assumes an established transport.
+    The transport may be plain or obfuscated (BASIC/DH) — the listener
+    establishes the mode before handing the session over.
 
     The session runs a request loop: it receives OP_REQUESTFILENAME,
     OP_HASHSETREQUEST, and OP_REQUESTPARTS / OP_REQUESTPARTS_I64 requests,
@@ -466,7 +468,6 @@ class UploadSession:
         self.stats: UploadSessionStats = UploadSessionStats()
 
     async def _send(self, opcode: int, payload: bytes) -> None:
-        # WIP by external developer: encrypted transport (BASIC obfuscation / DH) is implemented externally; this session assumes an established transport.
         await self.transport.send(opcode, payload)
 
     async def _handle_request_filename(self, payload: bytes) -> None:
@@ -576,7 +577,6 @@ class UploadSession:
     async def _send_block(
         self, start: int, end: int, length: int, is_i64: bool
     ) -> None:
-        # WIP by external developer: encrypted transport (BASIC obfuscation / DH) is implemented externally; this session assumes an established transport.
         file_hash = self.block_source.file_hash
         data = self.block_source.read_block(start, length)
         if self.throttle is not None:
@@ -723,7 +723,6 @@ class UploadSession:
         )
         try:
             while True:
-                # WIP by external developer: encrypted transport (BASIC obfuscation / DH) is implemented externally; this session assumes an established transport.
                 packet = await self.transport.recv()
                 if packet is None:
                     log.info(

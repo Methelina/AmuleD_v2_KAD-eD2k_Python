@@ -163,20 +163,23 @@ def _build_hello_tags(nickname: str, version: int = 0x3C, client_port: int = 0) 
     cap_large_files = 1      # REQUESTPARTS_I64 / SENDINGPART_I64
     cap_kad2 = 9             # kad2-клиент (поиск/публикация/источники)
     cap_no_view_shared = 1   # раздаемые файлы на просмотр не открываем
-    cap_aich = 0             # AICH-ответы не реализованы
+    cap_aich = 1             # OP_AICHREQUEST отвечаем (responder, стадия X)
     cap_udp_version = 0      # aux-UDP (OS_UDP_*) не отвечаем
-    cap_source_exchange = 0  # OP_REQUESTSOURCES не отвечаем
+    cap_source_exchange = 1  # OP_REQUESTSOURCES(2) отвечаем (responder, стадия X)
     cap_extended_requests = 0  # комментарии/файл-теги в ответах не шлём
     cap_accept_comment = 0   # комментарии о файле не принимаем
     cap_multipacket = 0      # multipacket (0xBC) не разбираем
     cap_ext_multipacket = 0  # extended multipacket не разбираем
     cap_file_identifiers = 0  # 0xA4 file identifiers не отвечаем
+    # SecureIdent: 3 = full SUI + v2 capable (SUI core в
+    # core/security/secure_ident.py; BaseClient.cpp:2027).
+    cap_secident = 3
     miso1 = (
         (cap_aich << 29)
         | (cap_unicode << 28)
         | (cap_udp_version << 24)
         | (cap_compression << 20)
-        | (0 << 16)  # SecIdent (крипта — BLOCKED-EXTERNAL)
+        | (cap_secident << 16)
         | (cap_source_exchange << 12)
         | (cap_extended_requests << 8)
         | (cap_accept_comment << 4)
@@ -191,11 +194,12 @@ def _build_hello_tags(nickname: str, version: int = 0x3C, client_port: int = 0) 
     cap_crypt_supports = 1
     cap_crypt_requests = 1
     cap_crypt_requires = 0
+    cap_source_exchange_v2 = 1  # SX2 (OP_REQUESTSOURCES2) отвечаем
     miso2 = (
         (cap_file_identifiers << 13)
         | (0 << 12)  # direct UDP callback (нет)
         | (0 << 11)  # captcha (нет)
-        | (0 << 10)  # source exchange v2 (не отвечаем)
+        | (cap_source_exchange_v2 << 10)
         | (cap_crypt_requires << 9)
         | (cap_crypt_requests << 8)
         | (cap_crypt_supports << 7)
@@ -1149,3 +1153,311 @@ def build_file_status_payload(
         len(payload),
     )
     return payload
+
+
+# ---------------------------------------------------------------------------
+# SecureIdent payloads (stage X; Opcodes.h OP_SECIDENTSTATE/OP_PUBLICKEY/
+# OP_SIGNATURE, protocol byte 0xC5)
+# ---------------------------------------------------------------------------
+
+
+def build_secident_state_payload(state: int, challenge: int) -> bytes:
+    """OP_SECIDENTSTATE: [state u8][challenge u32 LE] (BaseClient.cpp:4907)."""
+    return struct.pack("<BI", state & 0xFF, challenge & 0xFFFFFFFF)
+
+
+def parse_secident_state_payload(payload: bytes) -> tuple[int, int]:
+    """Parse OP_SECIDENTSTATE -> (state, challenge)."""
+    if len(payload) != 5:
+        raise PeerCodecError(
+            f"malformed OP_SECIDENTSTATE: {len(payload)} bytes, expected 5"
+        )
+    state, challenge = struct.unpack("<BI", payload)
+    return state, challenge
+
+
+def build_publickey_payload(pubkey_blob: bytes) -> bytes:
+    """OP_PUBLICKEY: [len u8][pubkey blob] (BaseClient.cpp:4732)."""
+    if not 1 <= len(pubkey_blob) <= 250:
+        raise PeerCodecError(
+            f"public key blob length out of range: {len(pubkey_blob)}"
+        )
+    return bytes((len(pubkey_blob),)) + pubkey_blob
+
+
+def parse_publickey_payload(payload: bytes) -> bytes:
+    """Parse OP_PUBLICKEY -> pubkey blob (BaseClient.cpp:4801 sanity)."""
+    if len(payload) < 10 or len(payload) > 250:
+        raise PeerCodecError(f"malformed OP_PUBLICKEY: {len(payload)} bytes")
+    blob_len = payload[0]
+    if blob_len != len(payload) - 1:
+        raise PeerCodecError(
+            f"OP_PUBLICKEY length mismatch: declared={blob_len}, actual={len(payload) - 1}"
+        )
+    return payload[1:]
+
+
+def build_signature_payload(signature: bytes, ip_kind: int = 0) -> bytes:
+    """OP_SIGNATURE: v1 [len u8][sig]; v2 [len u8][sig][ipkind u8]."""
+    if not 1 <= len(signature) <= 250:
+        raise PeerCodecError(f"signature length out of range: {len(signature)}")
+    payload = bytes((len(signature),)) + signature
+    if ip_kind:
+        payload += bytes((ip_kind & 0xFF,))
+    return payload
+
+
+def parse_signature_payload(payload: bytes) -> tuple[bytes, int]:
+    """Parse OP_SIGNATURE -> (signature, ip_kind) (ip_kind 0 = v1)."""
+    if len(payload) < 11 or len(payload) > 251:
+        raise PeerCodecError(f"malformed OP_SIGNATURE: {len(payload)} bytes")
+    sig_len = payload[0]
+    if sig_len != len(payload) - 1 and sig_len != len(payload) - 2:
+        raise PeerCodecError(
+            f"OP_SIGNATURE length mismatch: declared={sig_len}, payload={len(payload)}"
+        )
+    signature = payload[1:1 + sig_len]
+    ip_kind = payload[1 + sig_len] if len(payload) > 1 + sig_len else 0
+    return signature, ip_kind
+
+
+def miso1_secident_support(tags: tuple[Ed2kTag, ...]) -> int:
+    """Extract the SUI support nibble (bits 16-19) from MISCOPTIONS1 tags.
+
+    BaseClient.cpp:2041-2054: 0 = none, 3 = full SUI + v2 capable.
+    """
+    for tag in tags:
+        if tag.name_id == 0xFA and isinstance(tag.value, int):
+            return (int(tag.value) >> 16) & 0x0F
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Source exchange payloads (stage X; Opcodes.h OP_REQUESTSOURCES(2)/
+# OP_ANSWERSOURCES(2), protocol byte 0xC5).  Layout oracle: KnownFile.cpp
+# CKnownFile::CreateSrcInfoPacket (1373-1526), PartFile.cpp:5015-5136,
+# ListenSocket.cpp ProcessExtPacket (2265-2335).  CSafeMemFile writes
+# native LE on x86; the SX2 v3 high-id id is the one exception — there the
+# hybrid id is written WITHOUT the ntohl ("v3 high-id without htonl").
+# ---------------------------------------------------------------------------
+
+MAX_ANSWER_SOURCES = 500  # CreateSrcInfoPacket hard cap (KnownFile.cpp:1504)
+
+
+@dataclass(frozen=True)
+class SXSource:
+    """One source entry for OP_ANSWERSOURCES(2).
+
+    ``client_id`` is the classic ed2k high-id (a.b.c.d as a<<24|b<<16|c<<8|d,
+    exactly as stored in our file_sources rows).  ``user_hash`` enables the
+    obfuscated dial for v2+ entries.
+    """
+
+    client_id: int
+    port: int
+    server_ip: int = 0
+    server_port: int = 0
+    user_hash: bytes | None = None
+    connect_options: int = 0
+
+
+def parse_request_sources2(payload: bytes) -> tuple[int, int, bytes]:
+    """OP_REQUESTSOURCES2: [ver u8][options u16 LE][hash 16] (ListenSocket.cpp:2285)."""
+    if len(payload) != 19:
+        raise PeerCodecError(
+            f"malformed OP_REQUESTSOURCES2: {len(payload)} bytes, expected 19"
+        )
+    version, options = struct.unpack("<BH", payload[:3])
+    return version, options, payload[3:19]
+
+
+def parse_request_sources(payload: bytes) -> bytes:
+    """Legacy OP_REQUESTSOURCES: [hash 16] only (ListenSocket.cpp:2298)."""
+    if len(payload) != 16:
+        raise PeerCodecError(
+            f"malformed OP_REQUESTSOURCES: {len(payload)} bytes, expected 16"
+        )
+    return payload
+
+
+def _sx_entry(source: SXSource, version: int) -> bytes:
+    if version >= 3 and source.client_id >= 16_000_000:
+        # SX2 v3+ high-id: hybrid id written without ntohl, so the wire
+        # bytes are the dotted-order IP (PartFile.cpp:5099-5101).
+        ident = struct.pack(">I", source.client_id & 0xFFFFFFFF)
+    else:
+        # v1/v2 (and any low id): id passed through htonl before the
+        # native-LE WriteUInt32 -> wire bytes = LE of the ed2k client id.
+        ident = struct.pack("<I", source.client_id & 0xFFFFFFFF)
+    entry = ident + struct.pack("<H", source.port & 0xFFFF)
+    entry += struct.pack("<IH", source.server_ip & 0xFFFFFFFF,
+                         source.server_port & 0xFFFF)
+    if version >= 2:
+        entry += bytes(source.user_hash) if source.user_hash else b"\x00" * 16
+    if version >= 4:
+        entry += bytes((source.connect_options & 0xFF,))
+    return entry
+
+
+def build_answer_sources2(
+    version: int, file_hash: bytes, sources: list[SXSource]
+) -> bytes:
+    """OP_ANSWERSOURCES2: [ver u8][hash 16][count u16 LE][entries]."""
+    if len(file_hash) != 16:
+        raise PeerCodecError("file hash must be 16 bytes")
+    version = max(1, min(4, version))
+    body = bytes((version,)) + file_hash
+    body += struct.pack("<H", len(sources))
+    for source in sources[:MAX_ANSWER_SOURCES]:
+        body += _sx_entry(source, version)
+    return body
+
+
+def build_answer_sources(
+    file_hash: bytes, sources: list[SXSource], entry_version: int = 1
+) -> bytes:
+    """Legacy OP_ANSWERSOURCES: [hash 16][count u16 LE][entries].
+
+    No version byte on the wire (SX1); the entry tails still follow the
+    peer's SX1 version (KnownFile.cpp: byUsedVersion =
+    GetSourceExchange1Version()).
+    """
+    if len(file_hash) != 16:
+        raise PeerCodecError("file hash must be 16 bytes")
+    entry_version = max(1, min(4, entry_version))
+    body = file_hash + struct.pack("<H", len(sources))
+    for source in sources[:MAX_ANSWER_SOURCES]:
+        body += _sx_entry(source, entry_version)
+    return body
+
+
+def miso1_source_exchange(tags: tuple[Ed2kTag, ...]) -> int:
+    """SX1 version nibble (bits 12-15) of MISCOPTIONS1 (BaseClient.cpp)."""
+    for tag in tags:
+        if tag.name_id == 0xFA and isinstance(tag.value, int):
+            return (int(tag.value) >> 12) & 0x0F
+    return 0
+
+
+def build_request_sources2_payload(
+    version: int, options: int, file_hash: bytes
+) -> bytes:
+    """OP_REQUESTSOURCES2: [ver u8][options u16 LE][hash 16]."""
+    if len(file_hash) != 16:
+        raise PeerCodecError("file hash must be 16 bytes")
+    return struct.pack("<BH", version & 0xFF, options & 0xFFFF) + file_hash
+
+
+def build_request_sources_payload(file_hash: bytes) -> bytes:
+    """Legacy OP_REQUESTSOURCES: [hash 16]."""
+    if len(file_hash) != 16:
+        raise PeerCodecError("file hash must be 16 bytes")
+    return file_hash
+
+
+def _parse_sx_entry(
+    payload: bytes, offset: int, version: int
+) -> tuple[SXSource, int]:
+    if version >= 3:
+        (client_id,) = struct.unpack(">I", payload[offset:offset + 4])
+    else:
+        (client_id,) = struct.unpack("<I", payload[offset:offset + 4])
+    port = struct.unpack("<H", payload[offset + 4:offset + 6])[0]
+    server_ip = struct.unpack("<I", payload[offset + 6:offset + 10])[0]
+    server_port = struct.unpack("<H", payload[offset + 10:offset + 12])[0]
+    offset += 12
+    user_hash = None
+    connect_options = 0
+    if version >= 2:
+        user_hash = payload[offset:offset + 16]
+        offset += 16
+    if version >= 4:
+        connect_options = payload[offset]
+        offset += 1
+    return (
+        SXSource(
+            client_id=client_id,
+            port=port,
+            server_ip=server_ip,
+            server_port=server_port,
+            user_hash=user_hash,
+            connect_options=connect_options,
+        ),
+        offset,
+    )
+
+
+def parse_answer_sources2(payload: bytes) -> tuple[int, bytes, list[SXSource]]:
+    """OP_ANSWERSOURCES2 -> (version, file_hash, entries)."""
+    if len(payload) < 19:
+        raise PeerCodecError(
+            f"malformed OP_ANSWERSOURCES2: {len(payload)} bytes"
+        )
+    version = payload[0]
+    file_hash = payload[1:17]
+    (count,) = struct.unpack("<H", payload[17:19])
+    sources: list[SXSource] = []
+    offset = 19
+    for _ in range(count):
+        source, offset = _parse_sx_entry(payload, offset, version)
+        sources.append(source)
+    return version, file_hash, sources
+
+
+def parse_answer_sources(
+    payload: bytes, version: int
+) -> tuple[int, bytes, list[SXSource]]:
+    """Legacy OP_ANSWERSOURCES -> (entry_version, file_hash, entries).
+
+    SX1 carries no version byte; the caller supplies the entry version the
+    writer used (the peer's SX1 version).
+    """
+    if len(payload) < 18:
+        raise PeerCodecError(
+            f"malformed OP_ANSWERSOURCES: {len(payload)} bytes"
+        )
+    file_hash = payload[:16]
+    (count,) = struct.unpack("<H", payload[16:18])
+    sources: list[SXSource] = []
+    offset = 18
+    for _ in range(count):
+        source, offset = _parse_sx_entry(payload, offset, version)
+        sources.append(source)
+    return version, file_hash, sources
+
+
+# ---------------------------------------------------------------------------
+# AICH payloads (stage X; Opcodes.h OP_AICHREQUEST 0x9B / OP_AICHANSWER 0x9C,
+# protocol byte 0xC5).  Request: [hash 16][part u16][master 20].  Answer:
+# the same 38-byte header followed by the recovery data blob (see
+# aich.aich_part_recovery_data; SHAHashSet.cpp:766-771).
+# ---------------------------------------------------------------------------
+
+
+def build_aich_request_payload(file_hash: bytes, part: int, master: bytes) -> bytes:
+    if len(file_hash) != 16 or len(master) != 20:
+        raise PeerCodecError("AICH request needs hash16 and master20")
+    return file_hash + struct.pack("<H", part & 0xFFFF) + master
+
+
+def parse_aich_request_payload(payload: bytes) -> tuple[bytes, int, bytes]:
+    if len(payload) != 38:
+        raise PeerCodecError(
+            f"malformed OP_AICHREQUEST: {len(payload)} bytes, expected 38"
+        )
+    return payload[:16], struct.unpack("<H", payload[16:18])[0], payload[18:38]
+
+
+def build_aich_answer_payload(
+    file_hash: bytes, part: int, master: bytes, recovery: bytes
+) -> bytes:
+    return build_aich_request_payload(file_hash, part, master) + recovery
+
+
+def parse_aich_answer_payload(payload: bytes) -> tuple[bytes, int, bytes, bytes]:
+    """OP_AICHANSWER -> (hash, part, master, recovery data)."""
+    if len(payload) < 38:
+        raise PeerCodecError(
+            f"malformed OP_AICHANSWER: {len(payload)} bytes, expected >= 38"
+        )
+    return payload[:16], struct.unpack("<H", payload[16:18])[0], payload[18:38], payload[38:]

@@ -111,23 +111,49 @@ def _parse_user_hash(raw: Any) -> bytes | None:
         raise IdentityError(f"identity.user_hash is not hex: {raw!r}") from exc
 
 
+def _mark_user_hash(raw: bytes) -> bytes:
+    """SO_EMULE markers (Preferences.cpp CreateUserHash): hash[5]=14,
+    hash[14]=111.  GetHashType (BaseClient.cpp) classifies clients by these
+    bytes; an unmarked hash is SO_UNKNOWN, and strict eD2K servers drop
+    such logins after the handshake timeout (verified live 2026-09-27).
+    Applied on load too, so hashes persisted before this fix converge to
+    the marked form (a one-time, documented identity change)."""
+    marked = bytearray(raw)
+    marked[5] = 14
+    marked[14] = 111
+    return bytes(marked)
+
+
 def load_identity() -> AppIdentity:
     """Load the identity from config, generating+persisting the userhash.
 
     A missing/empty ``identity.user_hash`` produces a fresh random 16-byte
     hash that is immediately written back to the config file, so the
     identity is stable across restarts (eMule keeps it in preferences.dat).
+    The hash always carries the SO_EMULE markers (Preferences.cpp
+    CreateUserHash: hash[5]=14, hash[14]=111).
     """
     cfg = load_config()
     section = cfg.get("identity") or {}
     user_hash = _parse_user_hash(section.get("user_hash"))
     if user_hash is None:
         user_hash = os.urandom(16)
+        user_hash = _mark_user_hash(user_hash)
         cfg.setdefault("identity", {})["user_hash"] = user_hash.hex().upper()
         save_config(cfg)
         log.info(
-            "identity: generated new user_hash and persisted it to config"
+            "identity: generated new marked user_hash and persisted it to config"
         )
+    else:
+        marked = _mark_user_hash(user_hash)
+        if marked != user_hash:
+            user_hash = marked
+            cfg.setdefault("identity", {})["user_hash"] = user_hash.hex().upper()
+            save_config(cfg)
+            log.info(
+                "identity: user_hash upgraded with SO_EMULE markers "
+                "(one-time identity change, persisted)"
+            )
     nick = section.get("nick") or "AmuleD"
     tcp_port = int(section.get("tcp_port") or 0)
     client_id = int(section.get("client_id") or 0)

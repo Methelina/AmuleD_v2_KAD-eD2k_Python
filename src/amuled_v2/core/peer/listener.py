@@ -55,6 +55,7 @@ Patch Notes v0.1.0 (Soror L.'.L'.):
 from __future__ import annotations
 
 import asyncio
+import os
 import struct
 import time
 from collections.abc import Callable
@@ -64,10 +65,25 @@ from typing import Any
 from amuled_v2.core.codec.constants import EDONKEY, EMULE
 from amuled_v2.core.peer.codec import (
     C2CTCP,
+    SXSource,
+    build_answer_sources,
+    build_answer_sources2,
+    build_aich_answer_payload,
+    parse_aich_request_payload,
     build_end_of_download_payload,
     build_hello_answer_payload,
     parse_hello,
     parse_file_hash_payload,
+    parse_publickey_payload,
+    parse_request_sources,
+    parse_request_sources2,
+    parse_secident_state_payload,
+    parse_signature_payload,
+    build_publickey_payload,
+    build_secident_state_payload,
+    build_signature_payload,
+    miso1_secident_support,
+    miso1_source_exchange,
 )
 from amuled_v2.core.peer.client import (
     C2CEMULE,
@@ -389,6 +405,8 @@ class IncomingPeerSession:
         idle_timeout: float | None = 300.0,
         traffic_recorder: Callable[[str, int], None] | None = None,
         queue_rank_period: float = 60.0,
+        secure_ident: Any | None = None,
+        source_provider: Callable[[bytes], list[SXSource]] | None = None,
     ) -> None:
         self._reader = reader
         self._writer = writer
@@ -403,6 +421,12 @@ class IncomingPeerSession:
         # the caller-supplied recorder, never by the session.
         self._traffic_recorder = traffic_recorder
         self._queue_rank_period = queue_rank_period
+        # Stage X SecureIdent: shared RSA provider (SecureIdentProvider).
+        self._secure_ident = secure_ident
+        self._sui = {"challenge_in": None, "peer_blob": b""}
+        # Stage X source exchange: answers OP_REQUESTSOURCES(2) from these
+        # rows (None = feature disabled, requests are ignored).
+        self._source_provider = source_provider
         self._peer_name = _format_peer(writer)
         self._transport: StreamTransport | None = None
 
@@ -542,6 +566,23 @@ class IncomingPeerSession:
             self._identity.user_hash.hex().upper(),
         )
 
+        # Stage X SecureIdent: after the info packets we challenge the peer
+        # (BaseClient.cpp SendSecIdentStatePacket via InfoPacketsReceived).
+        if self._secure_ident is not None and self._secure_ident.has_keys:
+            peer_sui = miso1_secident_support(hello.tags)
+            if peer_sui:
+                challenge = int.from_bytes(os.urandom(4), "little") or 1
+                self._sui["challenge_out"] = challenge
+                await transport.send(
+                    C2CEMULE.SECIDENTSTATE,
+                    build_secident_state_payload(2, challenge),
+                    protocol=EMULE,
+                )
+                log.debug(
+                    "SECIDENTSTATE sent: peer=%s, challenge=%d",
+                    self._peer_name, challenge,
+                )
+
         started_upload = False
         last_hash_hex: str | None = None
         session: UploadSession | None = None
@@ -554,6 +595,193 @@ class IncomingPeerSession:
                     "peer closed connection before STARTUPLOADREQ"
                 )
             opcode, payload = packet
+
+            if opcode == C2CEMULE.SECIDENTSTATE:
+                state, challenge = parse_secident_state_payload(payload)
+                self._sui["challenge_in"] = challenge
+                log.debug(
+                    "SECIDENTSTATE received: peer=%s, state=%d, challenge=%d",
+                    self._peer_name, state, challenge,
+                )
+                # Answer with PUBLICKEY + SIGNATURE over [our blob][their
+                # challenge] (BaseClient.cpp SendPublicKeyPacket /
+                # SendSignaturePacket).
+                await transport.send(
+                    C2CEMULE.PUBLICKEY,
+                    build_publickey_payload(self._secure_ident.public_blob),
+                    protocol=EMULE,
+                )
+                signature = self._secure_ident.create_signature(challenge)
+                await transport.send(
+                    C2CEMULE.SIGNATURE,
+                    build_signature_payload(signature),
+                    protocol=EMULE,
+                )
+                continue
+
+            if opcode == C2CEMULE.PUBLICKEY:
+                self._sui["peer_blob"] = parse_publickey_payload(payload)
+                log.debug(
+                    "PUBLICKEY received: peer=%s, len=%d",
+                    self._peer_name, len(self._sui["peer_blob"]),
+                )
+                continue
+
+            if opcode == C2CEMULE.SIGNATURE:
+                signature, _ip_kind = parse_signature_payload(payload)
+                challenge_in = self._sui.get("challenge_out")
+                peer_blob = self._sui.get("peer_blob", b"")
+                if challenge_in is None or not peer_blob:
+                    log.debug(
+                        "SIGNATURE ignored (no challenge/key yet): peer=%s",
+                        self._peer_name,
+                    )
+                    continue
+                from amuled_v2.core.security.secure_ident import SecureIdentProvider
+
+                verified = SecureIdentProvider.verify_signature(
+                    peer_blob, signature, challenge_in
+                )
+                if verified:
+                    self._secure_ident.mark_verified(hello.user_hash.hex().lower())
+                log.info(
+                    "SecureIdent %s: peer=%s, user_hash=%s",
+                    "VERIFIED" if verified else "FAILED",
+                    self._peer_name,
+                    hello.user_hash.hex().upper(),
+                )
+                continue
+
+            if opcode == C2CEMULE.REQUESTSOURCES2:
+                # Source exchange responder (stage X; gate per
+                # ListenSocket.cpp:2289 — SX2 request OR SX1 version > 1).
+                if self._source_provider is None:
+                    continue
+                try:
+                    req_version, _options, req_hash = parse_request_sources2(payload)
+                except Exception as exc:
+                    log.debug(
+                        "REQUESTSOURCES2 ignored (malformed): peer=%s, error=%s",
+                        self._peer_name, exc,
+                    )
+                    continue
+                peer_sx1 = miso1_source_exchange(hello.tags)
+                if not (req_version > 0 or peer_sx1 > 1):
+                    continue
+                try:
+                    sources = self._source_provider(req_hash) or []
+                except Exception as exc:
+                    log.debug(
+                        "source provider failed: peer=%s, error=%s",
+                        self._peer_name, exc,
+                    )
+                    continue
+                if not sources:
+                    continue
+                answer_version = max(1, min(4, req_version))
+                await transport.send(
+                    C2CEMULE.ANSWERSOURCES2,
+                    build_answer_sources2(answer_version, req_hash, sources),
+                    protocol=EMULE,
+                )
+                log.debug(
+                    "ANSWERSOURCES2 sent: peer=%s, hash=%s, version=%d, count=%d",
+                    self._peer_name, req_hash.hex().upper(),
+                    answer_version, len(sources),
+                )
+                continue
+
+            if opcode == C2CEMULE.REQUESTSOURCES:
+                # Legacy SX1: answered only when the peer advertises an SX1
+                # version above 1 (ListenSocket.cpp:2289).
+                if self._source_provider is None:
+                    continue
+                try:
+                    req_hash = parse_request_sources(payload)
+                except Exception as exc:
+                    log.debug(
+                        "REQUESTSOURCES ignored (malformed): peer=%s, error=%s",
+                        self._peer_name, exc,
+                    )
+                    continue
+                if miso1_source_exchange(hello.tags) <= 1:
+                    continue
+                try:
+                    sources = self._source_provider(req_hash) or []
+                except Exception as exc:
+                    log.debug(
+                        "source provider failed: peer=%s, error=%s",
+                        self._peer_name, exc,
+                    )
+                    continue
+                if not sources:
+                    continue
+                await transport.send(
+                    C2CEMULE.ANSWERSOURCES,
+                    build_answer_sources(req_hash, sources, entry_version=peer_sx1),
+                    protocol=EMULE,
+                )
+                log.debug(
+                    "ANSWERSOURCES sent: peer=%s, hash=%s, count=%d",
+                    self._peer_name, req_hash.hex().upper(), len(sources),
+                )
+                continue
+
+            if opcode == C2CEMULE.AICHREQUEST:
+                # AICH recovery responder (stage X; gate per
+                # SHAHashSet.cpp:715-723: complete file, part in range,
+                # requested master hash must match ours).
+                try:
+                    req_hash, req_part, req_master = parse_aich_request_payload(
+                        payload
+                    )
+                except Exception as exc:
+                    log.debug(
+                        "AICHREQUEST ignored (malformed): peer=%s, error=%s",
+                        self._peer_name, exc,
+                    )
+                    continue
+                shared = self._resolver.resolve(req_hash)
+                if shared is None or not shared.path:
+                    continue
+                try:
+                    from amuled_v2.core.codec.constants import PARTSIZE
+                    from amuled_v2.core.hashes.aich import (
+                        AichError,
+                        aich_hash_file,
+                        aich_part_recovery_data,
+                    )
+
+                    result = aich_hash_file(shared.path)
+                    if bytes(result.master_hash) != bytes(req_master):
+                        log.debug(
+                            "AICHREQUEST master mismatch: peer=%s, hash=%s",
+                            self._peer_name, req_hash.hex().upper(),
+                        )
+                        continue
+                    part_count = (shared.size + PARTSIZE - 1) // PARTSIZE
+                    if req_part >= part_count:
+                        continue
+                    recovery = aich_part_recovery_data(result, req_part)
+                except AichError as exc:
+                    log.debug(
+                        "AICH recovery unavailable: peer=%s, error=%s",
+                        self._peer_name, exc,
+                    )
+                    continue
+                await transport.send(
+                    C2CEMULE.AICHANSWER,
+                    build_aich_answer_payload(
+                        req_hash, req_part, req_master, recovery
+                    ),
+                    protocol=EMULE,
+                )
+                log.debug(
+                    "AICHANSWER sent: peer=%s, hash=%s, part=%d, recovery=%d",
+                    self._peer_name, req_hash.hex().upper(),
+                    req_part, len(recovery),
+                )
+                continue
 
             if opcode == C2CTCP.REQUESTFILENAME:
                 # eMule answers file-name requests immediately, regardless
@@ -1004,6 +1232,8 @@ class IncomingPeerServer:
         max_connections: int = 64,
         traffic_recorder: Callable[[str, int], None] | None = None,
         queue_rank_period: float = 60.0,
+        secure_ident: Any | None = None,
+        source_provider: Callable[[bytes], list[SXSource]] | None = None,
     ) -> None:
         self._identity = identity
         self._resolver = resolver
@@ -1015,11 +1245,36 @@ class IncomingPeerServer:
         self._idle_timeout = idle_timeout
         self._traffic_recorder = traffic_recorder
         self._queue_rank_period = queue_rank_period
+        # Stage X SecureIdent provider shared by all sessions.
+        self._secure_ident = secure_ident
+        # Stage X source exchange: shared SX source rows for answers.
+        self._source_provider = source_provider
         if max_connections < 1:
             raise ListenerError(f"max_connections must be >= 1, got {max_connections}")
         self._max_connections = max_connections
         self._server: asyncio.AbstractServer | None = None
         self._connections: set[IncomingPeerSession] = set()
+        # Stage X direct-callback: callers (DownloadRunner) reserve inbound
+        # connections from a firewalled source by IP; _on_client hands the
+        # raw socket to the waiter instead of starting an upload session.
+        self._expected: dict[str, asyncio.Future] = {}
+
+    async def expect_connection_from(
+        self, ip: str, timeout: float = 15.0
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Wait for an inbound TCP connection from ``ip`` (direct-callback).
+
+        The connection is NOT served by the upload engine: the waiting
+        caller receives the raw (reader, writer) pair.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        self._expected[ip] = future
+        try:
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            if self._expected.get(ip) is future:
+                del self._expected[ip]
 
     @property
     def bound_port(self) -> int:
@@ -1076,6 +1331,19 @@ class IncomingPeerServer:
             writer.close()
             return
         log.info("Incoming C2C connection: peer=%s", peer_name)
+
+        # Direct-callback reservation: hand raw sockets to a waiting
+        # downloader instead of the upload engine (peer IP match).
+        peer_ip = peer_name.rsplit(":", 1)[0].strip() if peer_name else ""
+        waiter = self._expected.pop(peer_ip, None)
+        if waiter is not None and not waiter.done():
+            waiter.set_result((reader, writer))
+            log.info(
+                "Inbound connection reserved for direct-callback: peer=%s",
+                peer_name,
+            )
+            return
+
         session = IncomingPeerSession(
             reader,
             writer,
@@ -1087,6 +1355,8 @@ class IncomingPeerServer:
             idle_timeout=self._idle_timeout,
             traffic_recorder=self._traffic_recorder,
             queue_rank_period=self._queue_rank_period,
+            secure_ident=self._secure_ident,
+            source_provider=self._source_provider,
         )
         self._connections.add(session)
         try:

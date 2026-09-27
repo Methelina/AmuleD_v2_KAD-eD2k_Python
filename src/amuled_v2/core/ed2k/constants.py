@@ -21,11 +21,12 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from amuled_v2.core.codec.binary import BinaryWriter
 from amuled_v2.core.codec.constants import EDONKEY
 from amuled_v2.core.codec.packet import Packet, encode_packet
-from amuled_v2.core.codec.tags import Ed2kTag, TagError, write_new_tag
+from amuled_v2.core.codec.tags import Ed2kTag, TagError
 from amuled_v2.logging_setup import LogTags, get_tagged_logger
 
 log = get_tagged_logger(LogTags.ED2K, "core.ed2k.constants")
@@ -181,12 +182,53 @@ class LoginRequest:
 
 
 def _login_tags(request: LoginRequest) -> list[Ed2kTag]:
+    """Login tag set exactly as eMuleAI ServerConnect.cpp:198-245 sends it:
+    [CT_NAME][CT_VERSION][CT_SERVER_FLAGS][CT_EMULE_VERSION]."""
+    # CT_SERVER_FLAGS value (Opcodes.h:725-734): ZLIB | NEWTAGS | UNICODE |
+    # LARGEFILES | SUPPORTCRYPT | REQUESTCRYPT — what we really support.
+    server_flags = (
+        0x0001  # SRVCAP_ZLIB
+        | 0x0008  # SRVCAP_NEWTAGS
+        | 0x0010  # SRVCAP_UNICODE
+        | 0x0100  # SRVCAP_LARGEFILES
+        | 0x0200  # SRVCAP_SUPPORTCRYPT
+        | 0x0400  # SRVCAP_REQUESTCRYPT
+    )
     return [
-        Ed2kTag(name_id=0x01, type=0x02, value=request.nickname),
-        Ed2kTag(name_id=0x11, type=0x03, value=request.edonkey_version),
-        Ed2kTag(name_id=0x20, type=0x03, value=request.capabilities),
-        Ed2kTag(name_id=0xFB, type=0x03, value=request.emule_version),
+        Ed2kTag(name_id=0x01, type=0x02, value=request.nickname),   # CT_NAME
+        Ed2kTag(name_id=0x11, type=0x03, value=request.edonkey_version),  # CT_VERSION
+        Ed2kTag(name_id=0x20, type=0x03, value=server_flags),       # CT_SERVER_FLAGS
+        Ed2kTag(name_id=0xFB, type=0x03, value=request.emule_version),  # CT_EMULE_VERSION
     ]
+
+
+def _write_old_tag(tag: Ed2kTag, writer: Any) -> None:
+    """Write one tag in the OLD CTag::WriteTagToFile format (Packets.cpp:676).
+
+    Real clients send server-login tags in this form ([type u8]
+    [u16 namelen = 1][u8 name_id][value]); the compact write_new_tag form
+    made strict servers ignore the whole login (10 s handshake timeout).
+    """
+    name = tag.name if tag.name is not None else tag.name_id
+    if name is None:
+        raise TagError("login tag needs a name or name_id")
+    if isinstance(tag.value, str):
+        raw = tag.value.encode("utf-8")
+        writer.write_u8(0x02)
+        writer.write_u16(1)
+        writer.write_u8(int(name))
+        writer.write_u16(len(raw))
+        writer.write_bytes(raw)
+        return
+    if isinstance(tag.value, int) and not isinstance(tag.value, bool):
+        if not 0 <= tag.value <= 0xFFFFFFFF:
+            raise TagError(f"login tag value out of UInt32 range: {tag.value}")
+        writer.write_u8(0x03)
+        writer.write_u16(1)
+        writer.write_u8(int(name))
+        writer.write_u32(tag.value)
+        return
+    raise TagError(f"unsupported login tag value type: {type(tag.value).__name__}")
 
 
 def build_login_payload(request: LoginRequest) -> bytes:
@@ -199,7 +241,7 @@ def build_login_payload(request: LoginRequest) -> bytes:
     writer.write_u32(len(tags))
     for tag in tags:
         try:
-            write_new_tag(tag, writer)
+            _write_old_tag(tag, writer)
         except TagError as exc:
             log.error(f"Login tag encoding failed: tag_id=0x{tag.name_id:02X}, error={exc}")
             raise ProtocolError(f"cannot encode login tag: {exc}") from exc

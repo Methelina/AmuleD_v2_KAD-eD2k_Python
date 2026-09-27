@@ -105,6 +105,13 @@ class AmuleDKernel:
         self.spider: SpiderEngine | None = None
         self.upload_queue: UploadQueue | None = None
         self.nat_result: dict[str, Any] | None = None
+        # Stage X SecureIdent: one RSA-384 provider for the whole kernel
+        # (listener challenges incoming peers; DownloadRunner challenges on
+        # outgoing dials).  Key file: config/cryptkey.dat (eMule format).
+        from amuled_v2.core.security.secure_ident import SecureIdentProvider
+
+        self.secure_ident = SecureIdentProvider(key_path=ROOT / "config" / "cryptkey.dat")
+        self.secure_ident.ensure_keys()
         self.started_at = time.time()
         self.publish_box: dict[str, Any] = {}
         # In-kernel download runs (stage U phase 3 / downloads end-to-end):
@@ -114,6 +121,39 @@ class AmuleDKernel:
         self._download_tasks: set[asyncio.Task] = set()
 
     # -- subsystem pieces ---------------------------------------------------
+
+    def _source_provider(self, file_hash: bytes) -> list:
+        """SX answer rows: known dialable sources for the file (stage X).
+
+        High-id rows with a userhash only — a source without a userhash
+        cannot be dialed obfuscated on today's network, so advertising it
+        would be noise (mirrors DownloadRunner.resolve_sources).
+        """
+        from amuled_v2.core.peer.codec import SXSource
+        from amuled_v2.core.download.runner import _row_not_directly_dialable
+
+        try:
+            rows = self.state.list_file_sources(file_hash.hex(), limit=500)
+        except Exception as exc:
+            log.debug("SX source lookup failed: error=%s", exc)
+            return []
+        out = []
+        for row in rows:
+            if _row_not_directly_dialable(row):
+                continue
+            try:
+                client_id = int(row["client_id"])
+                user_hash = row.get("user_hash")
+                out.append(
+                    SXSource(
+                        client_id=client_id,
+                        port=int(row["client_port"]),
+                        user_hash=bytes.fromhex(str(user_hash)) if user_hash else None,
+                    )
+                )
+            except Exception as exc:
+                log.debug("SX row skipped: error=%s", exc)
+        return out
 
     def _record_uploaded(self, user_hash_hex: str, uploaded: int) -> None:
         try:
@@ -182,6 +222,20 @@ class AmuleDKernel:
                     max_peers=max_peers,
                     traffic_sink=self._record_downloaded,
                     plain_dial_ok=getattr(self, "plain_dial_ok", False),
+                    secure_ident=getattr(self, "secure_ident", None),
+                    connection_source=(
+                        self.server.expect_connection_from
+                        if self.server is not None
+                        else None
+                    ),
+                    callback_identity=(
+                        {
+                            "tcp_port": self._tcp_port,
+                            "user_hash": self.identity.user_hash,
+                        }
+                        if self.server is not None
+                        else None
+                    ),
                 )
 
                 def _progress(received: int, total: int, blocks: int) -> None:
@@ -492,6 +546,8 @@ class AmuleDKernel:
             throttle=throttle,
             max_connections=self.max_sessions,
             traffic_recorder=self._record_uploaded,
+            secure_ident=getattr(self, "secure_ident", None),
+            source_provider=self._source_provider,
         )
         await self.server.start()
         self._tcp_port = self.server.bound_port

@@ -217,6 +217,15 @@ class DownloadQueue:
         part_path = Path(str(entry["part_path"]))
         self.incoming_dir.mkdir(parents=True, exist_ok=True)
         target = self.incoming_dir / str(entry["name"])
+        # Disk-space gate (stage X): refuse the move when the incoming
+        # volume cannot hold the completed file.
+        part_size = part_path.stat().st_size
+        free = shutil.disk_usage(self.incoming_dir).free
+        if free <= part_size:
+            raise DownloadQueueError(
+                f"insufficient disk space for finalize: need={part_size}, "
+                f"free={free}, target={target}"
+            )
         if verify:
             from amuled_v2.core.download.partfile import PartFile
 

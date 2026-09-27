@@ -2,13 +2,13 @@
 
 These tests verify INTERNAL consistency between the raw framed client side
 and the upload engine over real TCP loopback (127.0.0.1, ephemeral ports).
-They are NOT a live acceptance test against a real eMule client: the
-encrypted transport is pending external work (see ``WIP by external
-developer`` markers in core/peer/listener.py).
+They are NOT a live acceptance test against a real eMule client: live
+obfuscated acceptance is covered separately (obf-dial + inbound accept are
+real since session 11, see docs/roadmap.md 11h/11i).
 
 tests/test_listener.py
 Author:      Soror L.'.L.'.
-Updated:     2026-09-24
+Updated:     2026-09-27
 """
 
 from __future__ import annotations

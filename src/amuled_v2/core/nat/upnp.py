@@ -13,10 +13,15 @@ the returned result dict (lowid stays a cosmetic problem, not a crash).
 The mapping is public-external-port == local bind port (eMule behaviour).
 
 src/amuled_v2/core/nat/upnp.py
-Version:     0.1.0
+Version:     0.2.0
 Author:      Soror L.'.L.'.
-Updated:     2026-09-26
+Updated:     2026-09-27
 
+Patch Notes v0.2.0 (Soror L'.L'.):
+  [*] SSDP discovery is multi-NIC now: the M-SEARCH is bound once per
+      local IPv4 (VPN tunnels own the default route and shadow the LAN
+      IGD — live case 2026-09-27, router on 192.168.3.111 found only via
+      its interface).
 Patch Notes v0.1.0 (Soror L'.L'.):
   [+] Added SSDP discovery + SOAP AddPortMapping and NAT-PMP TCP mapping.
 """
@@ -27,6 +32,9 @@ import asyncio
 import re
 import socket
 import struct
+import subprocess
+import sys
+import time
 from typing import Any
 from urllib.parse import urlsplit
 from urllib.request import urlopen
@@ -45,9 +53,6 @@ _TIMEOUT = 4.0
 def _default_gateway() -> str | None:
     """Best-effort default gateway on Windows and Linux, no deps."""
     try:
-        import subprocess
-        import sys
-
         if sys.platform == "win32":
             out = subprocess.run(
                 ["route", "print", "0.0.0.0"], capture_output=True, text=True,
@@ -106,9 +111,86 @@ async def _ssdp_discover() -> str | None:
         finally:
             s.close()
 
-    return await asyncio.wait_for(
-        loop.run_in_executor(None, _search), timeout=_TIMEOUT + 2.0
-    )
+def _local_ipv4s() -> list[str]:
+    """All local IPv4 addresses, one per up interface (multi-NIC: VPN
+    tunnels first in the routing table must not shadow the LAN IGD)."""
+    ips: list[str] = []
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(
+                ["ipconfig"], capture_output=True, text=True, timeout=5,
+            ).stdout
+            for m in re.finditer(
+                r"(?im)^\s*(?:IPv4 Address|IPv4-Adresse).*?:\s*"
+                r"(\d+\.\d+\.\d+\.\d+)",
+                out,
+            ):
+                ip = m.group(1)
+                if ip not in ips:
+                    ips.append(ip)
+        else:
+            out = subprocess.run(
+                ["hostname", "-I"], capture_output=True, text=True, timeout=5,
+            ).stdout
+            ips = out.split()
+    except Exception:
+        pass
+    return ips
+
+
+async def _ssdp_discover() -> str | None:
+    """Return the first device-description Location URL from SSDP.
+
+    Multi-NIC: SSDP multicast is link-local, so the M-SEARCH is sent once
+    per local IPv4 (bound to that address) — a VPN tunnel that owns the
+    default route must not shadow the LAN IGD (live case 2026-09-27:
+    tun0 answered nothing, the router on 192.168.3.111 did).
+    """
+
+    def _search_on(bind_ip: str | None) -> str | None:
+        msg = (
+            "M-SEARCH * HTTP/1.1\r\n"
+            f"HOST: {SSDP_ADDR[0]}:{SSDP_ADDR[1]}\r\n"
+            'MAN: "ssdp:discover"\r\n'
+            "MX: 2\r\n"
+            f"ST: {SSDP_ST}\r\n\r\n"
+        ).encode("ascii")
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        s.settimeout(_TIMEOUT)
+        try:
+            if bind_ip is not None:
+                try:
+                    s.bind((bind_ip, 0))
+                except OSError:
+                    return None
+            s.sendto(msg, SSDP_ADDR)
+            deadline = time.time() + _TIMEOUT
+            while time.time() < deadline:
+                try:
+                    data, _addr = s.recvfrom(4096)
+                except (OSError, TimeoutError):
+                    break
+                m = re.search(rb"(?i)location:\s*(\S+)", data)
+                if m:
+                    return m.group(1).decode("ascii")
+        except OSError:
+            return None
+        finally:
+            s.close()
+        return None
+
+    loop = asyncio.get_running_loop()
+    bind_ips = [None] + _local_ipv4s()
+    for bind_ip in bind_ips:
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _search_on, bind_ip), _TIMEOUT + 1.0
+            )
+        except asyncio.TimeoutError:
+            result = None
+        if result:
+            return result
+    return None
 
 
 def _soap_request(control_url: str, service_type: str, action: str,

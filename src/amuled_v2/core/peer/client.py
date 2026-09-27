@@ -20,12 +20,13 @@ Updated:     2026-09-26
 
 Patch Notes v0.3.0 (Soror L'.L'.):
   [+] BASIC-obfuscation session wired into the transport (block 11e #6,
-      Cloud fix): with a known target userhash, connect() negotiates the
-      obfuscation handshake on ONE persistent RC4 stream per direction
-      (BasicObfuscationSession) and every frame is encrypted/decrypted on
-      that stream afterwards.  No plaintext fallback: the plain protocol
-      is dead on today's network (instant FIN).  Response leftovers are
-      buffered in _rx_plain and consumed exactly once.
+      closed live in session 11): with a known target userhash, connect()
+      negotiates the obfuscation handshake on ONE persistent RC4 stream per
+      direction (BasicObfuscationSession) and every frame is
+      encrypted/decrypted on that stream afterwards.  No plaintext
+      fallback: the plain protocol is dead on today's network (instant
+      FIN).  Response leftovers are buffered in _rx_plain and consumed
+      exactly once.
 
 Patch Notes v0.1.0 (Soror L.'.L'.):
   [+] Added asyncio peer session with bounded framing and idle timeouts.
@@ -38,6 +39,7 @@ Patch Notes v0.1.0 (Soror L.'.L'.):
 from __future__ import annotations
 
 import asyncio
+import os
 import struct
 import time
 import zlib
@@ -66,6 +68,13 @@ from amuled_v2.core.peer.codec import (
     parse_queue_rank,
     parse_sending_part,
     parse_sending_part_i64,
+    build_secident_state_payload,
+    build_publickey_payload,
+    build_signature_payload,
+    parse_secident_state_payload,
+    parse_publickey_payload,
+    parse_signature_payload,
+    miso1_secident_support,
 )
 from amuled_v2.core.peer.obfuscation import (
     BasicObfuscationSession,
@@ -100,6 +109,18 @@ class C2CEMULE:
     QUEUERANKING = 0x60
     REQUESTPARTS_A4 = 0xA4
     COMPRESSEDPART_A4 = 0xA4
+    # SecureIdent (stage X; Opcodes.h):
+    PUBLICKEY = 0x85
+    SIGNATURE = 0x86
+    SECIDENTSTATE = 0x87
+    # Source exchange (stage X; Opcodes.h):
+    REQUESTSOURCES = 0x81
+    ANSWERSOURCES = 0x82
+    REQUESTSOURCES2 = 0x83
+    ANSWERSOURCES2 = 0x84
+    # AICH (stage X; Opcodes.h):
+    AICHREQUEST = 0x9B
+    AICHANSWER = 0x9C
 
 
 # OP_OUTOFPARTREQS retry policy: the source needs a moment to read the
@@ -172,9 +193,9 @@ def build_emuleinfo_payload(emule_version: int = 0x3C) -> bytes:
     таймауту хендшейка (~10 с). Набор тегов — стандартные 7 флагов; id и
     порядок менять нельзя.
 
-    Значения — честные (сверка стадии X): заявляем только сжатие и
-    (в features) то, что реально обрабатываем. Source exchange, udp version
-    aux-операции и комментарии мы не отвечаем — нули.
+    Значения — честные (сверка стадии X): заявляем сжатие, source exchange
+    v4 (responder в listener.py) и (в features) то, что реально обрабатываем.
+    udp version aux-операции и комментарии мы не отвечаем — нули.
     """
     from amuled_v2.core.codec.binary import BinaryWriter
 
@@ -185,10 +206,10 @@ def build_emuleinfo_payload(emule_version: int = 0x3C) -> bytes:
         Ed2kTag(name_id=0x20, type=0x03, value=1),   # сжатие данных (есть)
         Ed2kTag(name_id=0x22, type=0x03, value=0),   # udp version (aux — нет)
         Ed2kTag(name_id=0x21, type=0x03, value=0),   # udp port (нет)
-        Ed2kTag(name_id=0x23, type=0x03, value=0),   # source exchange (нет)
+        Ed2kTag(name_id=0x23, type=0x03, value=4),   # source exchange v4 (responder)
         Ed2kTag(name_id=0x24, type=0x03, value=0),   # comments (нет)
         Ed2kTag(name_id=0x25, type=0x03, value=0),   # extended requests (нет)
-        Ed2kTag(name_id=0x27, type=0x03, value=0),   # features (без крипты)
+        Ed2kTag(name_id=0x27, type=0x03, value=3),   # features: full SUI + v2
     ]
     writer.write_u32(len(tags))
     for tag in tags:
@@ -215,6 +236,7 @@ class PeerClient:
         traffic_sink: Optional[Callable[[str, int], None]] = None,
         target_userhash: Optional[bytes] = None,
         local_userhash: Optional[bytes] = None,
+        secure_ident: Optional[Any] = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -232,6 +254,14 @@ class PeerClient:
         # Already-decrypted bytes that arrived together with the handshake
         # response; consumed exactly once by _read_exact().
         self._rx_plain = bytearray()
+        # Stage X SecureIdent: shared RSA provider; per-session exchange
+        # state (challenge out/in, peer's claimed pubkey blob).
+        self._secure_ident = secure_ident
+        self._sui: dict[str, Any] = {
+            "challenge_in": None,
+            "challenge_out": None,
+            "peer_blob": b"",
+        }
         # Stage C credit accounting: called once per finished transfer with
         # (peer_user_hash_hex, downloaded_bytes); exceptions are swallowed —
         # credit bookkeeping must never break a download.
@@ -240,8 +270,6 @@ class PeerClient:
         self._writer: Optional[asyncio.StreamWriter] = None
         self.connected = False
         self.peer_info: Optional[PeerInfo] = None
-        import os
-
         # eMule marks every generated userhash with SO_EMULE markers
         # (Preferences.cpp::CreateUserHash: hash[5]=14, hash[14]=111);
         # GetHashType uses them to classify the client.  A plain random
@@ -260,6 +288,45 @@ class PeerClient:
     @property
     def is_connected(self) -> bool:
         return self.connected and self._writer is not None
+
+    @classmethod
+    def adopt_connection(
+        cls,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        *,
+        local_client_id: int = 0,
+        local_port: int = 8089,
+        nickname: str = "AmuleD",
+        local_userhash: Optional[bytes] = None,
+        secure_ident: Optional[Any] = None,
+        response_timeout: float = 20.0,
+        queue_wait_timeout: float = 120.0,
+        traffic_sink: Optional[Callable[[str, int], None]] = None,
+    ) -> "PeerClient":
+        """Wrap an ALREADY ACCEPTED inbound TCP connection (direct-callback
+        flow: the firewalled source dialed us) and run the DOWNLOADER role
+        over it.  handshake() then answers the peer's HELLO/EMULEINFO
+        instead of initiating them (both branches already exist)."""
+        peername = writer.get_extra_info("peername") or ("?", 0)
+        host = peername[0] if isinstance(peername, tuple) else str(peername)
+        port = peername[1] if isinstance(peername, tuple) and len(peername) > 1 else 0
+        client = cls(
+            host,
+            port,
+            local_client_id=local_client_id,
+            local_port=local_port,
+            nickname=nickname,
+            local_userhash=local_userhash,
+            secure_ident=secure_ident,
+            response_timeout=response_timeout,
+            queue_wait_timeout=queue_wait_timeout,
+            traffic_sink=traffic_sink,
+        )
+        client._reader = reader
+        client._writer = writer
+        client.connected = True
+        return client
 
     # -- transport -----------------------------------------------------------
 
@@ -453,11 +520,50 @@ class PeerClient:
 
         hello_seen = False
         info_seen = False
+        sui_challenged = False
+        sui_deadline: Optional[float] = None
         peer: Optional[PeerInfo] = None
+        peer_tags: tuple = ()
         deadline = time.monotonic() + self.response_timeout * 2
-        while not (hello_seen and info_seen):
+
+        async def _maybe_challenge_sui() -> None:
+            # Stage X SecureIdent (mirrors listener.py): once the EMULEINFO
+            # side of the handshake is through, challenge a SUI-capable peer
+            # (BaseClient.cpp InfoPacketsReceived -> SendSecIdentStatePacket).
+            nonlocal sui_challenged, sui_deadline
+            if sui_challenged:
+                return
+            provider = self._secure_ident
+            if provider is None or not provider.has_keys:
+                return
+            if not peer_tags or not miso1_secident_support(peer_tags):
+                return
+            sui_challenged = True
+            challenge = int.from_bytes(os.urandom(4), "little") or 1
+            self._sui["challenge_out"] = challenge
+            sui_deadline = time.monotonic() + 3.0
+            await self._send(
+                EMULE_PROTOCOL,
+                C2CEMULE.SECIDENTSTATE,
+                build_secident_state_payload(2, challenge),
+            )
+            log.debug(
+                "PEER SECIDENTSTATE sent: host=%s:%d, challenge=%d",
+                self.host, self.port, challenge,
+            )
+
+        # The SUI grace period: the peer's PUBLICKEY/SIGNATURE may arrive
+        # after hello/info are both seen; keep draining briefly so the
+        # verification is not lost (bounded by sui_deadline).
+        while not (hello_seen and info_seen) or (
+            sui_deadline is not None and time.monotonic() < sui_deadline
+        ):
             remaining = deadline - time.monotonic()
+            if sui_deadline is not None and hello_seen and info_seen:
+                remaining = min(remaining, sui_deadline - time.monotonic())
             if remaining <= 0:
+                if hello_seen and info_seen:
+                    break  # SUI grace only; the app handshake is complete
                 raise PeerSessionError(
                     "peer handshake incomplete: hello=%s, info=%s"
                     % (hello_seen, info_seen)
@@ -468,6 +574,7 @@ class PeerClient:
             protocol, opcode, payload = packet
             if protocol == EDONKEY and opcode == C2CTCP.HELLOANSWER:
                 parsed = parse_hello(payload)
+                peer_tags = parsed.tags
                 peer = PeerInfo(
                     user_hash=parsed.user_hash.hex().upper(),
                     client_id=parsed.client_id,
@@ -485,6 +592,7 @@ class PeerClient:
                 )
             elif protocol == EDONKEY and opcode == C2CTCP.HELLO:
                 parsed = parse_hello(payload)
+                peer_tags = parsed.tags
                 peer = PeerInfo(
                     user_hash=parsed.user_hash.hex().upper(),
                     client_id=parsed.client_id,
@@ -513,11 +621,66 @@ class PeerClient:
                         compression=compression,
                     )
                 log.info("PEER emule info answer: compression=%s", compression)
+                await _maybe_challenge_sui()
             elif protocol == EMULE_PROTOCOL and opcode == C2CEMULE.EMULEINFO:
                 info_seen = True
                 await self._send(
                     EMULE_PROTOCOL, C2CEMULE.EMULEINFOANSWER, build_emuleinfo_payload()
                 )
+                await _maybe_challenge_sui()
+            elif protocol == EMULE_PROTOCOL and opcode == C2CEMULE.SECIDENTSTATE:
+                state, challenge = parse_secident_state_payload(payload)
+                self._sui["challenge_in"] = challenge
+                log.debug(
+                    "PEER SECIDENTSTATE received: host=%s:%d, state=%d, challenge=%d",
+                    self.host, self.port, state, challenge,
+                )
+                # Answer with PUBLICKEY + SIGNATURE over [our blob][their
+                # challenge] (BaseClient.cpp SendPublicKeyPacket /
+                # SendSignaturePacket; mirrors listener.py).
+                if self._secure_ident is not None and self._secure_ident.has_keys:
+                    await self._send(
+                        EMULE_PROTOCOL,
+                        C2CEMULE.PUBLICKEY,
+                        build_publickey_payload(self._secure_ident.public_blob),
+                    )
+                    signature = self._secure_ident.create_signature(challenge)
+                    await self._send(
+                        EMULE_PROTOCOL,
+                        C2CEMULE.SIGNATURE,
+                        build_signature_payload(signature),
+                    )
+            elif protocol == EMULE_PROTOCOL and opcode == C2CEMULE.PUBLICKEY:
+                self._sui["peer_blob"] = parse_publickey_payload(payload)
+                log.debug(
+                    "PEER PUBLICKEY received: host=%s:%d, len=%d",
+                    self.host, self.port, len(self._sui["peer_blob"]),
+                )
+            elif protocol == EMULE_PROTOCOL and opcode == C2CEMULE.SIGNATURE:
+                signature, _ip_kind = parse_signature_payload(payload)
+                challenge_in = self._sui.get("challenge_out")
+                peer_blob = self._sui.get("peer_blob", b"")
+                if challenge_in is None or not peer_blob or peer is None:
+                    log.debug(
+                        "PEER SIGNATURE ignored (no challenge/key yet): host=%s:%d",
+                        self.host, self.port,
+                    )
+                else:
+                    from amuled_v2.core.security.secure_ident import SecureIdentProvider
+
+                    verified = SecureIdentProvider.verify_signature(
+                        peer_blob, signature, challenge_in
+                    )
+                    if verified and self._secure_ident is not None:
+                        self._secure_ident.mark_verified(peer.user_hash.lower())
+                    log.info(
+                        "PEER SecureIdent %s: host=%s:%d, user_hash=%s",
+                        "VERIFIED" if verified else "FAILED",
+                        self.host,
+                        self.port,
+                        peer.user_hash,
+                    )
+                sui_deadline = None  # signature round over; no grace needed
             else:
                 log.debug(
                     "PEER ignoring packet during handshake: "

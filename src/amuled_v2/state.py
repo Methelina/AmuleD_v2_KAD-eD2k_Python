@@ -273,6 +273,28 @@ def _migrate_v7(con: Any) -> None:
     )
 
 
+def _migrate_v8(con: Any) -> None:
+    # Stage X: KAD direct-UDP-callback (source type 6) needs the source's
+    # KAD/UDP port at dial time; store it alongside the TCP port.
+    con.execute("""
+        ALTER TABLE file_sources ADD COLUMN IF NOT EXISTS kad_udp_port UINTEGER
+    """)
+    con.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (8)"
+    )
+
+
+def _migrate_v9(con: Any) -> None:
+    # Stage X: KAD buddy-callback (source type 3/5) needs the serving
+    # buddy's KadID to address KADEMLIA_CALLBACK_REQ.
+    con.execute("""
+        ALTER TABLE file_sources ADD COLUMN IF NOT EXISTS buddy_id VARCHAR
+    """)
+    con.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (9)"
+    )
+
+
 def _init_duckdb(con: Any) -> None:
     """Apply all pending schema migrations."""
     log.debug("Initializing DuckDB schema")
@@ -302,6 +324,14 @@ def _init_duckdb(con: Any) -> None:
     if current < 7:
         _migrate_v7(con)
         log.info("DuckDB schema migrated to version 7")
+        current = 7
+    if current < 8:
+        _migrate_v8(con)
+        log.info("DuckDB schema migrated to version 8")
+        current = 8
+    if current < 9:
+        _migrate_v9(con)
+        log.info("DuckDB schema migrated to version 9")
     else:
         log.debug("DuckDB schema is current")
 
@@ -668,30 +698,45 @@ class StateBackend:
         server_port: int,
         source_type: str = "ed2k_server",
     ) -> int:
-        """Persist sources returned by one ED2K source lookup."""
+        """Persist sources returned by one ED2K source lookup.
+
+        KAD rows carry the numeric source-entry type in the stored
+        ``source_type`` string (``kad1`` = direct HighID, ``kad3``/``kad5`` =
+        firewalled via buddy, ``kad6`` = direct-UDP-callback) so the dial
+        side can skip non-dialable records without a schema change
+        (eMule DownloadQueue.cpp:4906-4992: only types 1/4/6-with-callback
+        are direct; buddy types need a callback first).
+        """
         con = self._require_duckdb()
         count = 0
         for source in record.sources:
+            row_type = source_type
+            if source.kad_type is not None and source_type.startswith("kad"):
+                row_type = f"kad{source.kad_type}"
             con.execute(
                 """
                 INSERT INTO file_sources (
                     file_hash, client_id, client_port, source_type,
-                    server_ip, server_port, user_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    server_ip, server_port, user_hash, kad_udp_port, buddy_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (file_hash, client_id, client_port, source_type) DO UPDATE SET
                     server_ip   = excluded.server_ip,
                     server_port = excluded.server_port,
                     user_hash   = excluded.user_hash,
+                    kad_udp_port = excluded.kad_udp_port,
+                    buddy_id    = excluded.buddy_id,
                     last_seen   = get_current_timestamp()
                 """,
                 (
                     record.file_hash.hex().upper(),
                     source.client_id,
                     source.client_port,
-                    source_type,
+                    row_type,
                     server_ip,
                     server_port,
                     source.user_hash.hex().upper() if source.user_hash else None,
+                    source.kad_udp_port,
+                    source.buddy_id.hex().upper() if source.buddy_id else None,
                 ),
             )
             count += 1
@@ -716,7 +761,8 @@ class StateBackend:
             rows = con.execute(
                 """
                 SELECT file_hash, client_id, client_port, source_type,
-                       server_ip, server_port, user_hash, first_seen, last_seen
+                       server_ip, server_port, user_hash, first_seen, last_seen,
+                       kad_udp_port, buddy_id
                 FROM file_sources
                 WHERE lower(file_hash) = ?
                 ORDER BY client_id, client_port
@@ -728,7 +774,8 @@ class StateBackend:
             rows = con.execute(
                 """
                 SELECT file_hash, client_id, client_port, source_type,
-                       server_ip, server_port, user_hash, first_seen, last_seen
+                       server_ip, server_port, user_hash, first_seen, last_seen,
+                       kad_udp_port, buddy_id
                 FROM file_sources
                 ORDER BY file_hash, client_id, client_port
                 LIMIT ?
@@ -746,6 +793,8 @@ class StateBackend:
                 "user_hash": row[6],
                 "first_seen": str(row[7]),
                 "last_seen": str(row[8]),
+                "kad_udp_port": row[9],
+                "buddy_id": row[10],
             }
             for row in rows
         ]

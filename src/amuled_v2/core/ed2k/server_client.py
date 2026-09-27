@@ -218,6 +218,14 @@ class FoundSource:
     client_port: int
     crypt_options: int = 0
     user_hash: Optional[bytes] = None
+    # KAD source-entry type (1=HighID direct, 3/5=firewalled via buddy,
+    # 6=firewalled direct-UDP-callback); None for ED2K-server sources.
+    # Only types 1/4 are directly dialable (eMule DownloadQueue.cpp:4906-4992).
+    kad_type: Optional[int] = None
+    # KAD/UDP port of the source (type 6: the direct-callback target port).
+    kad_udp_port: Optional[int] = None
+    # Serving buddy KadID (type 3/5): addressed by KADEMLIA_CALLBACK_REQ.
+    buddy_id: Optional[bytes] = None
 
     @property
     def low_id(self) -> bool:

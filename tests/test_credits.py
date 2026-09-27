@@ -117,23 +117,57 @@ def test_normalize_user_hash_rejects_garbage() -> None:
 # --- SecureIdent adapter -------------------------------------------------------
 
 
-def test_secure_ident_provider_is_a_mock() -> None:
-    provider = SecureIdentProvider()
-    assert provider.has_keys is False
-    with pytest.raises(SecureIdentError):
-        provider.sign(b"challenge")
-    with pytest.raises(SecureIdentError):
-        provider.verify(_unique_uh(), b"sig", b"challenge")
+def test_secure_ident_sign_verify_roundtrip(tmp_path) -> None:
+    provider = SecureIdentProvider(key_path=tmp_path / "cryptkey.dat")
+    provider.ensure_keys()
+    assert provider.has_keys is True
+    assert 10 <= len(provider.public_blob) <= 80
+    peer = SecureIdentProvider(key_path=tmp_path / "peer.dat")
+    peer.ensure_keys()
+    # SUI: the signer signs [SIGNER's own blob][challenge]; the verifier
+    # rebuilds the same string with the signer's blob (from OP_PUBLICKEY).
+    sig = provider.create_signature(0xDEADBEEF)
+    assert len(sig) == 48  # 384-bit modulus
+    assert SecureIdentProvider.verify_signature(
+        provider.public_blob, sig, 0xDEADBEEF
+    )
+    # Tampering / wrong challenge must fail.
+    bad = sig[:-1] + bytes([sig[-1] ^ 0xFF])
+    assert not SecureIdentProvider.verify_signature(
+        provider.public_blob, bad, 0xDEADBEEF
+    )
+    assert not SecureIdentProvider.verify_signature(
+        provider.public_blob, sig, 0xDEADBEFF
+    )
 
 
-def test_secure_ident_evaluate_unverified_no_bonus() -> None:
-    provider = SecureIdentProvider()
+def test_secure_ident_key_persistence(tmp_path) -> None:
+    key_file = tmp_path / "cryptkey.dat"
+    first = SecureIdentProvider(key_path=key_file)
+    first.ensure_keys()
+    blob = first.public_blob
+    assert key_file.exists()
+    # Second provider reloads the SAME key from disk.
+    second = SecureIdentProvider(key_path=key_file)
+    second.ensure_keys()
+    assert second.public_blob == blob
+    sig = first.create_signature(42)
+    assert SecureIdentProvider.verify_signature(first.public_blob, sig, 42)
+
+
+def test_secure_ident_evaluate_unverified_no_bonus(tmp_path) -> None:
+    provider = SecureIdentProvider(key_path=tmp_path / "ck.dat")
+    provider.ensure_keys()
     uh = _unique_uh()
     info = provider.evaluate(uh)
     assert info.verified is False
     assert info.bonus_multiplier == 1.0
     assert info.state == SecureIdentState.NOT_AVAILABLE
     assert info.to_dict()["user_hash"] == uh
+    provider.mark_verified(uh)
+    verified = provider.evaluate(uh)
+    assert verified.verified is True
+    assert verified.bonus_multiplier == 2.0
 
 
 # --- integration: listener credits uploaded bytes -----------------------------

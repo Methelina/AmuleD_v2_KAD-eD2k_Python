@@ -153,14 +153,36 @@ def test_login_payload_layout_and_tags() -> None:
     assert reader.read_u16() == request.client_port
     assert reader.read_u32() == 4
 
-    name = read_new_tag(reader)
-    version = read_new_tag(reader)
-    flags = read_new_tag(reader)
-    emule = read_new_tag(reader)
-    assert name.name_id == 0x01 and name.value == request.nickname
-    assert version.name_id == 0x11 and version.value == EDONKEY_PROTOCOL_VERSION
-    assert flags.name_id == 0x20 and flags.value == request.capabilities
-    assert emule.name_id == 0xFB and emule.value == A_MULE_VERSION
+    # Tags travel in the OLD CTag::WriteTagToFile form (Packets.cpp:676):
+    # [type u8][u16 namelen = 1][u8 name_id][value] — the compact
+    # write_new_tag form made strict servers ignore the whole login.
+    def read_old_tag_int() -> tuple[int, int]:
+        tag_type = reader.read_u8()
+        assert reader.read_u16() == 1
+        name_id = reader.read_u8()
+        assert tag_type == 0x03
+        return name_id, reader.read_u32()
+
+    def read_old_tag_str() -> tuple[int, str]:
+        tag_type = reader.read_u8()
+        assert reader.read_u16() == 1
+        name_id = reader.read_u8()
+        assert tag_type == 0x02
+        length = reader.read_u16()
+        return name_id, reader.read_bytes(length).decode("utf-8")
+
+    name_id, name_value = read_old_tag_str()
+    version_id, version_value = read_old_tag_int()
+    flags_id, flags_value = read_old_tag_int()
+    emule_id, emule_value = read_old_tag_int()
+    assert name_id == 0x01 and name_value == request.nickname
+    assert version_id == 0x11 and version_value == EDONKEY_PROTOCOL_VERSION
+    # CT_SERVER_FLAGS = SRVCAP_* bitmask (Opcodes.h:725-734) as eMuleAI
+    # sends it (ServerConnect.cpp:236): ZLIB|NEWTAGS|UNICODE|LARGEFILES|
+    # SUPPORTCRYPT|REQUESTCRYPT.
+    assert flags_id == 0x20
+    assert flags_value == 0x0001 | 0x0008 | 0x0010 | 0x0100 | 0x0200 | 0x0400
+    assert emule_id == 0xFB and emule_value == A_MULE_VERSION
     assert reader.remaining == 0
 
 

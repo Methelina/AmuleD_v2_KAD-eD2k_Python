@@ -548,12 +548,19 @@ def _server_is_blacklisted(host: str, port: int) -> bool:
 
 def _ed2k_login_request() -> "LoginRequest":
     from amuled_v2.core.ed2k import LoginRequest
+    from amuled_v2.core.identity import load_identity
 
     cfg = load_config(save_if_missing=True)
+    # eMule sends its persistent SO_EMULE-marked userhash (Preferences.cpp
+    # CreateUserHash: hash[5]=14, hash[14]=111); a fresh random hash per
+    # login makes strict servers drop the session after the handshake
+    # timeout (verified live 2026-09-27).
+    identity = load_identity()
     return LoginRequest.create(
         nickname=cfg.get("app", {}).get("name", "AmuleD"),
         client_id=0,
         client_port=int(cfg.get("network", {}).get("client_tcp_port", 8089)),
+        user_hash=identity.user_hash,
         enable_security=True,
     )
 
@@ -1314,6 +1321,12 @@ async def _run_kad_sources(args: argparse.Namespace) -> dict:
                     client_id=int(ipaddress.IPv4Address(src.ip)),
                     client_port=src.tcp_port,
                     user_hash=src.source_id or None,
+                    kad_type=src.source_type or None,
+                    kad_udp_port=src.udp_port or None,
+                    buddy_id=(
+                        bytes.fromhex(src.buddy_hash)
+                        if src.buddy_hash else None
+                    ),
                 )
             )
         record = FoundSources(
