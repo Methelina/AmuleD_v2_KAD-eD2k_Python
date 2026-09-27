@@ -14,9 +14,19 @@ Implements the eMule-compatible download flow against one remote client:
    or the peer sends ``OP_END_OF_DOWNLOAD``.
 
 src/amuled_v2/core/peer/client.py
-Version:     0.6.0
+Version:     0.7.0
 Author:      Soror L.'.L.'.
-Updated:     2026-09-27
+Updated:     2026-09-28
+
+Patch Notes v0.7.0 (Soror L'.L'.):
+  [+] ICS: part-status capture — OP_FILESTATUS (0x50) parsed at every
+      dispatch site (handshake, request_file, wait_upload_slot, transfer);
+      complete_sources set and part_status dict populated; parse errors
+      caught (PeerCodecError) and logged at debug, never crash the loop.
+  [+] ICS: transfer() gains block_selector / release_ranges keyword params;
+      when a selector is supplied it provides inclusive (start,end) ranges
+      converted to the payload's exclusive (start, end+1) convention;
+      linear fallback path unchanged when selector is None.
 
 Patch Notes v0.6.0 (Soror L'.L'.):
   [+] transfer(start_offset, end_offset): stripe scheduling — a racing
@@ -83,6 +93,7 @@ from amuled_v2.core.peer.codec import (
     parse_file_hash_payload,
     parse_filename_answer,
     parse_hashset_answer,
+    parse_file_status,
     parse_hello,
     parse_queue_rank,
     parse_sending_part,
@@ -297,6 +308,13 @@ class PeerClient:
         # collected from OP_ANSWERSOURCES(2) during the session.
         self.peer_tags: tuple = ()
         self.collected_sources: list = []
+        # ICS (Intelligent Chunk Selection): part-status captured from
+        # OP_FILESTATUS answers.  part_status maps file_hash -> present
+        # chunk indices (empty frozenset means complete source, i.e. the
+        # peer has every part).  complete_sources is the same set of
+        # hashes but indexed for O(1) "has the whole file" checks.
+        self.part_status: dict[bytes, frozenset[int]] = {}
+        self.complete_sources: set[bytes] = set()
         # eMule marks every generated userhash with SO_EMULE markers
         # (Preferences.cpp::CreateUserHash: hash[5]=14, hash[14]=111);
         # GetHashType uses them to classify the client.  A plain random
@@ -709,6 +727,7 @@ class PeerClient:
                     )
                 sui_deadline = None  # signature round over; no grace needed
             else:
+                self._capture_file_status(protocol, opcode, payload)
                 log.debug(
                     "PEER ignoring packet during handshake: "
                     "protocol=0x%02X, opcode=0x%02X",
@@ -790,6 +809,49 @@ class PeerClient:
         )
         return True
 
+    def _capture_file_status(self, protocol: int, opcode: int, payload: bytes) -> bool:
+        """Parse OP_FILESTATUS (0x50) and store part-status for ICS.
+
+        Returns True when the packet was a FILESTATUS that got handled.
+        chunk_count == 0 signals a complete source (DownloadClient.cpp:694-724):
+        the peer has every part — record it in complete_sources and leave
+        part_status empty (caller checks complete_sources first).  Any
+        parse error is caught and logged at debug; it must never crash
+        the receive loop.
+        """
+        if protocol != EDONKEY or opcode != C2CTCP.FILESTATUS:
+            return False
+        try:
+            status = parse_file_status(payload)
+        except PeerCodecError as exc:
+            log.debug(
+                "PEER FILESTATUS parse error: host=%s:%d, error=%s",
+                self.host,
+                self.port,
+                exc,
+            )
+            return True
+        if status.chunk_count == 0:
+            self.complete_sources.add(status.file_hash)
+            self.part_status[status.file_hash] = frozenset()
+            log.debug(
+                "PEER FILESTATUS complete source: host=%s:%d, hash=%s",
+                self.host,
+                self.port,
+                status.file_hash.hex().upper(),
+            )
+        else:
+            self.part_status[status.file_hash] = frozenset(status.present_chunks)
+            log.debug(
+                "PEER FILESTATUS parts: host=%s:%d, hash=%s, present=%d/%d",
+                self.host,
+                self.port,
+                status.file_hash.hex().upper(),
+                len(status.present_chunks),
+                status.chunk_count,
+            )
+        return True
+
     # -- file request and queue ----------------------------------------------
 
     async def request_file(self, file_hash: bytes) -> HashSetAnswer:
@@ -846,6 +908,8 @@ class PeerClient:
                     self.host,
                     self.port,
                 )
+                continue
+            if self._capture_file_status(protocol, opcode, payload):
                 continue
             log.debug(
                 "PEER ignoring packet while requesting file: opcode=0x%02X",
@@ -954,6 +1018,8 @@ class PeerClient:
                 continue
             if opcode == C2CTCP.FILEREQANSNOFIL:
                 raise PeerSessionError("peer reported the file as unavailable")
+            if self._capture_file_status(protocol, opcode, payload):
+                continue
             log.debug(
                 "PEER ignoring packet while waiting for slot: opcode=0x%02X",
                 opcode,
@@ -986,6 +1052,8 @@ class PeerClient:
         max_blocks: int = 100_000,
         start_offset: int = 0,
         end_offset: Optional[int] = None,
+        block_selector: Optional[Callable[[int], list[tuple[int, int]]]] = None,
+        release_ranges: Optional[Callable[[list[tuple[int, int]]], None]] = None,
     ) -> DownloadOutcome:
         """Run the request-parts / sending-part loop until completion.
 
@@ -994,6 +1062,17 @@ class PeerClient:
         blocks)`` fires after each block.  ``start_offset``/``end_offset``
         bound the region this session downloads (stripe scheduling); write
         offsets remain absolute.
+
+        ICS: when ``block_selector`` is supplied it is called with the current
+        outstanding request count and returns up to 3 *inclusive* ``(start,
+        end)`` ranges chosen by the Intelligent Chunk Selector.  The selector
+        output is normalised to the wire convention used by
+        ``build_request_parts_payload`` — *exclusive* end (``end + 1``) —
+        per DownloadClient.cpp:1241 (``aOffs[3..5] = EndOffset + 1``).  When
+        ``block_selector`` is ``None`` the original linear
+        ``EMBLOCK_SIZE``-stepped scheduling is used unchanged.  Every range
+        actually issued on the wire is accumulated in ``issued_ranges`` and
+        released via ``release_ranges`` exactly once on any exit path.
         """
         started = time.monotonic()
         # ВАЖНО (на это уже нарывались): OP_ACCEPTUPLOADREQ — серверный
@@ -1023,6 +1102,10 @@ class PeerClient:
                 else []
             )
 
+        # ICS: every range actually sent on the wire this call, for the
+        # runner's block_selector bookkeeping.  Released once on exit.
+        issued_ranges: list[tuple[int, int]] = []
+
         # COMPRESSEDPART reassembly buffer: eMule splits a compressed block
         # into sub-packets where every sub-packet repeats the BLOCK start and
         # the TOTAL compressed size (UploadDiskIOThread CreatePackedPackets).
@@ -1031,146 +1114,97 @@ class PeerClient:
         pending_compressed: dict[tuple[int, int], dict[str, Any]] = {}
         outofpart_retries = 0
 
-        while blocks < max_blocks:
-            if base_offset + received >= bound:
-                break
-            starts, ends = [], []
-            for offset in (
-                base_offset + received,
-                base_offset + received + EMBLOCK_SIZE,
-                base_offset + received + 2 * EMBLOCK_SIZE,
-            ):
-                if offset >= bound:
+        try:
+            while blocks < max_blocks:
+                if base_offset + received >= bound:
                     break
-                end = min(offset + EMBLOCK_SIZE, bound)
-                starts.append(offset)
-                ends.append(end)
-            if not starts:
-                break
-            while len(starts) < 3:
-                starts.append(0)
-                ends.append(0)
-            if any(value > 0xFFFFFFFF for value in starts + ends):
-                await self._send(
-                    EDONKEY,
-                    C2CTCP.REQUESTPARTS_I64,
-                    build_request_parts_i64_payload(
-                        file_hash,
-                        (starts[0], starts[1], starts[2]),
-                        (ends[0], ends[1], ends[2]),
-                    ),
+                # -- range selection (ICS / linear fallback) -------------------
+                # build_request_parts_payload expects EXCLUSIVE ends (the
+                # encoder writes start then end-offset, eMule decodes as
+                # EndOffset+1 per DownloadClient.cpp:1241).  The linear
+                # fallback computes end = min(offset + EMBLOCK_SIZE, bound)
+                # directly as an exclusive end.  A block_selector returns
+                # INCLUSIVE (start, end) ranges, so we add +1 to each end.
+                if block_selector is not None:
+                    raw_ranges = block_selector(3)
+                    if not raw_ranges:
+                        break  # peer/source has nothing we need
+                    # Clip to [base_offset, bound) and normalise to 3 slots.
+                    clipped: list[tuple[int, int]] = []
+                    for rstart, rend in raw_ranges[:3]:
+                        rstart = max(rstart, base_offset)
+                        rend = min(rend, bound - 1)
+                        if rstart <= rend:
+                            clipped.append((rstart, rend + 1))  # incl -> excl
+                    while len(clipped) < 3:
+                        clipped.append((0, 0))
+                    starts = [c[0] for c in clipped]
+                    ends = [c[1] for c in clipped]
+                    round_ranges = [
+                        (rstart, rend) for rstart, rend in raw_ranges[:3]
+                    ]
+                    issued_ranges.extend(round_ranges)
+                else:
+                    starts, ends = [], []
+                    for offset in (
+                        base_offset + received,
+                        base_offset + received + EMBLOCK_SIZE,
+                        base_offset + received + 2 * EMBLOCK_SIZE,
+                    ):
+                        if offset >= bound:
+                            break
+                        end = min(offset + EMBLOCK_SIZE, bound)
+                        starts.append(offset)
+                        ends.append(end)
+                    if not starts:
+                        break
+                    while len(starts) < 3:
+                        starts.append(0)
+                        ends.append(0)
+                    issued_ranges.extend(
+                        (s, e - 1) for s, e in zip(starts, ends) if s < e
+                    )
+                if any(value > 0xFFFFFFFF for value in starts + ends):
+                    await self._send(
+                        EDONKEY,
+                        C2CTCP.REQUESTPARTS_I64,
+                        build_request_parts_i64_payload(
+                            file_hash,
+                            (starts[0], starts[1], starts[2]),
+                            (ends[0], ends[1], ends[2]),
+                        ),
+                    )
+                else:
+                    await self._send(
+                        EDONKEY,
+                        C2CTCP.REQUESTPARTS,
+                        build_request_parts_payload(
+                            file_hash,
+                            (starts[0], starts[1], starts[2]),
+                            (ends[0], ends[1], ends[2]),
+                        ),
+                    )
+                log.debug(
+                    "PEER parts requested: host=%s:%d, count=%d, from=%d",
+                    self.host,
+                    self.port,
+                    len([s for s in starts if s < total_size]),
+                    starts[0],
                 )
-            else:
-                await self._send(
-                    EDONKEY,
-                    C2CTCP.REQUESTPARTS,
-                    build_request_parts_payload(
-                        file_hash,
-                        (starts[0], starts[1], starts[2]),
-                        (ends[0], ends[1], ends[2]),
-                    ),
-                )
-            log.debug(
-                "PEER parts requested: host=%s:%d, count=%d, from=%d",
-                self.host,
-                self.port,
-                len([s for s in starts if s < total_size]),
-                starts[0],
-            )
 
-            # Byte-based round accounting: the server splits each requested
-            # range into an arbitrary number of sub-packets (13000/10240,
-            # CreateStandardPackets/CreatePackedPackets), so counting PACKETS
-            # deadlocks the round.  Count PAYLOAD bytes instead: the round
-            # is complete once every requested byte has arrived.
-            expected_bytes = sum(
-                e - s for s, e in zip(starts, ends) if s < e
-            )
-            while expected_bytes > 0:
-                packet = await self._receive(
-                    timeout=self.response_timeout, close_on_timeout=False
+                # Byte-based round accounting: the server splits each requested
+                # range into an arbitrary number of sub-packets (13000/10240,
+                # CreateStandardPackets/CreatePackedPackets), so counting PACKETS
+                # deadlocks the round.  Count PAYLOAD bytes instead: the round
+                # is complete once every requested byte has arrived.
+                expected_bytes = sum(
+                    e - s for s, e in zip(starts, ends) if s < e
                 )
-                if packet is None:
-                    self._maybe_credit_downloaded(received)
-                    outcome = DownloadOutcome(
-                        file_hash=file_hash.hex().upper(),
-                        bytes_received=received,
-                        blocks_received=blocks,
-                        complete=base_offset + received >= bound,
-                        elapsed=time.monotonic() - started,
-                        detail="idle timeout while transferring",
+                while expected_bytes > 0:
+                    packet = await self._receive(
+                        timeout=self.response_timeout, close_on_timeout=False
                     )
-                    log.warning(
-                        "PEER transfer stalled: host=%s:%d, received=%d/%d",
-                        self.host,
-                        self.port,
-                        received,
-                        total_size,
-                    )
-                    return outcome
-                protocol, opcode, payload = packet
-                if protocol != EDONKEY:
-                    continue
-                part: Optional[SendingPart] = None
-                if opcode == C2CTCP.SENDINGPART:
-                    part = parse_sending_part(payload)
-                elif opcode == C2CTCP.SENDINGPART_I64:
-                    part = parse_sending_part_i64(payload)
-                elif opcode == C2CTCP.COMPRESSEDPART:
-                    h, s, total, chunk = parse_compressed_part_chunk(payload)
-                    key = (s, total)
-                    slot = pending_compressed.setdefault(
-                        key, {"hash": h, "buf": bytearray(), "i64": False}
-                    )
-                    slot["buf"] += chunk
-                    if len(slot["buf"]) < total:
-                        continue  # more sub-packets pending
-                    del pending_compressed[key]
-                    try:
-                        data = zlib.decompress(bytes(slot["buf"]))
-                    except zlib.error as exc:
-                        raise PeerSessionError(
-                            f"compressed part reassembly failed: {exc}"
-                        ) from exc
-                    part = SendingPart(
-                        file_hash=slot["hash"], start=s, end=s + len(data), data=data
-                    )
-                elif opcode == C2CTCP.COMPRESSEDPART_I64:
-                    h, s, total, chunk = parse_compressed_part_chunk_i64(payload)
-                    key = (s, total)
-                    slot = pending_compressed.setdefault(
-                        key, {"hash": h, "buf": bytearray(), "i64": True}
-                    )
-                    slot["buf"] += chunk
-                    if len(slot["buf"]) < total:
-                        continue  # more sub-packets pending
-                    del pending_compressed[key]
-                    try:
-                        data = zlib.decompress(bytes(slot["buf"]))
-                    except zlib.error as exc:
-                        raise PeerSessionError(
-                            f"compressed part reassembly failed: {exc}"
-                        ) from exc
-                    part = SendingPart(
-                        file_hash=slot["hash"], start=s, end=s + len(data), data=data
-                    )
-                elif opcode == C2CTCP.END_OF_DOWNLOAD:
-                    log.info(
-                        "PEER end of download: host=%s:%d, received=%d/%d",
-                        self.host,
-                        self.port,
-                        received,
-                        total_size,
-                    )
-                    expected_bytes = 0
-                    break
-                elif opcode == C2CTCP.OUTOFPARTREQS:
-                    # The source accepted us but has no upload blocks
-                    # prepared yet (it reads the file lazily after the
-                    # slot grant).  Real clients re-request after a short
-                    # pause instead of dropping the slot.
-                    outofpart_retries += 1
-                    if outofpart_retries > _OUTOFPART_MAX_RETRIES:
+                    if packet is None:
                         self._maybe_credit_downloaded(received)
                         outcome = DownloadOutcome(
                             file_hash=file_hash.hex().upper(),
@@ -1178,59 +1212,175 @@ class PeerClient:
                             blocks_received=blocks,
                             complete=base_offset + received >= bound,
                             elapsed=time.monotonic() - started,
-                            detail="peer has no more parts",
+                            detail="idle timeout while transferring",
+                        )
+                        log.warning(
+                            "PEER transfer stalled: host=%s:%d, received=%d/%d",
+                            self.host,
+                            self.port,
+                            received,
+                            total_size,
                         )
                         return outcome
-                    log.info(
-                        "PEER out of parts (retry %d/%d): host=%s:%d",
-                        outofpart_retries,
-                        _OUTOFPART_MAX_RETRIES,
+                    protocol, opcode, payload = packet
+                    if protocol != EDONKEY:
+                        continue
+                    part: Optional[SendingPart] = None
+                    if opcode == C2CTCP.SENDINGPART:
+                        part = parse_sending_part(payload)
+                    elif opcode == C2CTCP.SENDINGPART_I64:
+                        part = parse_sending_part_i64(payload)
+                    elif opcode == C2CTCP.COMPRESSEDPART:
+                        h, s, total, chunk = parse_compressed_part_chunk(payload)
+                        key = (s, total)
+                        slot = pending_compressed.setdefault(
+                            key, {"hash": h, "buf": bytearray(), "i64": False}
+                        )
+                        slot["buf"] += chunk
+                        if len(slot["buf"]) < total:
+                            continue  # more sub-packets pending
+                        del pending_compressed[key]
+                        try:
+                            data = zlib.decompress(bytes(slot["buf"]))
+                        except zlib.error as exc:
+                            raise PeerSessionError(
+                                f"compressed part reassembly failed: {exc}"
+                            ) from exc
+                        part = SendingPart(
+                            file_hash=slot["hash"], start=s, end=s + len(data), data=data
+                        )
+                    elif opcode == C2CTCP.COMPRESSEDPART_I64:
+                        h, s, total, chunk = parse_compressed_part_chunk_i64(payload)
+                        key = (s, total)
+                        slot = pending_compressed.setdefault(
+                            key, {"hash": h, "buf": bytearray(), "i64": True}
+                        )
+                        slot["buf"] += chunk
+                        if len(slot["buf"]) < total:
+                            continue  # more sub-packets pending
+                        del pending_compressed[key]
+                        try:
+                            data = zlib.decompress(bytes(slot["buf"]))
+                        except zlib.error as exc:
+                            raise PeerSessionError(
+                                f"compressed part reassembly failed: {exc}"
+                            ) from exc
+                        part = SendingPart(
+                            file_hash=slot["hash"], start=s, end=s + len(data), data=data
+                        )
+                    elif opcode == C2CTCP.END_OF_DOWNLOAD:
+                        log.info(
+                            "PEER end of download: host=%s:%d, received=%d/%d",
+                            self.host,
+                            self.port,
+                            received,
+                            total_size,
+                        )
+                        expected_bytes = 0
+                        break
+                    elif opcode == C2CTCP.OUTOFPARTREQS:
+                        # The source accepted us but has no upload blocks
+                        # prepared yet (it reads the file lazily after the
+                        # slot grant).  Real clients re-request after a short
+                        # pause instead of dropping the slot.
+                        outofpart_retries += 1
+                        if outofpart_retries > _OUTOFPART_MAX_RETRIES:
+                            self._maybe_credit_downloaded(received)
+                            outcome = DownloadOutcome(
+                                file_hash=file_hash.hex().upper(),
+                                bytes_received=received,
+                                blocks_received=blocks,
+                                complete=base_offset + received >= bound,
+                                elapsed=time.monotonic() - started,
+                                detail="peer has no more parts",
+                            )
+                            return outcome
+                        log.info(
+                            "PEER out of parts (retry %d/%d): host=%s:%d",
+                            outofpart_retries,
+                            _OUTOFPART_MAX_RETRIES,
+                            self.host,
+                            self.port,
+                        )
+                        await asyncio.sleep(_OUTOFPART_RETRY_DELAY)
+                        # Escape the receive loop: the outer while re-issues
+                        # REQUESTPARTS.  With an ICS selector, the re-issue
+                        # path falls through to block_selector(3) again (the
+                        # selector decides fresh ranges); the linear path reuses
+                        # the existing base_offset + received arithmetic.
+                        if block_selector is not None:
+                            round_ranges = []
+                        expected_bytes = 0
+                        break
+                    elif opcode == C2CTCP.QUEUERANK:
+                        log.info(
+                            "PEER requeued during transfer: rank=%d",
+                            parse_queue_rank(payload),
+                        )
+                        self._maybe_credit_downloaded(received)
+                        outcome = DownloadOutcome(
+                            file_hash=file_hash.hex().upper(),
+                            bytes_received=received,
+                            blocks_received=blocks,
+                            complete=base_offset + received >= bound,
+                            elapsed=time.monotonic() - started,
+                            detail="moved back to queue",
+                        )
+                        return outcome
+                    else:
+                        if self._capture_file_status(protocol, opcode, payload):
+                            continue
+                        if self._collect_answer_sources(protocol, opcode, payload):
+                            continue
+                        log.debug(
+                            "PEER ignoring packet during transfer: opcode=0x%02X",
+                            opcode,
+                        )
+                        continue
+                    if part is None:
+                        continue
+                    write_block(part.start, part.data)
+                    received += len(part.data)
+                    blocks += 1
+                    if progress_callback is not None:
+                        try:
+                            progress_callback(received, total_size, blocks)
+                        except Exception:
+                            pass
+                    expected_bytes -= len(part.data)
+                if base_offset + received >= bound:
+                    break
+
+            complete = base_offset + received >= bound
+            self._maybe_credit_downloaded(received)
+            outcome = DownloadOutcome(
+                file_hash=file_hash.hex().upper(),
+                bytes_received=received,
+                blocks_received=blocks,
+                complete=complete,
+                elapsed=time.monotonic() - started,
+                detail="transfer finished",
+            )
+            log.info(
+                "PEER transfer completed: host=%s:%d, received=%d/%d, complete=%s",
+                self.host,
+                self.port,
+                received,
+                total_size,
+                complete,
+            )
+            return outcome
+        finally:
+            if release_ranges is not None and issued_ranges:
+                try:
+                    release_ranges(issued_ranges)
+                except Exception as exc:
+                    log.debug(
+                        "PEER release_ranges failed: host=%s:%d, error=%s",
                         self.host,
                         self.port,
+                        exc,
                     )
-                    await asyncio.sleep(_OUTOFPART_RETRY_DELAY)
-                    # Escape the receive loop: the outer while re-issues
-                    # REQUESTPARTS for the same range.
-                    expected_bytes = 0
-                    break
-                elif opcode == C2CTCP.QUEUERANK:
-                    log.info(
-                        "PEER requeued during transfer: rank=%d",
-                        parse_queue_rank(payload),
-                    )
-                    self._maybe_credit_downloaded(received)
-                    outcome = DownloadOutcome(
-                        file_hash=file_hash.hex().upper(),
-                        bytes_received=received,
-                        blocks_received=blocks,
-                        complete=base_offset + received >= bound,
-                        elapsed=time.monotonic() - started,
-                        detail="moved back to queue",
-                    )
-                    return outcome
-                else:
-                    if self._collect_answer_sources(protocol, opcode, payload):
-                        continue
-                    log.debug(
-                        "PEER ignoring packet during transfer: opcode=0x%02X",
-                        opcode,
-                    )
-                    continue
-                if part is None:
-                    continue
-                write_block(part.start, part.data)
-                received += len(part.data)
-                blocks += 1
-                if progress_callback is not None:
-                    try:
-                        progress_callback(received, total_size, blocks)
-                    except Exception:
-                        pass
-                expected_bytes -= len(part.data)
-            if base_offset + received >= bound:
-                break
-
-        complete = base_offset + received >= bound
         self._maybe_credit_downloaded(received)
         outcome = DownloadOutcome(
             file_hash=file_hash.hex().upper(),

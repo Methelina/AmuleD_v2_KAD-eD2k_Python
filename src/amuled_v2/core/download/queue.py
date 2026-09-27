@@ -5,9 +5,15 @@ paused, complete, error), and the on-disk part-file state.  Adding a download
 requires a real ED2K file link; the queue itself never fakes transfer data.
 
 src/amuled_v2/core/download/queue.py
-Version:     0.2.0
+Version:     0.2.1
 Author:      Soror L.'.L.'.
-Updated:     2026-09-27
+Updated:     2026-09-28
+
+Patch Notes v0.2.1 (Soror L'.L'.):
+  [+] _file_hash(): verify with the eD2K root hash (MD4 of concatenated
+      part-MD4s for multi-part files) instead of a bare whole-file MD4.
+      For single-part files both coincide, which is why finalize(verify)
+      silently passed on < 9.7 MB files and failed on multi-part ones.
 
 Patch Notes v0.2.0 (Soror L'.L'.):
   [+] gap_ranges(): remaining hole ranges of the part file - input for
@@ -301,10 +307,9 @@ class DownloadQueue:
 
     @staticmethod
     def _file_hash(path: Path) -> str:
-        from Crypto.Hash import MD4
+        # eD2K verification hash: bare MD4 only for single-part files; for
+        # multi-part files it is the MD4 of the concatenated part-MD4
+        # digests (ed2k_hash_file implements both cases).
+        from amuled_v2.core.hashes.ed2k import ed2k_hash_file
 
-        digest = MD4.new()
-        with open(path, "rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
-        return digest.hexdigest().upper()
+        return ed2k_hash_file(str(path)).file_hash.hex().upper()

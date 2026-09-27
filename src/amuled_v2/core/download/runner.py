@@ -8,9 +8,24 @@ part file via ``record_block`` and completion is finalized only when a
 peer delivers the whole file.
 
 src/amuled_v2/core/download/runner.py
-Version:     0.7.1
-Author:      Soror L.'.L.'.
-Updated:     2026-09-27
+Version:     0.8.0
+Author:      Soror L.'.L'.
+Updated:     2026-09-28
+
+Patch Notes v0.8.0 (Soror L'.L'.):
+  [+] ICS (Intelligent Chunk Selection): runner-level requested-ranges registry
+      (_requested_ranges) as the IsAlreadyRequested equivalent (PartFile.cpp:2674-2696);
+      per-peer block_selector built on amuled_v2.core.download.ics.select_blocks;
+      _part_frequencies aggregates live peer part-status (ics-filestatus-client.recon.md,
+      ics-endgame.recon.md section 5: UpdatePartsInfo PartFile.cpp:3644-3677).
+  [+] ICS path activates only when file > PART_SIZE or >1 gap; single-part /
+      single-gap files keep the linear stripe transfer.  Selector creation is
+      try/except-guarded — on any failure the existing stripe transfer is used
+      unchanged (no swallowing of transfer errors).
+  [+] complete_sources / part_status on PeerClient (parallel client.py change)
+      feed _part_frequencies; peers with no status info are treated as complete
+      sources (unknown -> assume available, per ics-filestatus-client.recon.md
+      Mode A: chunk_count == 0 means the peer has every part).
 
 Patch Notes v0.7.1 (Soror L'.L'.):
   [+] Self-record filter (roadmap 11o addendum 4): resolve_sources
@@ -78,8 +93,9 @@ from __future__ import annotations
 import asyncio
 import socket
 import struct
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
+from amuled_v2.core.download.ics import PART_SIZE as _ICS_PART_SIZE
 from amuled_v2.logging_setup import LogTags, get_tagged_logger
 
 if TYPE_CHECKING:
@@ -225,6 +241,64 @@ class DownloadRunner:
         # local addresses (NAT reflection / self-publication).  Loopback
         # tests disable it — their fake source legitimately sits on ::1.
         self.self_record_filter = self_record_filter
+        # ICS requested-ranges registry (PartFile.cpp requestedblocks_list,
+        # recon ics-endgame.recon.md section 6): file_hash bytes -> set of
+        # inclusive (start, end) byte ranges currently in flight across all
+        # peer sessions.  Prevents duplicate block requests between peers.
+        self._requested_ranges: dict[bytes, set[tuple[int, int]]] = {}
+        # Live ICS clients per file: used by _part_frequencies to aggregate
+        # peer part-status into global per-part source counts.
+        self._ics_clients: dict[bytes, list[Any]] = {}
+
+    def _register_ranges(self, file_hash: bytes, ranges) -> None:
+        """Add inclusive (start, end) ranges to the in-flight registry."""
+        bucket = self._requested_ranges.setdefault(file_hash, set())
+        for start, end in ranges:
+            bucket.add((start, end))
+
+    def _release_ranges(self, file_hash: bytes, ranges) -> None:
+        """Discard each range; drop the dict entry when empty."""
+        bucket = self._requested_ranges.get(file_hash)
+        if bucket is None:
+            return
+        for start, end in ranges:
+            bucket.discard((start, end))
+        if not bucket:
+            self._requested_ranges.pop(file_hash, None)
+
+    def _part_frequencies(
+        self, file_hash: bytes, clients: Sequence, total_size: int
+    ) -> list[int]:
+        """Per-part source frequency m_SrcPartFrequency (recon
+        ics-endgame.recon.md section 5, PartFile.cpp:3644-3677).
+
+        For each live client with the file in client.part_status, add 1 to
+        frequencies[i] for each i in part_status[hash].  Clients with the hash
+        in ``complete_sources`` count as having ALL parts (range(part_count)).
+        Clients with no status info at all are treated as complete sources too:
+        unknown -> assume available (per ics-filestatus-client.recon.md Mode A:
+        chunk_count == 0 means the peer has every part).  Length =
+        part_count(total_size).
+        """
+        from amuled_v2.core.download.ics import part_count
+
+        n = part_count(total_size)
+        frequencies = [0] * n
+        all_parts = frozenset(range(n))
+        for client in clients:
+            if client is None:
+                continue
+            complete = getattr(client, "complete_sources", None)
+            if complete and file_hash in complete:
+                parts = all_parts
+            else:
+                parts = getattr(client, "part_status", {}).get(file_hash)
+                if parts is None:
+                    parts = all_parts
+            for i in parts:
+                if 0 <= i < n:
+                    frequencies[i] += 1
+        return frequencies
 
     def resolve_sources(
         self, file_hash: str, *, limit: int = 20
@@ -395,7 +469,141 @@ class DownloadRunner:
                 log.debug(
                     "DOWNLOAD source exchange request failed: error=%s", exc
                 )
+            await client.handshake()
+            hashset = await client.request_file(file_hash_bytes)
+            try:
+                # Stage X source exchange: ask the peer for additional
+                # sources; answers are collected asynchronously and
+                # persisted in the finally block below.
+                await client.request_sources(file_hash_bytes)
+            except Exception as exc:
+                log.debug(
+                    "DOWNLOAD source exchange request failed: error=%s", exc
+                )
             await client.wait_upload_slot(file_hash_bytes)
+
+            # ICS (Intelligent Chunk Selection): when the file is multi-part
+            # (size > PART_SIZE) or has multiple gaps, delegate block selection
+            # to the ICS algorithm instead of the linear stripe.  Single-part /
+            # single-gap files keep the old linear behaviour.
+            block_selector: Callable[[int], list[tuple[int, int]]] | None = None
+            release_ranges: Callable[[list[tuple[int, int]]], None] | None = None
+            ics_active = (
+                size > _ICS_PART_SIZE
+                or len(self.queue.gap_ranges(file_hash)) > 1
+            )
+            if ics_active:
+                try:
+                    clients = self._ics_clients.setdefault(file_hash_bytes, [])
+                    clients.append(client)
+
+                    # Per-peer sticky state (eMule m_lastPartAsked per source,
+                    # PartFile.cpp:7490-7494): persists across selector calls
+                    # within one peer session.
+                    last_part_box: list[int | None] = [None]
+                    # Ranges this closure itself issued — excluded from the
+                    # "other in-flight" count so a peer does not penalise
+                    # itself.
+                    own_issued: set[tuple[int, int]] = set()
+
+                    def _selector(n: int) -> list[tuple[int, int]]:
+                        from amuled_v2.core.download import ics
+
+                        # Convert exclusive-end gaps from queue.gap_ranges
+                        # to inclusive (start, end-1) for the ICS module.
+                        raw_gaps = self.queue.gap_ranges(file_hash)
+                        gaps = [(s, e - 1) for s, e in raw_gaps if e > s]
+                        frequencies = self._part_frequencies(
+                            file_hash_bytes, clients, size
+                        )
+                        # downloading_counts: per part p, count of OTHER
+                        # in-flight ranges overlapping part p, excluding the
+                        # ranges this selector registered itself.
+                        downloading: dict[int, int] = {}
+                        for start, end in self._requested_ranges.get(
+                            file_hash_bytes, set()
+                        ):
+                            if (start, end) in own_issued:
+                                continue
+                            p_lo = start // ics.PART_SIZE
+                            p_hi = end // ics.PART_SIZE
+                            for p in range(p_lo, p_hi + 1):
+                                downloading[p] = downloading.get(p, 0) + 1
+
+                        # available: parts the peer has (or all if unknown).
+                        if file_hash_bytes in client.complete_sources:
+                            available = frozenset(range(ics.part_count(size)))
+                        else:
+                            available = client.part_status.get(
+                                file_hash_bytes
+                            ) or frozenset()
+                            if not available:
+                                available = frozenset(range(ics.part_count(size)))
+
+                        # gap_parts / gap_sizes (per-part remaining bytes).
+                        gap_parts: list[int] = []
+                        gap_sizes: dict[int, int] = {}
+                        for p in range(ics.part_count(size)):
+                            ps, pe = ics.part_bounds(p, size)
+                            part_gap = 0
+                            for g_start, g_end in gaps:
+                                ov_start = max(g_start, ps)
+                                ov_end = min(g_end, pe)
+                                if ov_end >= ov_start:
+                                    part_gap += ov_end - ov_start + 1
+                            if part_gap > 0:
+                                gap_parts.append(p)
+                                gap_sizes[p] = part_gap
+
+                        ranges, last_new = ics.select_blocks(
+                            total_size=size,
+                            gaps=gaps,
+                            available=available,
+                            frequencies=frequencies,
+                            downloading_counts=downloading,
+                            last_part=last_part_box[0],
+                            requested=self._requested_ranges.get(
+                                file_hash_bytes, set()
+                            ),
+                            max_blocks=n,
+                        )
+                        if ranges:
+                            own_issued.update(ranges)
+                            self._register_ranges(file_hash_bytes, ranges)
+                            last_part_box[0] = last_new
+                        return ranges
+
+                    def _release(ranges: list[tuple[int, int]]) -> None:
+                        for r in ranges:
+                            own_issued.discard(r)
+                        self._release_ranges(file_hash_bytes, ranges)
+
+                    block_selector = _selector
+                    release_ranges = _release
+
+                    # ICS uses the full file range; the selector picks only
+                    # from genuine gaps so start/end_offset are left at 0/None.
+                    transfer_start = 0
+                    transfer_end = None
+                    log.debug(
+                        "DOWNLOAD ICS selector armed: hash=%s, size=%d, "
+                        "peers=%d",
+                        file_hash, size, len(clients),
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "DOWNLOAD ICS selector build failed, falling back to "
+                        "stripe: hash=%s, error=%s",
+                        file_hash, exc,
+                    )
+                    block_selector = None
+                    release_ranges = None
+                    transfer_start = start_offset
+                    transfer_end = end_offset
+            else:
+                transfer_start = start_offset
+                transfer_end = end_offset
+
             outcome = await client.transfer(
                 file_hash_bytes,
                 size,
@@ -403,14 +611,16 @@ class DownloadRunner:
                     file_hash, start, data
                 ),
                 progress_callback=progress_callback,
-                start_offset=start_offset,
-                end_offset=end_offset,
+                start_offset=transfer_start,
+                end_offset=transfer_end,
+                block_selector=block_selector,
+                release_ranges=release_ranges,
             )
             if (
                 outcome.complete
                 and hashset is not None
-                and start_offset == 0
-                and (end_offset is None or end_offset >= size)
+                and transfer_start == 0
+                and (transfer_end is None or transfer_end >= size)
             ):
                 # Corrupt-part salvage (stage X; PartFile.cpp
                 # HashSinglePart:4399-4474, FlushBuffer:5793-5804): verify
@@ -430,14 +640,17 @@ class DownloadRunner:
                         file_hash, exc,
                     )
                 if corrupt:
-                    self.queue.punch_gaps(file_hash, corrupt)
-                    outcome.complete = False
-                    outcome.detail = f"corrupt parts punched: {corrupt}"
-                    log.warning(
-                        "DOWNLOAD corrupt parts punched: hash=%s, %s",
-                        file_hash, corrupt,
+                    ranges = await self._aich_narrow_corrupt(
+                        client, file_hash_bytes, size, corrupt, hashset
                     )
-            if outcome.complete and start_offset == 0 and self.aich_audit:
+                    self.queue.punch_gaps(file_hash, ranges)
+                    outcome.complete = False
+                    outcome.detail = f"corrupt ranges punched: {ranges}"
+                    log.warning(
+                        "DOWNLOAD corrupt ranges punched: hash=%s, %s",
+                        file_hash, ranges,
+                    )
+            if outcome.complete and transfer_start == 0 and self.aich_audit:
                 # AICH audit (stage X): the file just completed with MD4
                 # pending; verify the AICH tree against the peer and store
                 # the recovery-verified master for future salvage.  Must
@@ -474,6 +687,19 @@ class DownloadRunner:
                 except Exception:
                     pass
                 await client.close()
+                # Unregister this peer from the ICS live-client list so
+                # _part_frequencies stops counting it.
+                ics_clients = self._ics_clients.get(file_hash_bytes)
+                if ics_clients is not None:
+                    try:
+                        ics_clients.remove(client)
+                    except ValueError:
+                        pass
+                    if not ics_clients:
+                        self._ics_clients.pop(file_hash_bytes, None)
+                # Ranges this peer registered are released by the transfer's
+                # release_ranges callback (called in client.transfer's own
+                # finally); nothing extra to clean here.
             for closer in closers:
                 try:
                     closer()
@@ -509,6 +735,80 @@ class DownloadRunner:
             file_hash_bytes.hex().upper(),
             len(sources),
         )
+
+    async def _aich_narrow_corrupt(
+        self,
+        client: Any,
+        file_hash_bytes: bytes,
+        size: int,
+        corrupt_parts: list[tuple[int, int]],
+        hashset: Any,
+    ) -> list[tuple[int, int]]:
+        """Narrow corrupt PART ranges down to corrupt 180 KB blocks via
+        the AICH recovery data (PartFile.cpp AICHRecoveryDataAvailable
+        :7108-7221).  Falls back to whole-part punches when no trusted
+        master is stored or the blob does not authenticate.
+        """
+        from amuled_v2.core.codec.constants import (
+            BLOCKSIZE,
+            PARTSIZE,
+        )
+        from amuled_v2.core.hashes.aich import (
+            AichError,
+            aich_hash_data,
+            aich_verified_part_blocks,
+        )
+
+        ranges: list[tuple[int, int]] = []
+        entry = self.queue.get(file_hash_bytes.hex())
+        if entry is None:
+            return corrupt_parts
+        stored = self.queue.state.get_aich_master(file_hash_bytes.hex())
+        part_path = str(entry["part_path"])
+        for part_start, _part_end in corrupt_parts:
+            part_index = part_start // PARTSIZE
+            part_size = min(PARTSIZE, size - part_start)
+            narrowed = False
+            if stored is not None:
+                try:
+                    with open(part_path, "rb") as handle:
+                        handle.seek(part_start)
+                        part_data = handle.read(part_size)
+                    recovery = None
+                    try:
+                        _h, _p, _m, recovery = await client.request_aich(
+                            file_hash_bytes, part_index, bytes(stored)
+                        )
+                    except Exception as exc:
+                        log.debug(
+                            "DOWNLOAD AICH request failed: part=%d, "
+                            "error=%s",
+                            part_index, exc,
+                        )
+                    if recovery:
+                        verified = aich_verified_part_blocks(
+                            recovery, part_index, size, bytes(stored)
+                        )
+                        ours = aich_hash_data(part_data).block_hashes
+                        for block_index, (ours_h, verified_h) in enumerate(
+                            zip(ours, verified)
+                        ):
+                            if ours_h != verified_h:
+                                block_start = part_start + block_index * BLOCKSIZE
+                                block_end = min(
+                                    block_start + BLOCKSIZE,
+                                    part_start + part_size,
+                                )
+                                ranges.append((block_start, block_end))
+                        narrowed = bool(ranges)
+                except AichError as exc:
+                    log.debug(
+                        "DOWNLOAD AICH narrowing failed: part=%d, error=%s",
+                        part_index, exc,
+                    )
+            if not narrowed:
+                ranges.append((part_start, part_start + part_size))
+        return ranges
 
     def _verify_parts_against_hashset(
         self,
