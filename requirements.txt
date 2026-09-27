@@ -23,6 +23,9 @@ aiohttp>=3.9.0
 cryptography>=43.0.0
 pycryptodome>=3.20.0
 maxminddb>=2.6.0
+# Stage X NAT-T: standard IETF QUIC transport (interop with eMuleAI
+# ngtcp2/GnuTLS NAT-T, ALPN "ed2k-ai-natt-quic-v1").
+aioquic>=1.2.0
 
 # === REPL & CLI Rendering ===
 prompt_toolkit>=3.0.47

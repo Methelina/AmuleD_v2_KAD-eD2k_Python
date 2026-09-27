@@ -38,6 +38,10 @@ __all__ = [
 
 DIRECT_CALLBACK_OPCODE = 0x95  # Opcodes.h:450, protocol OP_EMULEPROT (0xC5)
 KAD_CALLBACK_REQ_OPCODE = 0x52  # Opcodes.h:810, <TCPPORT (sender) [2]>
+REASK_CALLBACK_UDP_OPCODE = 0x94  # Opcodes.h:449 (NAT-T rendezvous request)
+RENDEZVOUS_MARKER = 0xA0  # Opcodes.h:705/704
+CONNECT_OPT_NATT_ENDPOINT_HINT = 0x20  # Opcodes.h:219
+CONNECT_OPT_NAT_TRAVERSAL_UTP = 0x80  # Opcodes.h:221
 CLIENT_UDP_PROTOCOL = 0xC5
 
 
@@ -178,6 +182,89 @@ async def send_kad_callback_req(
                 "PEER kad-callback request sent: buddy=%s:%d, attempt=%d, "
                 "our_port=%d",
                 host, buddy_udp_port, attempt, our_tcp_port,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(pause)
+    finally:
+        sock.close()
+
+
+# ---------------------------------------------------------------------------
+# NAT-T rendezvous (double-firewalled case; BaseClient.cpp:3091-3257).
+# Requester -> TARGET's buddy via client UDP: OP_REASKCALLBACKUDP (0x94)
+# [buddy KadID 16][null marker 16][OP_RENDEZVOUS 0xA0][our userhash 16]
+# [connect options u8 | ENDPOINT_HINT][file hash 16][our ext ip u32]
+# [our ext udp port u16][transport hint u8].  The buddy relays
+# OP_REASKCALLBACKTCP to the firewalled source, kicks our NAT with
+# OP_HOLEPUNCH and answers OP_NATT_ENDPOINT_HINT; both sides then open the
+# NAT-T transport (uTP 0x80 / QUIC 0x40) over the punched endpoint.
+# ---------------------------------------------------------------------------
+
+
+def build_rendezvous_req_payload(
+    buddy_id: bytes,
+    our_user_hash: bytes,
+    connect_options: int,
+    file_hash: bytes,
+    our_ext_ip: int,
+    our_ext_udp_port: int,
+    transport_hint: int,
+) -> bytes:
+    """BaseClient.cpp:3147-3196 payload layout (LE where applicable)."""
+    if len(buddy_id) != 16 or len(our_user_hash) != 16 or len(file_hash) != 16:
+        raise ValueError("rendezvous payload needs three 16-byte ids")
+    opts = (connect_options | CONNECT_OPT_NATT_ENDPOINT_HINT) & 0xFF
+    hint = transport_hint | CONNECT_OPT_NAT_TRAVERSAL_UTP
+    return (
+        bytes(buddy_id)
+        + b"\x00" * 16
+        + bytes((RENDEZVOUS_MARKER,))
+        + bytes(our_user_hash)
+        + bytes((opts,))
+        + bytes(file_hash)
+        + struct.pack("<IH", our_ext_ip & 0xFFFFFFFF, our_ext_udp_port & 0xFFFF)
+        + bytes((hint,))
+    )
+
+
+async def send_rendezvous_req(
+    host: str,
+    buddy_udp_port: int,
+    buddy_id: bytes,
+    our_user_hash: bytes,
+    file_hash: bytes,
+    our_ext_ip: int,
+    our_ext_udp_port: int,
+    *,
+    connect_options: int = 3,
+    transport_hint: int = 0,
+    attempts: int = 3,
+    pause: float = 1.0,
+) -> None:
+    """Fire OP_REASKCALLBACKUDP (rendezvous) at the target's buddy."""
+    loop = asyncio.get_running_loop()
+    payload = build_rendezvous_req_payload(
+        buddy_id,
+        our_user_hash,
+        connect_options,
+        file_hash,
+        our_ext_ip,
+        our_ext_udp_port,
+        transport_hint,
+    )
+    wire = (
+        bytes((CLIENT_UDP_PROTOCOL,))
+        + struct.pack("<I", len(payload) + 1)
+        + bytes((REASK_CALLBACK_UDP_OPCODE,))
+        + payload
+    )
+    sock = socket_udp()
+    try:
+        for attempt in range(1, attempts + 1):
+            await loop.sock_sendto(sock, wire, (host, buddy_udp_port))
+            log.info(
+                "PEER rendezvous request sent: buddy=%s:%d, attempt=%d",
+                host, buddy_udp_port, attempt,
             )
             if attempt < attempts:
                 await asyncio.sleep(pause)
