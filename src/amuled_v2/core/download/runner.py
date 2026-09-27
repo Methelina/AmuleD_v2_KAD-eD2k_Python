@@ -8,9 +8,24 @@ part file via ``record_block`` and completion is finalized only when a
 peer delivers the whole file.
 
 src/amuled_v2/core/download/runner.py
-Version:     0.8.0
+Version:     0.9.0
 Author:      Soror L.'.L'.
 Updated:     2026-09-28
+
+Patch Notes v0.9.0 (Soror L'.L'.):
+  [+] Runner-level A4AF/NNS gate (stateless-session equivalent of eMule's
+      SwapToAnotherFile, DownloadClient.cpp:2171 / PartFile.cpp:3353-3370).
+      _attempt_peer consults _a4af_needed_parts after wait_upload_slot:
+      DS_NONEEDEDPARTS skip (peer has none of our gap parts) records an
+      "nns" verdict and short-circuits the transfer with a zero-byte
+      outcome dict; peers with complete_sources or unknown part-status
+      pass through as before.  resolve_sources drops endpoints whose
+      (host, port) carries a known "nns" verdict for the file so the
+      source is not re-dialed (it remains available for OTHER files).
+  [+] _a4af_verdicts: per-(host,port) dict of file_hash_hex -> verdict.
+  [+] _a4af_needed_parts: computes gap parts from queue.gap_ranges and
+      intersects them with client.part_status / complete_sources.
+  [+] _a4af_verdict: single-read helper used by both gate points.
 
 Patch Notes v0.8.0 (Soror L'.L'.):
   [+] ICS (Intelligent Chunk Selection): runner-level requested-ranges registry
@@ -249,6 +264,56 @@ class DownloadRunner:
         # Live ICS clients per file: used by _part_frequencies to aggregate
         # peer part-status into global per-part source counts.
         self._ics_clients: dict[bytes, list[Any]] = {}
+        # A4AF/NNS verdict registry (DownloadClient.cpp:2171 SwapToAnotherFile,
+        # PartFile.cpp:3353-3370 Process NNS pass).  Keyed by (host, port);
+        # value maps file_hash_hex -> "nns" (peer has none of our gap parts)
+        # or "needed" (peer can serve at least one gap part).  An "nns"
+        # verdict in resolve_sources prevents re-dialing the endpoint for
+        # this file, though the source stays available for OTHER files.
+        self._a4af_verdicts: dict[tuple[str, int], dict[str, str]] = {}
+
+    def _a4af_verdict(self, host: str, port: int, file_hash_hex: str) -> str | None:
+        """Return the cached A4AF verdict for (host, port) + file, or None."""
+        return self._a4af_verdicts.get((host, port), {}).get(file_hash_hex)
+
+    def _a4af_needed_parts(
+        self,
+        file_hash_hex: str,
+        file_hash_bytes: bytes,
+        client: Any,
+        size: int,
+    ) -> bool | None:
+        """A4AF gate predicate (DS_NONEEDEDPARTS check).
+
+        Returns True when the peer can serve at least one part we still
+        need (gap part present in the peer's part_status); False when the
+        peer has none of our gap parts (eMule DS_NONEEDEDPARTS — the peer
+        said it has nothing we want); None when the peer's part-status is
+        unknown so no gating decision can be made (proceed as before).
+
+        Gap parts are derived from self.queue.gap_ranges (exclusive-end
+        (start, end) tuples) via part-index = byte_offset // PART_SIZE
+        (PartFile.cpp block-status / chunk_count semantics; recon
+        a4af-downloadclient.recon.md:2171, a4af-partfile.recon.md:3353).
+        """
+        gaps = self.queue.gap_ranges(file_hash_hex)
+        if not gaps:
+            # No gaps: the file is complete (or nothing is needed) — do not
+            # gate (return True so existing full-file tests proceed).
+            return True
+        # Peer has every part (chunk_count == 0 / complete source).
+        if file_hash_bytes in getattr(client, "complete_sources", set()):
+            return True
+        available = getattr(client, "part_status", {}).get(file_hash_bytes)
+        if available is None:
+            # Unknown part-status: probe anyway.
+            return None
+        gap_parts: set[int] = set()
+        for start, end in gaps:
+            gap_parts.add(start // _ICS_PART_SIZE)
+            if end > start:
+                gap_parts.add((end - 1) // _ICS_PART_SIZE)
+        return bool(gap_parts & available)
 
     def _register_ranges(self, file_hash: bytes, ranges) -> None:
         """Add inclusive (start, end) ranges to the in-flight registry."""
@@ -317,6 +382,7 @@ class DownloadRunner:
         seen: set[tuple[str, int]] = set()
         endpoints: list[dict[str, Any]] = []
         skipped = 0
+        nns_dropped = 0
         own_ips = _local_ip_set()
         own_userhash: bytes | None = None
         if self.callback_identity:
@@ -365,6 +431,15 @@ class DownloadRunner:
             endpoint = (_client_id_to_ip(client_id), row["client_port"])
             if endpoint in seen:
                 continue
+            # A4AF / NNS filter: drop endpoints whose (host, port) carries
+            # a known "nns" verdict for this file — the peer was already
+            # proven useless (DS_NONEEDEDPARTS) and will not yield data, but
+            # the source remains available for OTHER files.  (recon
+            # a4af-downloadqueue.recon.md:1200 AddAlreadyKnownSourceAsA4AF
+            # keeps the source on the other file's list.)
+            if self._a4af_verdict(endpoint[0], endpoint[1], file_hash) == "nns":
+                nns_dropped += 1
+                continue
             seen.add(endpoint)
             endpoints.append(
                 {
@@ -392,6 +467,12 @@ class DownloadRunner:
                 "DOWNLOAD skipped undialable sources: hash=%s, skipped=%d",
                 file_hash,
                 skipped,
+            )
+        if nns_dropped:
+            log.debug(
+                "DOWNLOAD A4AF NNS endpoints dropped: hash=%s, dropped=%d",
+                file_hash,
+                nns_dropped,
             )
         return endpoints
 
@@ -481,6 +562,46 @@ class DownloadRunner:
                     "DOWNLOAD source exchange request failed: error=%s", exc
                 )
             await client.wait_upload_slot(file_hash_bytes)
+
+            # ------------------------------------------------------------------
+            # A4AF / DS_NONEEDEDPARTS gate (DownloadClient.cpp:2171
+            # SwapToAnotherFile; PartFile.cpp:3353-3370 Process NNS pass).
+            # After the upload-slot wait and before building the ICS selector,
+            # decide whether the peer can serve any part we still need.  A peer
+            # with no matching parts is skipped (recorded "nns") so its slice
+            # is reassigned to others; the source stays eligible for OTHER
+            # files.  Unknown part-status -> proceed unchanged.
+            # ------------------------------------------------------------------
+            verdict = self._a4af_needed_parts(
+                file_hash, file_hash_bytes, client, size
+            )
+            if verdict is False:
+                self._a4af_verdicts.setdefault((host, port), {})[
+                    file_hash
+                ] = "nns"
+                log.debug(
+                    "DOWNLOAD A4AF NNS skip: hash=%s, peer=%s:%d, "
+                    "no gap parts available",
+                    file_hash, host, port,
+                )
+                close_client = getattr(client, "close", None)
+                if close_client is not None:
+                    try:
+                        await close_client()
+                    except Exception:
+                        pass
+                return {
+                    "file_hash": file_hash,
+                    "bytes_received": 0,
+                    "blocks_received": 0,
+                    "complete": False,
+                    "elapsed": 0.0,
+                    "detail": "a4af-nns: peer has no needed parts",
+                }
+            elif verdict is True:
+                self._a4af_verdicts.setdefault((host, port), {})[
+                    file_hash
+                ] = "needed"
 
             # ICS (Intelligent Chunk Selection): when the file is multi-part
             # (size > PART_SIZE) or has multiple gaps, delegate block selection
