@@ -1,9 +1,9 @@
 # AmuleD v0.5.1 — Operational Roadmap and Session Handoff
-[STATUS LEGEND] DONE = выполнено, не трогать | SOLVED = проблема решена | WIP = в работе | DEPRECATED = устарело, читать только для контекста | TODO = сделать. Актуальное: 11c (SOLVED) и 11b. Секции 2-8, 12-13 — DEPRECATED (история сессий 1-4).
+[STATUS LEGEND] DONE = completed, do not touch | SOLVED = problem solved | WIP = in progress | DEPRECATED = outdated, read only for context | TODO = to do. Current: 11c (SOLVED) and 11b. Sections 2-8, 12-13 — DEPRECATED (session 1-4 history).
 
-Дата обновления: 2026-09-23 (сессии 2–4: search persistence, GLOBAL UDP, AUTO, source lifecycle, peer protocol, download stack, ipfilter/blacklist). Актуальное состояние проекта — секции 11a–11c (11c: KAD search SOLVED — 200 результатов по «video» за 1 с); исторические секции 2–5 описывают состояние на момент сессии 1 и оставлены для контекста находок. Продолжение работы: [docs\continuation-prompt.md](file:///K:/work/AmuleD_v2/docs/continuation-prompt.md). Этот файл является локальным рабочим roadmap'ом standalone-проекта AmuleD и не публикуется в Git.
+Date updated: 2026-09-23 (sessions 2–4: search persistence, GLOBAL UDP, AUTO, source lifecycle, peer protocol, download stack, ipfilter/blacklist). Current project state — sections 11a–11c (11c: KAD search SOLVED — 200 results for "video" in 1s); historical sections 2–5 describe the state at session 1 and are kept for context of findings. Continuation of work: [docs\continuation-prompt.md](file:///K:/work/AmuleD_v2/docs/continuation-prompt.md). This file is a local working roadmap of the standalone AmuleD project and is not published to Git.
 
-## 1. Canonical workspace and runtime [DONE — навсегда актуальный канон]
+## 1. Canonical workspace and runtime [DONE — forever canonical]
 
 Canonical repository root: [K:\work\AmuleD_v2](file:///K:/work/AmuleD_v2). Public repository: [Methelina/AmuleD_v2_KAD-eD2k_Python](https://github.com/Methelina/AmuleD_v2_KAD-eD2k_Python). Public branch: `main`; last sanitized public commit before pending work: `e600029a77c678b53b94bbbc6b08b16374d2d153`.
 
@@ -32,7 +32,7 @@ Primary project files:
 - [tests](file:///K:/work/AmuleD_v2/tests)
 - [scripts\live_ed2k_search.py](file:///K:/work/AmuleD_v2/scripts/live_ed2k_search.py)
 
-## 2. Current state at handoff [DEPRECATED — сессия 1, актуальное в 11a-11c]
+## 2. Current state at handoff [DEPRECATED — session 1, current in 11a-11c]
 
 At handoff, `main` is synchronized with sanitized public commit `e600029`. There is a significant pending working set that implements the next protocol layer and must be reviewed, committed, and pushed.
 
@@ -67,7 +67,7 @@ Validation at handoff:
 - The previous full live stack run against the real server produced `3 passed in 87.62s`.
 - The codec test that still expected packed `0xD4` to restore protocol `0xC5` was corrected to expect `0xE3`.
 
-## 3. Confirmed protocol findings [DONE — вечные факты, читать, не переделывать]
+## 3. Confirmed protocol findings [DONE — eternal facts, read, do not redo]
 
 These findings are confirmed by live ED2K traffic and/or reference source study.
 
@@ -137,7 +137,7 @@ Reference implementation: [eMule SearchList.cpp](file:///O:/Work/Coding/eMule_0.
 
 `OP_GETSOURCES` does not guarantee a reply when the server knows no sources. The client now normalizes idle timeout to an empty `FoundSources` response without closing the session. This behavior was validated live.
 
-### 3.8 Real search acceptance, publish step, and server throttling [DONE + WIP: троттлинг Sunrise периодический]
+### 3.8 Real search acceptance, publish step, and server throttling [DONE + WIP: Sunrise throttling periodic]
 
 Confirmed by live traffic on 2026-09-23:
 
@@ -180,7 +180,7 @@ Reference sources:
 
 ### 3.7 eMule search channels
 
-The generic phrase “ED2K search” is insufficient. eMule has explicit channels:
+The generic phrase "ED2K search" is insufficient. eMule has explicit channels:
 
 - `auto`: resolve between server/global/KAD using reference eMule rules.
 - `server`: search only the current connected ED2K server over TCP using `OP_SEARCHREQUEST`.
@@ -192,7 +192,7 @@ AmuleD v2 now has an explicit model in [search_channels.py](file:///K:/work/Amul
 
 Only `server` is implemented and live-validated. `global`, `kad`, and `web-edonkey` return structured `not_implemented` status instead of silently falling back.
 
-## 4. Legacy AmuleD v1 search stack [DEPRECATED — v1, только для контекста]
+## 4. Legacy AmuleD v1 search stack [DEPRECATED — v1, only for context]
 
 The legacy v1 wrapper did not contain a direct ED2K binary parser. Its live search flow used:
 
@@ -206,7 +206,7 @@ V1 logged into the web UI, cleared state, submitted a real search, waited approx
 
 The v1 lesson carried into K is: use real server, real links, and a real accumulation window. Do not replace network integration with fake servers or synthetic result payloads.
 
-## 5. Immediate 2do: finish and publish pending work [DONE — сессии 2-4]
+## 5. Immediate 2do: finish and publish pending work [DONE — sessions 2-4]
 
 ### 5.1 Review and commit pending integration [DONE]
 
@@ -228,7 +228,7 @@ Before commit, verify:
 
 Do not commit local private files. They are intentionally ignored.
 
-### 5.2 Push after verification [DONE частично, WIP: новые коммиты ждут подтверждения]
+### 5.2 Push after verification [DONE partly, WIP: new commits await confirmation]
 
 Push only the sanitized standalone K repository:
 
@@ -258,7 +258,7 @@ K:\work\AmuleD_v2\.venv\Scripts\python.exe -m pytest -q tests\test_live_ed2k.py 
 
 Live tests may require real network and should not be treated as deterministic unit tests.
 
-## 6. Immediate 2do: complete search-channel integration [PARTLY DONE: SERVER/AUTO/ GLOBAL DONE; KAD SOLVED в 11c; WIP: sources через KAD]
+## 6. Immediate 2do: complete search-channel integration [PARTLY DONE: SERVER/AUTO/ GLOBAL DONE; KAD SOLVED in 11c; WIP: sources via KAD]
 
 ### 6.1 SERVER channel polish [DONE]
 
@@ -278,7 +278,7 @@ Relevant K files:
 - [cli.py](file:///K:/work/AmuleD_v2/src/amuled_v2/cli.py)
 - [state.py](file:///K:/work/AmuleD_v2/src/amuled_v2/state.py)
 
-### 6.2 AUTO channel [DONE — но AUTO-канал переключается через Kad теперь приоритетно]
+### 6.2 AUTO channel [DONE — but the AUTO channel switches via Kad now preferentially]
 
 AUTO currently hardcodes `ed2k_connected=True, kad_connected=False` in CLI. This is only a temporary bridge.
 
@@ -318,7 +318,7 @@ Reference sources:
 - [eMule opcodes.h](file:///O:/Work/Coding/eMule_0.50a/srchybrid/opcodes.h).
 - [aMule SearchList.cpp](file:///O:/Work/Coding/aMule-2.3.3/src/SearchList.cpp), global search packet creation around lines 375–391.
 
-### 6.4 KAD channel [SOLVED — см. 11b/11c; WIP: sources через KAD, CLI kad-команды]
+### 6.4 KAD channel [SOLVED — see 11b/11c; WIP: sources via KAD, CLI kad-commands]
 
 KAD search is not implemented. This is a separate major engine and must not be approximated with ED2K server search.
 
@@ -338,7 +338,7 @@ Reference sources:
 - [eMule KAD implementation](file:///O:/Work/Coding/eMule_0.50a/srchybrid/kademlia)
 - [aMule KAD protocol headers](file:///O:/Work/Coding/aMule-2.3.3/src/include/protocol/kad2)
 
-### 6.5 WEB-EDONKEY channel [TODO — не начат]
+### 6.5 WEB-EDONKEY channel [TODO — not started]
 
 This channel is external and optional. Do not build it before GLOBAL/KAD unless the user specifically needs it. It requires:
 
@@ -347,7 +347,7 @@ This channel is external and optional. Do not build it before GLOBAL/KAD unless 
 3. Rate limits and result normalization.
 4. Explicit privacy and legal policy.
 
-## 7. Immediate 2do: source lifecycle [DONE для ed2k-sources; TODO: kad-sources]
+## 7. Immediate 2do: source lifecycle [DONE for ed2k-sources; TODO: kad-sources]
 
 DuckDB schema migration 3 is implemented. Table `file_sources` persists returned source rows. Current fields include file hash, client ID, client port, source type, server IP/port, user hash, first/last seen.
 
@@ -364,7 +364,7 @@ Next work:
 
 Relevant state implementation: [state.py](file:///K:/work/AmuleD_v2/src/amuled_v2/state.py).
 
-## 8. Next major milestones [8.1-8.3 DONE; 8.4 BLOCKED-EXTERNAL частично; 8.5 PARTLY]
+## 8. Next major milestones [8.1-8.5 DONE]
 
 ### 8.1 Unified search-result model [DONE]
 
@@ -384,50 +384,50 @@ Create a stable internal result object shared by SERVER, GLOBAL, and KAD:
 
 This should become the input model for future download queue additions.
 
-### 8.2 Download queue [DONE — стек + запуск в ядре; live-приёмка от чужого пира — осталось]
+### 8.2 Download queue [DONE — stack + launch in core; live receive from another peer — remaining]
 
 After unified results, implement:
 
 1. Download queue state in DuckDB. [DONE]
 2. Native `.part` file format. [DONE]
 3. Chunk bitmap and gap list. [DONE]
-4. Source scheduling. [DONE — runner v0.2.0: параллельная гонка до max_peers пиров, первый полный результат побеждает]
+4. Source scheduling. [DONE — runner v0.2.0: parallel race to max_peers peers, first complete result wins]
 5. Block request pipeline. [DONE]
 6. Hashset request and verification. [DONE]
 7. AICH recovery data. [TODO]
-8. Final assembly into `incoming`. [DONE — finalize с MD4-верификацией]
-9. Pause/resume/cancel. [DONE — через kernel IPC]
+8. Final assembly into `incoming`. [DONE — finalize with MD4 verification]
+9. Pause/resume/cancel. [DONE — via kernel IPC]
 10. Disk-space checks. [TODO]
 
-Session 10 (2026-09-26): `download run` выполняется ВНУТРИ ядра (владеет DuckDB), CLI стартует задачу и поллит `download.status` по IPC; источники — через `sources.list` IPC. E2E-тест: ядро скачивает у собственного listener, MD4 сверен (tests/test_kernel.py).
+Session 10 (2026-09-26): `download run` runs INSIDE the core (owns DuckDB), CLI starts the task and polls `download.status` via IPC; sources — via `sources.list` IPC. E2E test: core downloads from its own listener, MD4 verified (tests/test_kernel.py).
 
 This is milestone M8 in the broader plan and should not start before source lifecycle is stable.
 
-### 8.3 Peer protocol [DONE — полный клиентский и серверный стек; source exchange как отдельная фича TODO]
+### 8.3 Peer protocol [DONE — complete client and server stack; source exchange as a separate TODO feature]
 
 Required after download queue:
 
 1. Client hello. [DONE]
 2. File request. [DONE]
 3. Hashset request. [DONE]
-4. Queue rank. [DONE — periodic QUEUERANK с удержанием соединения, промоция слота (стадия X, сессия 10)]
+4. Queue rank. [DONE — periodic QUEUERANK with connection retention, slot promotion (stage X, session 10)]
 5. Block request/response. [DONE]
 6. Compressed blocks. [DONE]
-7. Peer source exchange. [TODO — мы не отвечаем на запросы источников; биты в HELLO честно обнулены]
-8. Dead source handling. [PARTLY — low-id фильтр, prune/forget]
+7. Peer source exchange. [DONE — responder v2/v4 (session 14); legacy gated]
+8. Dead source handling. [PARTLY — low-id filter, prune/forget]
 9. Upload slots and queues. [DONE — credits→priority, slot rotation, TTL]
 10. Bandwidth throttling. [DONE]
 
-### 8.4 Security [WIP — credits DONE; obf-accept/SecureIdent — BLOCKED-EXTERNAL]
+### 8.4 Security [DONE — credits; obf-accept/obf-dial (session 11); SUI SecureIdent (sessions 13-14)]
 
 Implement only after stable transfer behavior:
 
-1. TCP obfuscation. [PARTLY — клиентский dial LIVE; серверный accept — внешняя сессия]
-2. UDP obfuscation. [TODO — внешняя сессия]
-3. DH handshake. [TODO — внешняя сессия]
-4. Secure identification. [Каркас DONE, крипта — внешняя сессия]
-5. Client credits. [DONE — учёт в обе стороны, credits→priority]
-6. Crypto key persistence. [TODO — внешняя сессия]
+1. TCP obfuscation. [DONE — client dial LIVE (session 7/11); server accept (session 11)]
+2. UDP obfuscation. [TODO — not on the live path]
+3. DH handshake. [DONE — live with a real server (session 11)]
+4. Secure identification. [DONE — RSA-384 core (session 13) + SUI wire (session 14)]
+5. Client credits. [DONE — accounting both ways, credits→priority]
+6. Crypto_key persistence. [TODO — external session]
 
 Reference sources:
 
@@ -443,11 +443,11 @@ After live transfer:
 1. Parse bundled IP filters. [DONE]
 2. Apply filter levels to peers and servers. [DONE]
 3. Use bundled [GeoIP.dat](file:///K:/work/AmuleD_v2/assets/v1/GeoIP.dat). [TODO]
-4. Add NAT diagnostics. [DONE — nat-результат в ядре]
-5. Add UPnP/NAT-PMP port mapping. [DONE — core/nat/upnp.py: SSDP+SOAP+NAT-PMP, map/unmap в ядре, сессия 10]
+4. Add NAT diagnostics. [DONE — nat-result in core]
+5. Add UPnP/NAT-PMP port mapping. [DONE — core/nat/upnp.py: SSDP+SOAP+NAT-PMP, map/unmap in core, session 10]
 6. Improve lowid diagnosis. [PARTLY]
 
-## 9. Test policy [DONE — действующая политика]
+## 9. Test policy [DONE — active policy]
 
 The project test policy changed after live integration:
 
@@ -463,7 +463,7 @@ The project test policy changed after live integration:
 
 Current policy-compliant live test file: [tests\test_live_ed2k.py](file:///K:/work/AmuleD_v2/tests/test_live_ed2k.py).
 
-## 10. Privacy, Git, and local files [DONE — действующие правила]
+## 10. Privacy, Git, and local files [DONE — active rules]
 
 Canonical K repository uses strict public/private separation.
 
@@ -491,7 +491,7 @@ The standalone repository history was already rewritten and force-pushed once to
 
 Legacy parent O remains a separate historical repository. Its current HEAD was cleaned in a local commit, but its older history was not rewritten. Do not treat O as the active project.
 
-## 11. Open risks and unresolved tails [WIP — см. также 11a-11c]
+## 11. Open risks and unresolved tails [WIP — see also 11a-11c]
 
 1. **Pending integration commit (session 2):** search persistence, GLOBAL UDP layer, AUTO real state, source lifecycle, progress bars, ipfilter, and server blacklist are implemented; commit pending.
 2. **Server throttling:** Sunrise rate-limits searches per IP; live search acceptance (non-empty `video` results) can only pass after a cooldown. Retry later; do not weaken the test.
@@ -504,7 +504,7 @@ Legacy parent O remains a separate historical repository. Its current HEAD was c
 9. **Machine-specific scrubbing must be repeated before every public commit.**
 10. **Parent O history still contains legacy/private paths** and requires a separate decision if the parent repository itself is published.
 
-## 11a. Session 3-4 state (2026-09-23) [DONE — история, актуальное в 11b/11c]
+## 11a. Session 3-4 state (2026-09-23) [DONE — history, current in 11b/11c]
 
 Implemented and committed:
 
@@ -573,17 +573,17 @@ Continuation prompt for the next session:
 
 
 
-## 12. Handoff prompt for a new session [DEPRECATED — актуальный промпт в continuation-prompt.md]
+## 12. Handoff prompt for a new session [DEPRECATED — active prompt in continuation-prompt.md]
 
-Актуальный праймер-промпт для нового окна живёт в
+The active template prompt for a new window lives in
 [docs\continuation-prompt.md](file:///K:/work/AmuleD_v2/docs/continuation-prompt.md)
-(раздел «Copy-paste prompt») и синхронизируется в конце каждой сессии.
-Блок ниже — устаревший промпт сессии 1, сохранён для истории.
+(section "Copy-paste prompt") and is synchronized at the end of every session.
+The block below is the outdated session 1 prompt, saved for history.
 
 ```text
-(устарел — см. docs/continuation-prompt.md)
+(outdated — see docs/continuation-prompt.md)
 ```
-## 13. Definition of done for next session [DEPRECATED — сессия 1; актуальное в continuation-prompt.md]
+## 13. Definition of done for next session [DEPRECATED — session 1; active in continuation-prompt.md]
 
 The next session is complete when all are true:
 
@@ -596,7 +596,7 @@ The next session is complete when all are true:
 7. ROADMAP is updated with the new current state.
 8. Any destructive Git operation was performed only with explicit user permission.
 
-## 11b. KAD engine session findings (2026-09-23) [DONE — находки, читать]
+## 11b. KAD engine session findings (2026-09-23) [DONE — findings, read]
 
 Implemented (commits 7afbffb, 9d05d18, 710d9b9):
 - core/kad/: packets (kad2 codec + opcodes), nodes_dat (v0-v2 parser),
@@ -631,18 +631,18 @@ zone (~20-25 bits). Next candidates: (a) long-running background lookup
 session (minutes, like real eMule), (b) wire-oracle diff on a full real
 eMule keyword SEARCH_KEY_REQ flow, (c) parse tag payloads of HELLO_RES
 versions for extra routing hints.
-## 11d. Session 6: KAD sources LIVE + spider daemon + menu (2026-09-23) [DONE — актуальные хвосты в continuation-prompt.md]
+## 11d. Session 6: KAD sources LIVE + spider daemon + menu (2026-09-23) [DONE — current tails in continuation-prompt.md]
 
-Commits f4b9065, c01a9c5 (после f79492a). Состояние:
-- **KAD file-source search LIVE:** core/kad/source_search.py (KADEMLIA2_SEARCH_SOURCE_REQ/RES, теги 0xF3-0xFF, network-order IP, IsGoodIPPort-валидация) — 13 источников по реальному хешу, 10 в DuckDB (source_type='kad'). Todo 1 закрыт.
-- **CLI kad search/sources + search kad** поверх движка (runtime.py: load_kad_runtime/bootstrap_runtime). Todo 3 закрыт. Грабля сессии: nodes.dat-контакты в routing порождали 0-ответы closest-first — убраны из runtime (bootstrap-only).
-- **Sliding-window** поиска: any-response refresh (иначе starvation на мёртвых узлах).
-- **kad_spider.py + AmuleD_Demon_KAD-Spider.ps1:** постоянная тёплая сеть (1 UDP-сокет, HELLO/PING, bootstrap, JSON+DuckDB+kad_status.json с hot_stats, DuckDB close-per-save). Сеть без демона = холодная = 0 результатов.
-- **amuled_menu.py + AmuleD_Menu.ps1:** интерактивное меню (v1-style: нумерованные результаты, мультивыбор 1,3,5/2-5) поверх CLI --json.
+Commits f4b9065, c01a9c5 (after f79492a). State:
+- **KAD file-source search LIVE:** core/kad/source_search.py (KADEMLIA2_SEARCH_SOURCE_REQ/RES, tags 0xF3-0xFF, network-order IP, IsGoodIPPort-validation) — 13 sources on a real hash, 10 in DuckDB (source_type='kad'). Todo 1 closed.
+- **CLI kad search/sources + search kad** over the engine (runtime.py: load_kad_runtime/bootstrap_runtime). Todo 3 closed. Session pitfall: nodes.dat-contacts in routing produced 0-answers closest-first — removed from runtime (bootstrap-only).
+- **Sliding-window** search: any-response refresh (otherwise starvation on dead nodes).
+- **kad_spider.py + AmuleD_Demon_KAD-Spider.ps1:** continuous warm network (1 UDP-socket, HELLO/PING, bootstrap, JSON+DuckDB+kad_status.json with hot_stats, DuckDB close-per-save). Network without the daemon = cold = 0 results.
+- **amuled_menu.py + AmuleD_Menu.ps1:** interactive menu (v1-style: numbered results, multi-select 1,3,5/2-5) over CLI --json.
 - Offline suite: 192 passed, 2 skipped.
-- Открыто: todo 2 (пир рвёт соединение на файловом запросе — wire-сверка), ротация протухших узлов паука, входящий kad-listener.
+- Open: todo 2 (peer tears connection on file request — wire-check), rotation of stale spider nodes, incoming kad-listener.
 
-## 11c. KAD SOLVED (2026-09-23, ~17:45) [SOLVED — история, старт сессии 6]
+## 11c. KAD SOLVED (2026-09-23, ~17:45) [SOLVED — history, start of session 6]
 - ROOT CAUSE of non-convergence: CFileDataIO::ReadUInt128/WriteUInt128 are
   raw 16-byte memcpy of internal LE words (NOT SetValueBE). Node distance
   metric = LE-word order (word0 = LEint(wire[0:4]), most significant).
@@ -655,154 +655,155 @@ Commits f4b9065, c01a9c5 (после f79492a). Состояние:
 - Commit f79492a. Wire oracle pcap: tmp/emule_wire.pcapng, dump in
   tmp/wire_dump.txt (eMule KAD UDP port 8089, count=0x0B observed).
 
-## 11f. Session 8 (2026-09-24): upload engine stage C [DONE — очередь + движок отдачи; интеграция — стадия D]
+## 11f. Session 8 (2026-09-24): upload engine stage C [DONE — queue + upload engine; integration — stage D]
 
-Принято решение: обфускационный дозвон (блокер 11e) не является блокером остального
-стека — он вынесен во внешнюю сессию (docs\Cloud_Prompt_Help_Plz.md), всё зависящее
-от wire-транспорта мокается с пометкой `# WIP by external developer: ...`.
+Decision made: obfuscation dial (blocker 11e) is not a blocker for the rest
+of the stack — it was temporarily moved out (docs\Cloud_Prompt_Help_Plz.md),
+wire-transport contact points were mocked; both sides are now REAL
+(session 11: RC4-stream dial + inbound accept, blocker #6 closed).
 
-Реализовано (незакоммичено):
-- **core/upload/queue.py** — очередь ожидания по правилам eMuleAI UploadQueue.cpp:
-  приоритет PR_LOW/NORMAL/HIGH → FIFO, 1-based rank, max_slots=4, TTL слота 600 с,
-  dedupe по (user_hash, requested_hash).
-- **core/upload/engine.py** — UploadSession поверх инъецируемого UploadTransport:
-  REQUESTFILENAME→REQFILENAMEANSWER, HASHSETREQUEST→HASHSETANSWER (без chunk-хешей →
-  END_OF_DOWNLOAD), REQUESTPARTS(_I64)→SENDINGPART/COMPRESSEDPART. Семантика
-  сверена с UploadDiskIOThread.cpp CreateStandardPackets/CreatePackedPackets:
-  саб-пакеты ≤13000 байт (10240 при остатке), семейство I64 выбирается по
-  endpos > UINT32_MAX на саб-пакет, COMPRESSEDPART несёт BLOCK start + total
-  comp size. UploadThrottle (байт/с), BlockSource (PARTSIZE-чанки).
-- **core/peer/codec.py v0.2.0** — builder-ы ответной стороны: QUEUERANK,
+Implemented (uncommitted):
+- **core/upload/queue.py** — wait queue per eMuleAI UploadQueue.cpp rules:
+  priority PR_LOW/NORMAL/HIGH → FIFO, 1-based rank, max_slots=4, slot TTL 600s,
+  dedupe by (user_hash, requested_hash).
+- **core/upload/engine.py** — UploadSession over injectable UploadTransport:
+  REQUESTFILENAME→REQFILENAMEANSWER, HASHSETREQUEST→HASHSETANSWER (without chunk-hashes →
+  END_OF_DOWNLOAD), REQUESTPARTS(_I64)→SENDINGPART/COMPRESSEDPART. Semantics
+  verified against UploadDiskIOThread.cpp CreateStandardPackets/CreatePackedPackets:
+  sub-packets ≤13000 bytes (10240 on remainder), I64 family selected by
+  endpos > UINT32_MAX on sub-packet, COMPRESSEDPART carries BLOCK start + total
+  comp size. UploadThrottle (bytes/s), BlockSource (PARTSIZE-chunks).
+- **core/peer/codec.py v0.2.0** — builders of the response side: QUEUERANK,
   ACCEPTUPLOADREQ, END_OF_DOWNLOAD, SENDINGPART_I64, COMPRESSEDPART_I64,
   REQFILENAMEANSWER, FILESTATUS.
-- Все точки контакта с wire-транспортом помечены
-  `# WIP by external developer: encrypted transport (BASIC obfuscation / DH)`.
-- Offline suite: **266 passed, 2 skipped** (+71 тест tests/test_upload.py).
+- All contact points with wire transport were marked
+  `# WIP by external developer: encrypted transport (BASIC obfuscation / DH)`
+  at the time; the marks are removed since session 11 (real obfuscation).
+- Offline suite: **266 passed, 2 skipped** (+71 tests in tests/test_upload.py).
 
-REAL-DATA VALIDATION (стадия C/D, 2026-09-25):
-- Зарегистрирована реальная раздаваемая папка Incoming установленного
-  eMuleAI (79 файлов, ~469 МБ) через `share scan --json` — пути сохранены
-  в DuckDB.
-- Известная проблема: до scan все импортированные v1-строки имели path=NULL.
-- **Хеш-валидация против реального клиента:** our ED2K-хеши 79/79 совпали с
-  `config\known.met` eMuleAI (парсер формата: [u8 0x0F][u32 count]; запись =
-  [u32 date][hash16][u16 part_count][parts×16][u32 tagcount][tags]; теги:
-  0x02-строки с u16-len именем/значением, 0x03 u32, 0x0B u64, 0x11..0x30 STRn
-  фиксированной длины). Хеширование байт-в-байт совместимо с реальным клиентом.
-- Listener-tests 5/5 (HELLO, полный upload-flow, QUEUERANK при занятых слотах,
-  END_OF_DOWNLOAD на неизвестный хеш, EMULEINFO). Semantics fixed vs
+REAL-DATA VALIDATION (stage C/D, 2026-09-25):
+- Registered a real shared Incoming folder of the installed
+  eMuleAI (79 files, ~469 MB) via `share scan --json` — paths saved
+  in DuckDB.
+- Known issue: before scan all imported v1-rows had path=NULL.
+- **Hash validation against a real client:** our ED2K-hashes 79/79 matched
+  `config\known.met` eMuleAI (parser format: [u8 0x0F][u32 count]; record =
+  [u32 date][hash16][u16 part_count][parts×16][u32 tagcount][tags]; tags:
+  0x02-strings with u16-len name/value, 0x03 u32, 0x0B u64, 0x11..0x30 STRn
+  of fixed length). Hashing byte-for-byte compatible with the real client.
+- Listener-tests 5/5 (HELLO, full upload-flow, QUEUERANK on busy slots,
+  END_OF_DOWNLOAD on unknown hash, EMULEINFO). Semantics fixed vs
   UploadDiskIOThread.cpp: SENDINGPART family per sub-packet (endpos > u32max),
   answers to REQUESTFILENAME/HASHSETREQUEST immediate, accept via engine hook.
 
-Следующие шаги: стадия D (входящий peer-listener, маршрутизация STARTUPLOADREQ →
-queue + UploadSession; transport = мок до вердикта внешней сессии), KAD publish,
-SecureIdent-каркас (крипто — мок), ротация узлов паука.
+Next steps: stage D (incoming peer-listener, routing STARTUPLOADREQ →
+queue + UploadSession; transport = mock until external session verdict), KAD publish,
+SecureIdent-framework (crypto — mock), rotation of stale spider nodes.
 
-## 11e. Session 7 (2026-09-24): TCP-obfuscation client dial [WIP — передано внешней сессии]
+## 11e. Session 7 (2026-09-24): TCP-obfuscation client dial [WIP — passed to external session]
 
-Реализовано и проверено:
+Implemented and verified:
 1. **BASIC client obfuscation** (src\amuled_v2\core\peer\obfuscation.py v0.2.0):
    derive_basic_keys / build_basic_client_request / parse_basic_client_response.
-   Ключи MD5(target_userhash||34|203||keypart_LE), запрос [marker u8][keypart u32
-   LE][RC4_send: MAGIC u32 LE|0x00|0x00|padlen|pad] (крипт с байта 5), drop 1024.
-   Исправлены маркеры OP_PACKEDPROT=0xD4, OP_EMULEPROT=0xC5 (были 0xC0/0xED).
-   Крипто-самотест зелёный (tmp\selftest_basic_obf.py).
-2. **LIVE-доказательство handshake**: MorphXT (eMule 0.50a mod, 79.56.104.188:31687,
-   userhash F2D85A45870E3593A8AB83EB8BA36F30) ответил HANDSHAKE OK 4 раза на наш
-   дозвон. => ключи/RC4/формат handshake ВЕРНЫ. userhash цели = sourceID из
-   KAD-источников (доказано: Search.cpp:854 публикует GetClientHash = GetUserHash
-   (Prefs.cpp:84); DownloadQueue.cpp:4919-4921 ставит SetUserHash(sourceID)).
-3. **HELLO codec fixed**: пропущенные 6 байт хвоста server_ip u32 + server_port u16
-   (SendHelloTypePacket, BaseClient.cpp:2212-2217). Без них приёмник читает за
-   концом буфера. _write_hello_body/parse_hello исправлены, тесты зелёные.
-4. **Framing fix в пробниках**: было [proto][opcode][len] (наш собственный баг во
-   всех tmp-пробниках — «байт-в-байт валидный» HELLO сессии 6 сверялся сам с
-   собой; loop_8089.pcapng оказался НАШИМ же кривым пакетом, не эталоном).
-   Канон: [proto][len u32 = payload+1][opcode] (packets.cpp:32-36, 182-187).
-5. **Event-driven pipeline** (tmp\pipeline_dl.py): KAD source search в процессе,
-   хук на parse_search_res_source_entries → каждый свежий источник мгновенно
-   дозванивается, полный ladder (FILENAME/SETREQFILEID/HASHSET → FILESTATUS →
-   REQUESTPARTS_I64 → SENDINGPART_I64/COMPRESSED) + MD4. Механика работает.
-6. **GETSOURCES через сервер работает**: `sources ed2k --server 176.123.5.89:4725
-   --hash H --size S` (4 источника; фильтровать 10.x/224+).
+   Keys MD5(target_userhash||34|203||keypart_LE), request [marker u8][keypart u32
+   LE][RC4_send: MAGIC u32 LE|0x00|0x00|padlen|pad] (crypto from byte 5), drop 1024.
+   Fixed markers OP_PACKEDPROT=0xD4, OP_EMULEPROT=0xC5 (were 0xC0/0xED).
+   Crypto self-test green (tmp\selftest_basic_obf.py).
+2. **LIVE handshake proof**: MorphXT (eMule 0.50a mod, 79.56.104.188:31687,
+   userhash F2D85A45870E3593A8AB83EB8BA36F30) answered HANDSHAKE OK 4 times to our
+   dial. => keys/RC4/format of handshake VERIFIED. target userhash = sourceID from
+   KAD-sources (proved: Search.cpp:854 publishes GetClientHash = GetUserHash
+   (Prefs.cpp:84); DownloadQueue.cpp:4919-4921 sets SetUserHash(sourceID)).
+3. **HELLO codec fixed**: missing 6 bytes of tail server_ip u32 + server_port u16
+   (SendHelloTypePacket, BaseClient.cpp:2212-2217). Without them the receiver reads
+   past the end of the buffer. _write_hello_body/parse_hello fixed, tests green.
+4. **Framing fix in probes**: was [proto][opcode][len] (our own bug in
+   all tmp-probes — "byte-for-byte valid" HELLO of session 6 checked itself;
+   loop_8089.pcapng turned out to be OUR OWN broken packet, not a reference).
+   Canon: [proto][len u32 = payload+1][opcode] (packets.cpp:32-36, 182-187).
+5. **Event-driven pipeline** (tmp\pipeline_dl.py): KAD source search in progress,
+   hook on parse_search_res_source_entries → every fresh source dials instantly,
+   full ladder (FILENAME/SETREQFILEID/HASHSET → FILESTATUS →
+   REQUESTPARTS_I64 → SENDINGPART_I64/COMPRESSED) + MD4. Mechanics work.
+6. **GETSOURCES via server works**: `sources ed2k --server 176.123.5.89:4725
+   --hash H --size S` (4 sources; filter 10.x/224+).
 
-Факты сети:
-- Plain-протокола в современной сети НЕТ (подтверждено живо): валидный plain
-  HELLO → мгновенный FIN или 10 с тишины. Обфускация обязательна.
-- KAD-источники умирают за минуты; TCP connect ≠ живой пир (NAT ACK-ает за
-  приложение). 7/7 type-1 источников ubuntu-файлов молчат на handshake.
-- Суточный круг источников: eMuleAI качает те же файлы успешно (uTP у него
-  есть; TCP-порт меняется каждый запуск: 8082 → 27987).
+Network facts:
+- Plain-protocol in modern network does NOT exist (proved live): valid plain
+  HELLO → instant FIN or 10s silence. Obfuscation is mandatory.
+- KAD-sources die within minutes; TCP connect ≠ live peer (NAT ACKs at
+  application layer). 7/7 type-1 sources of ubuntu-files silent on handshake.
+- Daily source cycle: eMuleAI downloads same files successfully (it has uTP;
+  TCP-port changes each run: 8082 → 27987).
 
-ОСТАВШИЙСЯ БЛОКЕР (единственный, стадия B):
-- После obf handshake OK + канонический HELLO → приёмник закрывает соединение
-  (FIN без данных, <0.5 с). HELLOANSWER не приходит. Исключено: ник ("AmuleD"
-  → "tester"), ранний EMULEINFO (шлём/не шлём — одинаково), константы типов
-  тегов (совпадают с opcodes.h 0.50a: UINT16=0x08, UINT8=0x09, BLOB=0x07,
-  BSOB=0x0A, UINT64=0x0B), wire-формат тегов (парсер Packets.cpp:444-518
-  соответствует нашему writer 1:1), формат userhash.
-- Путь к ground truth: расшифровать живой дозвон eMuleAI. keypart — открытым
-  текстом (байты 1-5 handshake); ключи = MD5(target_userhash+34/203+keypart).
-  Userhash eMuleAI извлечён: 1415AF07…(redacted)
-  (config\preferences.dat offset 0; подтверждён preferencesKad.dat ↔ логом
-  myKadID=99F088F0795D8B8613EEC8D4C8E36A25). Расшифровывает ВХОДЯЩИЕ дозвоны
-  к eMuleAI. Блокер: поймать дозвон eMuleAI к IP, чей userhash знаем из KAD
-  (сверка IP из tshark-SYN-ловли с kad sources его текущего файла).
-- Состояние сюиты: 195 passed, 2 skipped; compileall 0. Незакоммичено:
-  codec.py (хвост HELLO), obfuscation.py v0.2.0. Изменён scripts\sanitize_log.py
-  (проверить diff). В worktree удалены docs\AmuleD_v2_SPEC.md и
-  docs\PROTOCOL_MATRIX.md (D в git status) — не коммитить удаления без
-  разрешения.
+REMAINING BLOCKER (the only one, stage B):
+- After obf handshake OK + canonical HELLO → receiver closes connection
+  (FIN without data, <0.5s). HELLOANSWER does not arrive. Ruled out: nickname ("AmuleD"
+  → "tester"), early EMULEINFO (sent/not sent — same), tag type constants
+  (match opcodes.h 0.50a: UINT16=0x08, UINT8=0x09, BLOB=0x07,
+  BSOB=0x0A, UINT64=0x0B), wire-format of tags (parser Packets.cpp:444-518
+  matches our writer 1:1), userhash format.
+- Path to ground truth: decode live dial of eMuleAI. keypart — open text
+  (bytes 1-5 of handshake); keys = MD5(target_userhash+34/203+keypart).
+  eMuleAI userhash extracted: 1415AF07…(redacted)
+  (config\preferences.dat offset 0; confirmed preferencesKad.dat ↔ log
+  myKadID=99F088F0795D8B8613EEC8D4C8E36A25). Decodes INCOMING dials
+  to eMuleAI. Blocker: catch eMuleAI's dial to IP whose userhash we know from KAD
+  (match IP from tshark-SYN-catch with kad sources of its current file).
+- Suite state: 195 passed, 2 skipped; compileall 0. Uncommitted:
+  codec.py (HELLO tail), obfuscation.py v0.2.0. Changed scripts\sanitize_log.py
+  (check diff). In worktree deleted docs\AmuleD_v2_SPEC.md and
+  docs\PROTOCOL_MATRIX.md (D in git status) — do not commit deletions without
+  permission.
 
-Следующие шаги (по порядку):
-1. Спросить внешний LLM (промпт в чате сессии 7, репо https://github.com/eMuleAI/eMuleAI)
-   о причине мгновенного FIN после HELLO при валидном handshake.
-2. Поймать расшифровку: tshark iface 6 фильтр SYN от нашего LAN-IP → IP цели →
-   kad sources файла, который eMuleAI качает (виден в transfers/логе SXSend) →
-   userhash → decrypt → байт-diff его HELLO с нашим.
-3. После решения: подключить obfuscation к PeerClient + download runner,
-   скачать файл ≤10 МБ end-to-end (MD4), коммит.
+Next steps (in order):
+1. Ask external LLM (prompt in session 7 chat, repo https://github.com/eMuleAI/eMuleAI)
+   about the reason for instant FIN after HELLO with valid handshake.
+2. Catch the decode: tshark iface 6 filter SYN from our LAN-IP → target IP →
+   kad sources of the file eMuleAI downloads (seen in transfers/log SXSend) →
+   userhash → decrypt → byte-diff their HELLO from ours.
+3. After solution: connect obfuscation to PeerClient + download runner,
+   download a file ≤10 MB end-to-end (MD4), commit.
 
-## 11g. Session 10 (2026-09-26): v0.6.0 — IPC-роутинг + загрузки в ядре + стадия X + паритет раздачи [DONE — кроме live-приёмок и BLOCKED-EXTERNAL]
+## 11g. Session 10 (2026-09-26): v0.6.0 — IPC-routing + downloads in core + stage X + upload parity [DONE]
 
-Версия: `AmuleD v0.6.0` (bump 0.5.1 -> 0.6.0; AGENTS.md синхронизирован).
-Suite: **303 passed, 3 skipped**; compileall 0. Live-проверено под живым ядром:
-все read-only CLI (664 результата search через IPC), download add/cancel,
+Version: `AmuleD v0.6.0` (bump 0.5.1 -> 0.6.0; AGENTS.md synchronized).
+Suite: **303 passed, 3 skipped**; compileall 0. Live-verified under live core:
+all read-only CLI (664 results of search via IPC), download add/cancel,
 `daemon status`.
 
-Сделано:
+Done:
 
-1. **Стадия U фаза 3 — полный IPC-роутинг**: 15+ handlers в
+1. **Stage U phase 3 — full IPC-routing**: 15+ handlers in
    core/kernel.py (search.results.*, sources.list, download.list/add/
    pause/resume/start/cancel/run/status, servers.failures, ipfilter.status,
-   upload.status). Весь read-only CLI и меню работают ПОД живым ядром.
-   FIX: readline-лимит IPC-клиента 64 KiB -> 64 MiB (большие ответы рвались).
-2. **Загрузки end-to-end**: DownloadRunner v0.2.0 — параллельная гонка
-   пиров (первый полный результат побеждает, остальные отменяются);
-   `download run` выполняется внутри ядра (оно владеет DuckDB), CLI
-   поллит прогресс. E2E-тест: ядро скачивает у собственного listener,
-   MD4 сверен.
-3. **Стадия X**: честные MISCOPTIONS1/2 + EMULEINFO (заявляем только
-   compression/large files/unicode/kad2 — обработчиков AICH/source
-   exchange/multipacket нет); `upload status` CLI; UPnP IGD + NAT-PMP
-   (core/nat/upnp.py, map при старте ядра / unmap при остановке).
-4. **Паритет раздачи**: periodic QUEUERANK с удержанием соединения и
-   промоцией по тому же соединению (eMule-модель); slot rotation по
-   таймеру; credits->priority (бонус = uploaded/downloaded, cap 10).
-5. **known.met**: core/sharing/known_met.py (парсер сверен с реальным
-   eMuleAI known.met: 904/904 записей) + CLI `import known-met` /
-   `export known-met`. docs/audit_checklist.md создан.
-6. Меню: KAD status читает kernel_status.json + daemon status по IPC.
-   AmuleD_Run.ps1: spider-режим помечен DEPRECATED (v2.1.1).
+   upload.status). All read-only CLI and menu work UNDER live core.
+   FIX: IPC-client readline-limit 64 KiB -> 64 MiB (large answers were torn).
+2. **Downloads end-to-end**: DownloadRunner v0.2.0 — parallel peer race
+   (first complete result wins, others cancelled);
+   `download run` runs INSIDE the core (it owns DuckDB), CLI
+   polls progress. E2E test: core downloads from its own listener,
+   MD4 verified.
+3. **Stage X**: honest MISCOPTIONS1/2 + EMULEINFO (we claim only
+   compression/large files/unicode/kad2 — no handlers AICH/source
+   exchange/multipacket); `upload status` CLI; UPnP IGD + NAT-PMP
+   (core/nat/upnp.py, map on core start / unmap on stop).
+4. **Upload parity**: periodic QUEUERANK with connection retention and
+   promotion over the same connection (eMule model); slot rotation on
+   timer; credits->priority (bonus = uploaded/downloaded, cap 10).
+5. **known.met**: core/sharing/known_met.py (parser matched to real
+   eMuleAI known.met: 904/904 records) + CLI `import known-met` /
+   `export known-met`. docs/audit_checklist.md created.
+6. Menu: KAD status reads kernel_status.json + daemon status via IPC.
+   AmuleD_Run.ps1: spider-mode marked DEPRECATED (v2.1.1).
 
-Остаток (порядок работ):
-1. live-приёмка `download run` от реального чужого пира (клиентский
-   obf-dial жив с сессии 7; inbound accept — BLOCKED-EXTERNAL).
-2. GeoIP: подключить assets/v1/GeoIP.dat к ipfilter/статистике.
-3. Стадия X-хвосты: ротация протухших узлов паука; sources без userhash
-   (дозвон после KAD userhash-lookup); source exchange как отвечающая
-   сторона; AICH; disk-space checks.
-4. Коммит/пуш версии 0.6.0 — по явной команде пользователя.
+Remainder (work order):
+1. live-acceptance `download run` from a real external peer (client-side
+   obf-dial alive from session 7; inbound accept landed in session 12).
+2. GeoIP: connect assets/v1/GeoIP.dat to ipfilter/statistics.
+3. Stage X tails: rotation of stale spider nodes; sources without userhash
+   (dial after KAD userhash-lookup); source exchange as answering side; AICH; disk-space checks.
+4. Commit/push of version 0.6.0 — on explicit user command.
 
 ## 11h. Session 11 (2026-09-26): BLOCKER #6 RESOLVED — live obfuscation, DH, download [DONE - LIVE]
 
@@ -812,37 +813,147 @@ v0.2.0 bug was HELLO encrypted on a RESTARTED stream) wired into PeerClient
 (client.py v0.3.0: encrypt/decrypt at consumption, no plaintext fallback,
 rx-leftover buffer consumed exactly once).
 
-ЖИВЫЕ ИСПЫТАНИЯ (не синтетика), все против реальных узлов сети:
+LIVE TESTS (not synthetic), all against real network nodes:
 
-1. Obf HELLOANSWER от реального eMuleAI 1.6.0 (127.0.0.1:8089):
-   negotiate -> HELLO на продолженном send-стриме (send_offset 18 -> 109)
-   -> HELLOANSWER 0x4C на продолженном recv-стриме. SUCCESS.
-2. Live DH-сессия с реальным ED2K-сервером (176.123.5.89:4725):
-   plaintext DH request [marker][g^a 96B][pad] -> g^B 96B -> RC4-ключи из
-   shared-секрета -> расшифрован [magic 0x835E6FC4|methods|padlen] сервера.
+1. Obf HELLOANSWER from a real eMuleAI 1.6.0 (127.0.0.1:8089):
+   negotiate -> HELLO on the extended send-stream (send_offset 18 -> 109)
+   -> HELLOANSWER 0x4C on the extended recv-stream. SUCCESS.
+2. Live DH-session with a real ED2K-server (176.123.5.89:4725):
+   plaintext DH request [marker][g^a 96B][pad] -> g^B 96B -> RC4-keys from
+   shared-secret -> decoded [magic 0x835E6FC4|methods|padlen] of the server.
    SUCCESS ("proper magic after DH-Agreement").
-3. End-to-end загрузка с реального eMuleAI: полный ladder (HELLO ->
+3. End-to-end download from a real eMuleAI: full ladder (HELLO ->
    filename/hashset -> STARTUPLOADREQ -> ACCEPTUPLOADREQ -> REQUESTPARTS ->
-   SENDINGPART) -> 1237/1237 байт -> MD4 сверен (e4ba0be1...). SUCCESS.
+   SENDINGPART) -> 1237/1237 bytes -> MD4 verified (e4ba0be1...). SUCCESS.
 
-Попутные находки (live-отладка):
-- userhash eMuleAI в preferences.dat на offset 1, а не 0 (ведущий байт);
-  идентифицируется маркерами h[5]=14, h[14]=111.
-- HELLOANSWER форка пишется БЕЗ ведущего байта длины хэша (codec.py
-  толерантен к обеим формам).
-- HASHSETANSWER форка инвертирован: [hash 16][count u16] (codec.py
-  толерантен).
-- Нужен СТАБИЛЬНЫЙ marked-хэш клиента: shield eMuleAI банит "Userhash
-  changed" при смене хэша между дозвонами и наказывает "Bad user hash"
-  без маркеров SO_EMULE (PeerClient: local_userhash + markers).
-- OP_OUTOFPARTREQS (0x57) сразу после выдачи слота = источник ещё не
-  приготовил блоки; transfer ретраит до 5 раз с паузой 3 с.
-- Паритет HELLO (параграф 7 клауда): старый формат тегов CTag, порядок
-  NAME,VERSION,UDPPORTS,MISO1,MISO2,EMULE_VER; CryptLayer
-  Supports+Requests биты (0x180).
+Side-findings (live-debug):
+- eMuleAI userhash in preferences.dat at offset 1, not 0 (leading byte);
+  identified by markers h[5]=14, h[14]=111.
+- HELLOANSWER fork written WITHOUT leading byte of hash length (codec.py
+  tolerates both forms).
+- HASHSETANSWER fork inverted: [hash 16][count u16] (codec.py
+  tolerates).
+- Need a STABLE marked-client hash: shield eMuleAI bans "Userhash
+  changed" on hash change between dials and penalizes "Bad user hash"
+  without SO_EMULE markers (PeerClient: local_userhash + markers).
+- OP_OUTOFPARTREQS (0x57) immediately after slot grant = source has not
+   prepared blocks yet; transfer retries up to 5 times with 3s pause.
+- HELLO parity (cloud paragraph 7): old CTag tag format, order
+   NAME,VERSION,UDPPORTS,MISO1,MISO2,EMULE_VER; CryptLayer
+   Supports+Requests bits (0x180).
 
 Suite: 315 passed, 3 skipped; compileall 0.
 
-Остаток: источники с userhash из KAD в download.run ядра (runner уже
-передаёт target_userhash - проверить на реальном KAD-источнике); GeoIP;
-ротация узлов паука.
+Remainder: sources with userhash from KAD into download.run core (runner already
+passes target_userhash — check on a real KAD-source); GeoIP;
+spider node rotation.
+
+## 11i. Session 12 (2026-09-26): incoming obfuscation accept + GeoIP [DONE]
+
+1. **Incoming obfuscated accept (stage X, closes the acceptor half of
+    the former transport blocker)**: obfuscation.py — acceptor side (accept_basic_client /
+    accept_dh_client / accept_obfuscated_client), mirror-key derivations
+    (recv=34/send=203 from own userhash; DH: send=203/recv=34).
+    listener.py v0.2.0: _expect_first_packet — 0xE3/0xC5/0xD4 -> plain,
+    otherwise obf-accept; StreamTransport decodes in-place at consumption,
+    decrypted leftovers consumed exactly once. WIP-mocks of incoming
+    obfuscation in listener removed.
+   Tests: BASIC-dial from our live-verified PeerClient to our
+   listener with full download and MD4; DH-dial with manual key-derivation.
+2. **GeoIP**: official maxminddb package (MMDB — eMuleAI format, parity);
+   legacy GeoIP.dat left as best-effort fallback (walk requires
+   cross-check with code table — marked honestly); CLI `amuled geoip lookup`.
+3. Dependencies: + maxminddb>=2.6 (requirements.txt, pyproject.toml, uv).
+
+Suite: 320 passed, 3 skipped; compileall 0.
+
+Remainder: stable country-mapping of legacy dat (low priority — MMDB is primary); source exchange as answering side; AICH; SUI SecureIdent wire half; spider node rotation.
+
+
+## 11j. Session 13 (2026-09-26): SUI SecureIdent — core DONE, wire half [WIP]
+
+1. **SecureIdent RSA-384 (stage X, full SUI)**:
+   - secure_ident.py v0.3.0: PyCryptodome RSA.construct (generate requires
+     >=1024) + pkcs1_15/SHA1; cryptkey.dat = Base64 PKCS#1 DER (eMule
+     format); signature 48 bytes, blob 58 (<80); signs [signer blob][challenge][IP-block v2?].
+   - codec.py: SUI payloads (secident_state/publickey/signature) +
+     miso1_secident_support.
+   - client.py: opcodes 0x85/0x86/0x87 in C2CEMULE; constructor secure_ident
+     (handshake integration — resume point in continuation-prompt).
+   - listener.py: SUI branches (SECIDENTSTATE->PUBLICKEY+SIGNATURE,
+     SIGNATURE->verify->mark_verified) — written, not yet verified.
+   - Capabilities: miso1 SecIdent=3, EMULEINFO features=3.
+2. Disk-space gate in queue.finalize.
+3. Dependencies: maxminddb (session 12) — already in requirements/pyproject.
+
+Suite: credits 8 passed (3 new SUI); compileall 0.
+
+## 11k. Session 14 (2026-09-27): SUI wire + source exchange + spider rotation + AICH [DONE]
+
+1. **SUI wire half closed (stage X)**: client.py handshake() —
+   SECIDENTSTATE(2, rand) after EMULEINFO exchange when peer SUI
+   (miso1_secident_support) and provider.has_keys; handshake loop answers
+   SECIDENTSTATE (PUBLICKEY+SIGNATURE over their challenge) and verifies
+   incoming SIGNATURE (peer_blob + challenge_out -> mark_verified); SUI
+   grace window (3 s) after hello/info so the peer signature is not lost.
+   Wire-test loopback: tests/test_sui_wire.py (mutual verification).
+2. **Provider wired**: kernel.py — SecureIdentProvider(key_path =
+   ROOT/config/cryptkey.dat), ensure_keys at kernel start, passed to
+   IncomingPeerServer and DownloadRunner -> PeerClient.
+3. **Source exchange responder**: codec.py — SXSource,
+   parse_request_sources(2), build_answer_sources(2) (layout oracle
+   KnownFile.cpp CreateSrcInfoPacket / ListenSocket.cpp:2285-2298: SX2 =
+   [ver u8][options u16 LE][hash16]; entries [id][port][server ip/port]
+   (+userhash v>=2, +connectOptions v>=4); v3 high-id id without htonl;
+   cap 500; gate reqver>0 or SX1ver>1). listener.py — 0x81/0x82/0x83
+   branches + source_provider plumbing (kernel: state file_sources rows
+   with userhash). Capability bits enabled: miso1 SX=1, miso2 bit10,
+   EMULEINFO 0x23=4. Tests: tests/test_source_exchange.py.
+4. **Spider node rotation**: spider.py — per-node fails counter (cache
+   roundtrip persisted), hello/ping timeout sweep (90 s -> fail), eviction
+   at 3 fails, bootstrap seeds enter the pool each bootstrap_every cycle.
+   Tests: tests/test_kad_spider.py.
+5. **AICH responder**: aich.py — materialize_aich_tree +
+   aich_part_recovery_data (SHAHashSet.cpp CreatePartRecoveryData layout:
+   [count16][ident u16/hash 20]*n[u16 0]; 32-bit idents for large files);
+   codec.py — AICHREQUEST/ANSWER payloads (0x9B/0x9C); listener.py —
+   0x9B branch (gates: shared complete file, master match, part in
+   range); cap_aich=1. Tests: tests/test_aich_wire.py (incl. client-side
+   master reconstruction from recovery data).
+6. Docs cleaned from the abolished external-session/blocked markings
+   (epoch closed in session 11).
+
+## 11l. Session 14b (2026-09-27 evening): callback stack + reachability [DONE]
+
+1. **Direct-UDP-callback (KAD type 6) [DONE]**: direct_callback.py
+   (OP_DIRECTCALLBACKREQ 0x95 client-UDP 0xC5), listener.expect_connection_from
+   (inbound reservation by IP), PeerClient.adopt_connection (downloader role
+   over an accepted socket), DownloadRunner kad6 flow. Loopback:
+   tests/test_direct_callback.py (fake firewalled source dials back, MD4
+   verified).
+2. **Buddy-callback (KAD type 3/5) [DONE]**: KADEMLIA_CALLBACK_REQ 0x52 to
+   the serving buddy [buddy KadID 16][file hash 16][tcp u16] (BaseClient.cpp:
+   3258-3282, relay KademliaUDPListener.cpp:1813-1868, opcodes Opcodes.h:810/
+   348); buddy_id persisted (migration 9 file_sources.buddy_id; FoundSource.
+   buddy_id; kad CLI save); runner kad3/kad5 flow. Loopback test passed.
+3. **Reachability [DONE, live]**: upnp.py v0.2.0 — SSDP discovery is
+   multi-NIC (VPN tunnel owns the default route and shadowed the LAN IGD);
+   live-mapped listener port via router 192.168.3.1 (NAT mapping ok).
+4. **Server login parity [DONE]**: OP_LOGINREQUEST rewritten per oracle —
+   OLD CTag tag form (compact form was ignored: 10 s drop), tag set
+   ServerConnect.cpp:198-245, SRVCAP flags (Opcodes.h:725-734); identity
+   userhash now SO_EMULE-marked (one-time upgrade persisted) instead of a
+   fresh unmarked random hash per call.
+5. **Source typing [DONE]**: numeric KAD source type persisted
+   ("kad1"/"kad3"/...; migration 8/9 + FoundSource.kad_type/kad_udp_port/
+   buddy_id); runner dials direct rows, sends callbacks for kad6/kad3/kad5;
+   SX answers only direct rows.
+
+Suite: 333 passed, 3 skipped; compileall 0. Remainder: live download.run
+awaits clean network records (today's type-1 records FIN — stale/poisoned
+userhash at the peer side); NAT-T (item 5) only for double-firewalled
+corners. Commit+push on explicit user command.
+
+Suite: 331 passed, 3 skipped; compileall 0. Remainder: LIVE kernel
+download.run from a real KAD source; commit+push on user command.
+

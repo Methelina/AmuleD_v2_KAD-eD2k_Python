@@ -1,12 +1,11 @@
 # AmuleD v0.6.0 — Audit Checklist
 
 Автор: Soror L.'.L.'.
-Обновлён: 2026-09-26
+Обновлён: 2026-09-27
 
 Каждая строка: утверждение → команда воспроизведения → ожидаемый результат →
-категория (`внешняя` = требует внешней cloud-сессии / живого пира, `мои тесты`
-= offline suite этого репозитария, `мок` = заглушка, помеченная
-`# WIP by external developer`).
+категория (`live` = живой пир/сеть, `мои тесты`
+= offline suite этого репозитария).
 
 Команды выполняются из корня `K:\work\AmuleD_v2` в PowerShell:
 
@@ -57,7 +56,7 @@ $py = '.\.venv\Scripts\python.exe'
 |---|---|---|---|
 | Loopback self-test раздачи | `& $py -m pytest -q tests/test_serve_selftest.py tests/test_kernel.py -k vertical` | passed, MD4 сверен | мои тесты |
 | Credits начисляются при отдаче | после loopback-раздачи: `& $py -m amuled_v2 credits list --json` | uploaded ≥ размер файла | мои тесты (live) |
-| SecureIdent evaluate → unverified/bonus 1.0 | `& $py -m pytest -q tests/test_credits.py` | passed | мок (`WIP by external developer`) |
+| SecureIdent: RSA-384 sign/verify + SUI wire (взаимная верификация) | `& $py -m pytest -q tests/test_credits.py tests/test_sui_wire.py` | passed | мои тесты |
 | Полный offline suite | `& $py -m pytest -q tests --ignore=tests/test_live_ed2k.py` | все passed/known-skipped, 0 failed | мои тесты |
 
 ## 5. Клиентская обфускация
@@ -65,17 +64,17 @@ $py = '.\.venv\Scripts\python.exe'
 | Утверждение | Команда | Ожидаемый результат | Категория |
 |---|---|---|---|
 | Клиентский obf-handshake к живому пиру | историческая live-приёмка сессии 7 (MorphXT HANDSHAKE OK ×4) | подтверждено ранее | мои тесты (live, разовая) |
-| Серверный accept обфускации (входящий) | — | реализуется внешней cloud-сессией | внешняя / мок (`WIP by external developer`) |
+| Серверный accept обфускации (входящий) | `& $py -m pytest -q tests/test_listener.py -k "obfuscated or dh"` | passed (BASIC+DH accept в listener) | мои тесты |
 
 ## 6. Отложенное (стадия X и паритет раздачи)
 
 | Утверждение | Команда | Ожидаемый результат | Категория |
 |---|---|---|---|
-| MISCOPTIONS-биты HELLO соответствуют возможностям | сравнение с GetMyConnectOptions (eMuleAI) | TODO | мои тесты (будущее) |
-| GeoIP подключён | — | TODO (assets/v1/GeoIP.dat) | мои тесты (будущее) |
-| UPnP/NAT-PMP | — | TODO | мои тесты (будущее) |
-| QUEUERANK-переодика, slot rotation, credits→priority | — | TODO | мои тесты (будущее) |
-| known.met import/export CLI | — | TODO (парсер готов) | мои тесты (будущее) |
+| MISCOPTIONS-биты HELLO соответствуют возможностям | сверка cap-констант codec.py с GetMyConnectOptions (eMuleAI) | сверено (сессии 10/14: SX/AICH/SUI включены по факту responder'ов) | мои тесты |
+| GeoIP подключён | `& $py -m amuled_v2 geoip lookup 8.8.8.8 --json` | страна определена (maxminddb + legacy fallback) | мои тесты |
+| UPnP/NAT-PMP | `& $py -m amuled_v2 nat status --json` | map/unmap в ядре (`nat.enabled`) | мои тесты |
+| QUEUERANK-периодика, slot rotation, credits→priority | `& $py -m pytest -q tests/test_listener.py tests/test_kernel.py` | passed (queue_rank_period, expired_slots, credit_bonus) | мои тесты |
+| known.met import/export CLI | `& $py -m amuled_v2 import known-met --json` | импорт (парсер сверен: 904/904) | мои тесты |
 
 ## 7. Гигиена репозитария
 
