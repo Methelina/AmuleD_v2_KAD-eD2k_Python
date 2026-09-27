@@ -405,6 +405,9 @@ def test_natt_rendezvous_runner_ipv6_direct_punch(tmp_path) -> None:
                 "tcp_port": listener.bound_port,
                 "user_hash": our_hash,
             },
+            # The loopback fake source legitimately sits on our own ::1 —
+            # the production self-record filter must be off here.
+            self_record_filter=False,
         )
         runner.source_provider = lambda h, limit: [
             {

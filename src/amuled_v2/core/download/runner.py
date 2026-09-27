@@ -8,9 +8,15 @@ part file via ``record_block`` and completion is finalized only when a
 peer delivers the whole file.
 
 src/amuled_v2/core/download/runner.py
-Version:     0.7.0
+Version:     0.7.1
 Author:      Soror L.'.L.'.
 Updated:     2026-09-27
+
+Patch Notes v0.7.1 (Soror L'.L'.):
+  [+] Self-record filter (roadmap 11o addendum 4): resolve_sources
+      drops KAD records whose ipv6 is one of OUR local addresses (NAT
+      reflection / self-publication) or whose userhash equals ours;
+      self_record_filter flag for loopback tests.
 
 Patch Notes v0.7.0 (Soror L'.L'.):
   [+] Corrupt-part salvage (stage X; PartFile.cpp HashSinglePart
@@ -70,6 +76,7 @@ Patch Notes v0.1.0 (Soror L'.L'.):
 from __future__ import annotations
 
 import asyncio
+import socket
 import struct
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -145,6 +152,21 @@ def _client_id_to_ip(client_id: int) -> str:
     return f"{a}.{b}.{c}.{d}"
 
 
+def _local_ip_set() -> set[str]:
+    """All local addresses of this host (loopback included) — used to
+    drop self-referential KAD records (a record can carry our own
+    address after NAT reflection or self-publication)."""
+    ips: set[str] = {"127.0.0.1", "::1"}
+    try:
+        host = socket.gethostname()
+        for family in (socket.AF_INET, socket.AF_INET6):
+            for info in socket.getaddrinfo(host, None, family):
+                ips.add(str(info[4][0]))
+    except OSError:
+        pass
+    return ips
+
+
 class DownloadRunner:
     """Sequential peer-driven download runner over a ``DownloadQueue``."""
 
@@ -166,6 +188,7 @@ class DownloadRunner:
         connection_source: "Callable[[str, float], Any] | None" = None,
         callback_identity: "dict[str, Any] | None" = None,
         aich_audit: bool = True,
+        self_record_filter: bool = True,
     ) -> None:
         self.queue = queue
         self.local_client_id = local_client_id
@@ -198,6 +221,10 @@ class DownloadRunner:
         # state (aich_masters, migration 10) — seed for corrupt-part
         # salvage.
         self.aich_audit = aich_audit
+        # Self-record filter: drop KAD records whose ipv6 is one of OUR
+        # local addresses (NAT reflection / self-publication).  Loopback
+        # tests disable it — their fake source legitimately sits on ::1.
+        self.self_record_filter = self_record_filter
 
     def resolve_sources(
         self, file_hash: str, *, limit: int = 20
@@ -216,6 +243,12 @@ class DownloadRunner:
         seen: set[tuple[str, int]] = set()
         endpoints: list[dict[str, Any]] = []
         skipped = 0
+        own_ips = _local_ip_set()
+        own_userhash: bytes | None = None
+        if self.callback_identity:
+            raw_own = self.callback_identity.get("user_hash")
+            if raw_own:
+                own_userhash = bytes(raw_own)
         for row in rows:
             client_id = row["client_id"]
             if client_id < _HIGH_ID_THRESHOLD:
@@ -233,6 +266,28 @@ class DownloadRunner:
                 if not self.plain_dial_ok:
                     skipped += 1
                     continue
+            # Self-record filter (roadmap 11o addendum 4): a record can
+            # carry our own address/userhash after NAT reflection or
+            # self-publication — rendezvous with ourselves never works.
+            record_ipv6 = row.get("ipv6")
+            if (
+                self.self_record_filter
+                and record_ipv6
+                and record_ipv6 in own_ips
+            ):
+                log.debug(
+                    "DOWNLOAD self-record skipped (ipv6): source=%s:%d",
+                    _client_id_to_ip(client_id), row["client_port"],
+                )
+                skipped += 1
+                continue
+            if user_hash is not None and user_hash == own_userhash:
+                log.debug(
+                    "DOWNLOAD self-record skipped (userhash): source=%s:%d",
+                    _client_id_to_ip(client_id), row["client_port"],
+                )
+                skipped += 1
+                continue
             endpoint = (_client_id_to_ip(client_id), row["client_port"])
             if endpoint in seen:
                 continue

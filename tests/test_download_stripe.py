@@ -423,3 +423,56 @@ def test_corrupt_part_salvage(tmp_path) -> None:
             await source.stop()
 
     asyncio.run(scenario())
+
+
+def test_resolve_sources_self_record_filter() -> None:
+    """Self-referential KAD records (our own userhash or our own local
+    IPv6) must be dropped before the race."""
+    from amuled_v2.core.download.runner import DownloadRunner
+
+    our_hash = "7" * 32
+
+    def provider(file_hash: str, limit: int):
+        return [
+            {
+                # Self-record: our own userhash.
+                "client_id": 0x7F000001,
+                "client_port": 1,
+                "user_hash": our_hash,
+                "source_type": "kad3",
+                "kad_udp_port": 1111,
+                "ipv6": "::1",
+            },
+            {
+                # Self-record by IPv6 only.
+                "client_id": 0x7F000001,
+                "client_port": 2,
+                "user_hash": "A1" * 16,
+                "source_type": "kad3",
+                "kad_udp_port": 2222,
+                "ipv6": "::1",
+            },
+            {
+                # Good foreign record.
+                "client_id": 0x7F000001,
+                "client_port": 3,
+                "user_hash": "CD" * 16,
+                "source_type": "kad3",
+                "kad_udp_port": 3333,
+            },
+        ]
+
+    runner = DownloadRunner(
+        queue=object(),  # provider path never touches the queue
+        local_client_id=1,
+        plain_dial_ok=True,
+        source_provider=provider,
+        callback_identity={
+            "tcp_port": 4662,
+            "user_hash": bytes.fromhex(our_hash),
+        },
+    )
+
+    endpoints = runner.resolve_sources("6" * 32)
+    assert len(endpoints) == 1
+    assert endpoints[0]["port"] == 3
