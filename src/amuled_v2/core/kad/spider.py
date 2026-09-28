@@ -364,19 +364,35 @@ class SpiderEngine:
     def _bind_socket(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Egress bind (recon emuleai-shield-conf.recon.md / live 2026-09-28):
+        # with a VPN TUN default route, 0.0.0.0 makes every KAD datagram
+        # leave through the tunnel, so peers see the tunnel-exit IP and
+        # callbacks to us die.  network.bind_ip pins the socket to the
+        # physical NIC so the home NAT path completes the callback loop.
+        bind_ip = None
         try:
-            sock.bind(("0.0.0.0", self.udp_port))
+            from amuled_v2.core.net.bind_ip import resolve_bind_ip
+
+            bind_ip = resolve_bind_ip()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("spider bind_ip fallback: resolve failed: %r", exc)
+        try:
+            sock.bind((bind_ip or "0.0.0.0", self.udp_port))
         except OSError as exc:
             log.warning(
                 "socket bind failed on port=%d: error=%s, ephemeral fallback",
                 self.udp_port,
                 exc,
             )
-            sock.bind(("0.0.0.0", 0))
+            sock.bind((bind_ip or "0.0.0.0", 0))
         self.bound_port = sock.getsockname()[1]
         sock.setblocking(False)
         self.sock = sock
-        log.info("spider socket bound: port=%d", self.bound_port)
+        log.info(
+            "spider socket bound: port=%d, bind_ip=%s",
+            self.bound_port,
+            bind_ip or "0.0.0.0",
+        )
 
     def _hot_stats(self) -> Dict[str, Any]:
         stats: Dict[str, Any] = {

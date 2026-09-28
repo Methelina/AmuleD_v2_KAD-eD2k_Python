@@ -63,6 +63,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "client_udp_port": 8089,
         "enable_ed2k": True,
         "enable_kad": True,
+        # Physical-NIC egress for KAD/peer UDP (VPN TUN bypass); None = 0.0.0.0.
+        "bind_ip": None,
     },
     "paths": {
         "incoming": None,

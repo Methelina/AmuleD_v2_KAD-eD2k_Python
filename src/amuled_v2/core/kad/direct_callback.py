@@ -118,10 +118,32 @@ async def send_direct_callback_req(
 
 
 def socket_udp():
-    """Fresh non-blocking UDP socket for the callback request."""
+    """Fresh non-blocking UDP socket for the callback request.
+
+    Binds to ``network.bind_ip`` (physical NIC) when configured: the peer
+    answers a callback by connecting to this datagram's SOURCE address, so
+    the egress interface decides reachability (VPN TUN default routes make
+    0.0.0.0 egress unreachable for callbacks; live 2026-09-28).
+    """
     import socket
 
+    from amuled_v2.core.net.bind_ip import resolve_bind_ip
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    bind_ip = resolve_bind_ip()
+    if bind_ip:
+        try:
+            sock.bind((bind_ip, 0))
+        except OSError as exc:
+            # FALLBACK (policy: every fallback is logged).
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "direct-callback bind_ip fallback: bind to %s failed, "
+                "using 0.0.0.0: %r",
+                bind_ip,
+                exc,
+            )
     sock.setblocking(False)
     return sock
 

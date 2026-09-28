@@ -63,8 +63,14 @@ def main() -> int:
     )
     # Watchdog (policy 2026-09-28): the kernel must never freeze silently.
     # If the event loop stops progressing for 30 s, dump every thread's
-    # stack to stderr so the blocking frame is directly visible.
-    faulthandler.dump_traceback_later(30, repeat=True)
+    # stack to a project-local file (stderr races the console logger).
+    # The handle stays open for the process lifetime by design.
+    from pathlib import Path
+
+    _watchdog = Path("logs") / "kernel_watchdog_dump.txt"
+    _watchdog.parent.mkdir(exist_ok=True)
+    _watchdog_fh = open(_watchdog, "a", buffering=1)
+    faulthandler.dump_traceback_later(30, repeat=True, file=_watchdog_fh)
     return run_kernel(parser.parse_args())
 
 

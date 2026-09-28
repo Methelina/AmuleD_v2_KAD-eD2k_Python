@@ -293,6 +293,14 @@ class NattUdpSession(asyncio.DatagramProtocol):
 
     async def start(self, host: str = "0.0.0.0", port: int = 0) -> int:
         loop = asyncio.get_running_loop()
+        if host == "0.0.0.0":
+            # Egress bind (live 2026-09-28): rendezvous punch packets must
+            # leave through the physical NIC, not a VPN TUN default route -
+            # the peer dials the source address of our UDP punch, and only
+            # the home-NAT path has the UPnP-forwarded inbound port.
+            from amuled_v2.core.net.bind_ip import resolve_bind_ip
+
+            host = resolve_bind_ip() or host
         self._transport, _ = await loop.create_datagram_endpoint(
             lambda: self, local_addr=(host, port)
         )
