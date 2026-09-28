@@ -28,9 +28,13 @@ Protocol flow (see ``_expect_first_packet``):
        HASHSETREQUEST, REQUESTPARTS/REQUESTPARTS_I64, and END_OF_DOWNLOAD.
 
 src/amuled_v2/core/peer/listener.py
-Version:     0.3.1
-Author:      Soror L.'.L.'.
-Updated:     2026-09-27
+Version:     0.4.0
+Author:      Soror L'.L'.
+Updated:     2026-09-28
+
+Patch Notes v0.4.0 (Soror L'.L'.):
+  [!] Log listener fallback sites (close failures, format-peer failures,
+      upload-session close failures) instead of silently swallowing them.
 
 Patch Notes v0.3.1 (Soror L'.L'.):
   [+] Direct-callback waiters are a FIFO queue per IP (fixes two racing
@@ -345,8 +349,13 @@ class StateSharedFileResolver:
             if close is not None:
                 try:
                     close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug(
+                        "listener fallback: shared-file state close "
+                        "failed, hash=%s, error=%s",
+                        file_hash.hex(),
+                        exc,
+                    )
 
         if row is None:
             return None
@@ -1242,8 +1251,12 @@ class IncomingPeerSession:
     async def _safe_close(self, transport: StreamTransport) -> None:
         try:
             transport.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning(
+                "listener fallback: transport close failed, peer=%s, error=%s",
+                self._peer_name,
+                exc,
+            )
         try:
             await self._writer.wait_closed()
         except (OSError, asyncio.CancelledError):
@@ -1310,8 +1323,11 @@ def _format_peer(writer: asyncio.StreamWriter) -> str:
         peer = writer.get_extra_info("peername")
         if peer:
             return f"{peer[0]}:{peer[1]}"
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning(
+            "listener fallback: get_extra_info(peername) failed, error=%s",
+            exc,
+        )
     return "unknown"
 
 

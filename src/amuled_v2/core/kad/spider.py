@@ -11,9 +11,14 @@ save behavior; the kernel injects its permanent connection and never closes
 it mid-run.
 
 src/amuled_v2/core/kad/spider.py
-Version:     0.3.0
+Version:     0.4.0
 Author:      Soror L.'.L'.
-Updated:     2026-09-27
+Updated:     2026-09-28
+
+Patch Notes v0.4.0 (Soror L'.L'.):
+  [+] Replaced six silent `except Exception: continue/pass` sites in the
+      receiver loop with tagged logging so degraded packets are observable.
+  [+] Version bumped 0.3.0 -> 0.4.0.
 
 Patch Notes v0.3.0 (Soror L'.L'.):
   [+] Serving-buddy client (stage X): SpiderEngine accepts own buddy TCP
@@ -471,7 +476,12 @@ class SpiderEngine:
                     proto, op, payload = parse_kad_packet(data)
                     if proto == 0xE5:
                         payload = zlib.decompress(payload)
-                except Exception:
+                except Exception as exc:
+                    log.debug(
+                        "KAD spider fallback: parse_kad_packet/zlib "
+                        "decompress failed, skipping datagram: error=%r",
+                        exc,
+                    )
                     continue
                 if proto not in (0xE4, 0xE5):
                     plain = decode_obfuscated_kad(
@@ -485,7 +495,13 @@ class SpiderEngine:
                         proto, op, payload = parse_kad_packet(pkt)
                         if proto == 0xE5:
                             payload = zlib.decompress(payload)
-                    except Exception:
+                    except Exception as exc:
+                        log.debug(
+                            "KAD spider fallback: deobfuscated "
+                            "parse_kad_packet/zlib decompress failed, "
+                            "skipping datagram: error=%r",
+                            exc,
+                        )
                         continue
                     key = (addr[0], addr[1])
                     rec = nodes.get(key)
@@ -507,7 +523,12 @@ class SpiderEngine:
                         served_id, _uh, _tcp, _opts = (
                             parse_find_serving_buddy_req(payload)
                         )
-                    except Exception:
+                    except Exception as exc:
+                        log.debug(
+                            "KAD spider fallback: parse_find_serving_buddy_req "
+                            "failed, skipping buddy request: error=%r",
+                            exc,
+                        )
                         continue
                     if not buddy_registry.can_serve():
                         continue
@@ -535,7 +556,12 @@ class SpiderEngine:
                         ucheck, fh, req_tcp, ext_ip = parse_callback_req(
                             payload
                         )
-                    except Exception:
+                    except Exception as exc:
+                        log.debug(
+                            "KAD spider fallback: parse_callback_req "
+                            "failed, skipping callback relay: error=%r",
+                            exc,
+                        )
                         continue
                     buddy_registry.relay_op_callback(
                         ucheck, fh, addr[0], req_tcp
@@ -566,7 +592,12 @@ class SpiderEngine:
                     kadabra.reward((addr[0], addr[1]), 0.5)
                     try:
                         h = parse_hello_res(payload)
-                    except Exception:
+                    except Exception as exc:
+                        log.debug(
+                            "KAD spider fallback: parse_hello_res "
+                            "failed, skipping HELLO_RES: error=%r",
+                            exc,
+                        )
                         continue
                     if rec is None:
                         rec = nodes[key] = {
@@ -598,7 +629,13 @@ class SpiderEngine:
                     kadabra.reward((addr[0], addr[1]), 2.0)
                     try:
                         _sid, contacts = parse_bootstrap_res(payload)
-                    except Exception:
+                    except Exception as exc:
+                        log.warning(
+                            "KAD spider fallback: parse_bootstrap_res "
+                            "failed, dropping bootstrap source contacts "
+                            "from %s:%d: error=%r",
+                            addr[0], addr[1], exc,
+                        )
                         continue
                     for c in contacts:
                         ck = (c.ip, c.udp_port)

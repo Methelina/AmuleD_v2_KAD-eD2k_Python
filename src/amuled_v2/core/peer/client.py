@@ -330,6 +330,18 @@ class PeerClient:
         # also be STABLE across dials from one IP: eMuleAI tracks clients
         # and bans "Userhash changed" (verified live 2026-09-26).
         raw = bytes(local_userhash) if local_userhash else os.urandom(16)
+        if local_userhash is None:
+            # FALLBACK (policy: every fallback is logged): a random HELLO
+            # identity classifies as SO_UNKNOWN and makes peers ban
+            # "Userhash changed" (see comment above; live evidence
+            # 2026-09-28 eMuleAI <Ban> [Bad user hash]).
+            log.warning(
+                "PEER local_userhash fallback: caller supplied no identity, "
+                "using random marked hash - peers will treat each dial as a "
+                "different client (host=%s:%d)",
+                self.host,
+                self.port,
+            )
         if len(raw) != 16:
             raise PeerSessionError("local_userhash must be exactly 16 bytes")
         marked = bytearray(raw)
@@ -1020,8 +1032,13 @@ class PeerClient:
                 if rank_callback is not None:
                     try:
                         rank_callback(rank)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # FALLBACK (policy: every swallowed error is logged).
+                        log.warning(
+                            "PEER rank_callback fallback: callback raised, "
+                            "continuing without it: error=%r",
+                            exc,
+                        )
                 continue
             if opcode == C2CTCP.FILEREQANSNOFIL:
                 raise PeerSessionError("peer reported the file as unavailable")
@@ -1359,8 +1376,14 @@ class PeerClient:
                     if progress_callback is not None:
                         try:
                             progress_callback(received, total_size, blocks)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            # FALLBACK (policy: every swallowed error is
+                            # logged).
+                            log.warning(
+                                "PEER progress_callback fallback: callback "
+                                "raised, transfer continues: error=%r",
+                                exc,
+                            )
                     expected_bytes -= len(part.data)
                 if base_offset + received >= bound:
                     break

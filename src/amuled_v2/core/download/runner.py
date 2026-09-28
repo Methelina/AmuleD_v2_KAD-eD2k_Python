@@ -8,9 +8,15 @@ part file via ``record_block`` and completion is finalized only when a
 peer delivers the whole file.
 
 src/amuled_v2/core/download/runner.py
-Version:     0.9.1
-Author:      Soror L.'.L.'.
+Version:     0.9.2
+Author:      Soror L'.L'.
 Updated:     2026-09-28
+
+Patch Notes v0.9.2 (Soror L'.L'.):
+  [!] All silent `except Exception: pass` sites now log a tagged "runner
+      fallback:" line (log.debug for best-effort teardown noise, log.warning
+      for result-affecting degradations) per project policy.  Bare
+      `except Exception:` changed to `except Exception as exc:`.
 
 Patch Notes v0.9.1 (Soror L'.L'.):
   [+] Stable HELLO identity: PeerClient now receives local_userhash from
@@ -606,8 +612,11 @@ class DownloadRunner:
                 if close_client is not None:
                     try:
                         await close_client()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log.debug(
+                            "runner fallback: best-effort client close "
+                            "failed on A4AF NNS skip: %s", exc,
+                        )
                 return {
                     "file_hash": file_hash,
                     "bytes_received": 0,
@@ -823,8 +832,11 @@ class DownloadRunner:
             if client is not None:
                 try:
                     self._persist_collected_sources(client, file_hash_bytes)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug(
+                        "runner fallback: failed to persist collected "
+                        "sources for peer teardown: %s", exc,
+                    )
                 await client.close()
                 # Unregister this peer from the ICS live-client list so
                 # _part_frequencies stops counting it.
@@ -842,8 +854,11 @@ class DownloadRunner:
             for closer in closers:
                 try:
                     closer()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug(
+                        "runner fallback: one-shot closer failed on "
+                        "peer teardown: %s", exc,
+                    )
 
     def _persist_collected_sources(
         self, client: Any, file_hash_bytes: bytes

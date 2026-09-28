@@ -18,9 +18,16 @@ The identity section of ``config/amuled.jsonc``::
     }
 
 src/amuled_v2/core/identity.py
-Version:     0.1.0
-Author:      Soror L'.L'.
-Updated:     2026-09-25
+Version:     0.2.0
+Author:      Soror L.'.L.'.
+Updated:     2026-09-28
+
+Patch Notes v0.2.0 (Soror L'.L'.):
+  [+] Shield-compliance sanity (recon tmp/recon/emuleai-shield-conf.recon.md):
+      a degenerate userhash (all-zero body, the "Corrupt Userhash" soft-ban
+      pattern in eMuleAI shield.conf) is regenerated with a fallback
+      warning; a nickname matching a shield blacklist substring (hard/soft
+      leecher user names) logs a fallback warning at load.
 
 Patch Notes v0.1.0 (Soror L'.L'.):
   [+] Added AppIdentity dataclass (user_hash/nick/tcp_port/client_id).
@@ -157,6 +164,34 @@ def load_identity() -> AppIdentity:
     nick = section.get("nick") or "AmuleD"
     tcp_port = int(section.get("tcp_port") or 0)
     client_id = int(section.get("client_id") or 0)
+
+    # Shield-compliance sanity (recon emuleai-shield-conf.recon.md):
+    # eMuleAI's shield soft-bans "Corrupt Userhash" marker-only hashes
+    # (e.g. 00000000000E00000000000000006F00).  After marker application
+    # a degenerate hash still has <8 non-marker nonzero bytes -> regenerate.
+    nonzero_body = sum(1 for i, b in enumerate(user_hash) if b and i not in (5, 14))
+    if nonzero_body < 8:
+        log.warning(
+            "identity user_hash fallback: degenerate (corrupt) userhash "
+            "detected, regenerating - peers soft-ban marker-only hashes"
+        )
+        user_hash = _mark_user_hash(os.urandom(16))
+        cfg.setdefault("identity", {})["user_hash"] = user_hash.hex().upper()
+        save_config(cfg)
+
+    # Nickname must not collide with the shield's leecher user-name lists.
+    from amuled_v2.core.peer.shield_guard import check_nickname
+
+    banned_nick = check_nickname(str(nick))
+    if banned_nick is not None:
+        log.warning(
+            "identity nickname fallback: nickname %r contains shield-"
+            "blacklisted substring %r - replace it in config or peers will "
+            "punish the client as a leecher",
+            nick,
+            banned_nick,
+        )
+
     identity = AppIdentity(
         user_hash=user_hash,
         nickname=str(nick),
