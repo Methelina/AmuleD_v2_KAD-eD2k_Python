@@ -1,0 +1,113 @@
+// AmuleD v0.6.0 — Configuration prototype (JSONC).
+// This file is tracked in the repository as a sanitized template.
+// The installer copies it to config\amuled.jsonc on first run (only if
+// that file is missing); the live config stays local and private.
+//
+// Rules for THIS file:
+//   - no machine-specific absolute paths (all paths relative to the
+//     project root; null paths fall back to the portable runtime dirs);
+//   - no personal identifiers: identity.user_hash stays null — a stable
+//     SO_EMULE-marked userhash is generated and persisted on first launch;
+//   - network.bind_ip stays null (bind 0.0.0.0). Set it to a LOCAL NIC
+//     IPv4 only when a VPN TUN default route must be bypassed so that
+//     KAD/peer UDP egress reaches peers via the home NAT (see
+//     src\amuled_v2\core\net\bind_ip.py).
+//   - NEVER commit config\cryptkey.dat (SUI RSA-384 private key) or the
+//     generated config\amuled.jsonc.
+
+{
+  // Core
+  "app": {
+    "name": "AmuleD"
+  },
+
+  // Network. Ports are the classic eMule client defaults; 0/ephemeral also
+  // works — the serve daemon binds an ephemeral TCP port and publishes the
+  // real one. bind_ip: null = 0.0.0.0 (OS routing decides egress).
+  "network": {
+    "client_tcp_port": 8089,
+    "client_udp_port": 8089,
+    "enable_ed2k": true,
+    "enable_kad": true,
+    "bind_ip": null
+  },
+
+  // Runtime paths. null = portable project-local defaults
+  // (incoming/, temp/, shared/).
+  "paths": {
+    "incoming": null,
+    "temp": null,
+    "shared": null
+  },
+
+  // Kademlia bootstrap (bundled public assets).
+  "kademlia": {
+    "nodes_dat": "assets/v1/nodes.dat",
+    "bootstrap_nodes": []
+  },
+
+  // ED2K server list (bundled public assets).
+  "servers": {
+    "server_met": "assets/v1/server.met",
+    "static_servers": "assets/v1/staticservers.dat"
+  },
+
+  // Sharing. shared_files_json / shareddir_dat stay null unless you import
+  // a shared-files baseline; both are local-private by policy.
+  "sharing": {
+    "shared_files_json": null,
+    "shareddir_dat": null
+  },
+
+  // IP filter (bundled public assets).
+  "ipfilter": {
+    "ipfilter_dat": "assets/v1/ipfilter.dat",
+    "ipfilter_static_dat": "assets/v1/ipfilter_static.dat"
+  },
+
+  // GeoIP (bundled legacy dat; MMDB also supported when geoip.enabled).
+  "geoip": {
+    "geoip_dat": "assets/v1/GeoIP.dat",
+    "enabled": false
+  },
+
+  // Outbound proxy (disabled by default).
+  "proxy": {
+    "enabled": false,
+    "host": null,
+    "port": null,
+    "username": null,
+    "password": null
+  },
+
+  // Client identity. user_hash null = generated + persisted on first run.
+  // Presenting ONE stable identity per client is mandatory: peers
+  // (eMuleAI TrackedClientsList) ban per-IP "Userhash changed" churn.
+  "identity": {
+    "user_hash": null,
+    "nick": "AmuleD",
+    "tcp_port": 0,
+    "client_id": 0
+  },
+
+  // Serve daemon (unified kernel: spider + listener + publish + IPC).
+  "serve": {
+    "bind_host": "0.0.0.0",
+    "max_sessions": 64,
+    "upload_slots": 4,
+    "throttle_bytes_per_sec": 0,
+    "republish_hours": 6.0,
+    "publish_limit": 0
+  },
+
+  // State backend.
+  "storage": {
+    "backend": "duckdb"
+  },
+
+  // Diagnostics. Tagged JSONL; relative path stays inside the project.
+  "logging": {
+    "level": "INFO",
+    "file": "logs/amuled.jsonl"
+  }
+}

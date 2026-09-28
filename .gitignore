@@ -11,7 +11,10 @@ docs/roadmap.md
 docs/continuation-prompt.md
 
 # === Local private/generated state ===
+# Live config (may carry userhash / bind_ip / absolute paths) and the SUI
+# private key are private; the tracked prototype is config/amuled.example.jsonc.
 config/amuled.jsonc
+config/cryptkey.dat
 assets/v1/shared_files.json
 docs/recon/
 assets/v1/shareddir.dat

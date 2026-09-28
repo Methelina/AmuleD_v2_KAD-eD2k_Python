@@ -14,7 +14,8 @@
 #         AmuleD_v2\.cache or AmuleD_v2\bin.
 #       - Creates the portable runtime tree: config, db, logs, tmp, incoming,
 #         temp, shared.
-#       - Creates config\amuled.jsonc only if missing.
+#       - Seeds config\amuled.jsonc from the tracked sanitized prototype
+#         config\amuled.example.jsonc (only if missing).
 #       - Installs requirements.txt into .venv using only the project-local
 #         Python executable.
 #       - Verifies critical imports and writes logs\install.log.
@@ -25,16 +26,28 @@
 #
 # ==========================================
 # VERSION
-#     0.3.1
+#     0.3.2
 # ==========================================
 # AUTHOR
 #     Soror L.'.L.'.
 # ==========================================
 # UPDATED
-#     2026-09-22
+#     2026-09-28
 # ==========================================
 #
 # CHANGELOG
+#
+# v0.3.2 (2026-09-28 by Soror L.'.L'.)
+#   [+] The default configuration now ships as the tracked, sanitized
+#       prototype config\amuled.example.jsonc (schema = config.py
+#       DEFAULT_CONFIG; no userhash, no bind_ip, no absolute paths). Stage 3
+#       copies it to config\amuled.jsonc only when that file is missing, so
+#       a fresh checkout gets a correct editable prototype and an existing
+#       user config is never overwritten. The legacy inline template is
+#       removed; when the prototype is absent the runtime creates the config
+#       from its own defaults on first launch.
+#   [*] gitignore: config\cryptkey.dat (SUI private key) is now explicitly
+#       private alongside config\amuled.jsonc.
 #
 # v0.3.1 (2026-09-22 by Soror L.'.L'.)
 #   [+] Added project-local baseline resources under assets\v1.
@@ -133,6 +146,7 @@ $TempDir       = Join-Path $ProjectRoot "temp"
 $SharedDir     = Join-Path $ProjectRoot "shared"
 $ReqFile       = Join-Path $ProjectRoot "requirements.txt"
 $ConfigFile    = Join-Path $ConfigDir "amuled.jsonc"
+$ConfigExample = Join-Path $ConfigDir "amuled.example.jsonc"
 $LogFile       = Join-Path $LogsDir "install.log"
 $PythonVersion = "3.12"
 
@@ -252,124 +266,16 @@ function Get-LocalUv {
     }
 }
 
-function Get-DefaultConfig {
-    return @'
-// AmuleD_v2 Configuration (JSONC)
-// Version: 0.4.1
-// Updated: 2026-09-22
-
-{
-  // Core daemon settings
-  "daemon": {
-    "pid_file": "db/amuled.pid",
-    "log_level": "INFO"
-  },
-
-  // Diagnostics logging
-  "logging": {
-    "level": "INFO",
-    "file": "logs/amuled.jsonl"
-  },
-
-  // Network configuration
-  "network": {
-    "ed2k_tcp_port": 8089,
-    "ed2k_udp_port": 8089,
-    "kad_udp_port": 8089,
-    "bind_address": "0.0.0.0",
-    "max_connections": 200,
-    "max_sources_per_file": 500,
-    "connection_timeout": 30,
-    "socket_buffer_size": 65536
-  },
-
-  // Kademlia bootstrap
-  "kademlia": {
-    "nodes_dat": "assets/v1/nodes.dat",
-    "bootstrap_nodes": [],
-    "max_bucket_size": 20,
-    "ping_timeout": 10,
-    "publish_interval": 300
-  },
-
-  // ED2K server list
-  "servers": {
-    "server_met": "assets/v1/server.met",
-    "static_servers": "assets/v1/staticservers.dat",
-    "auto_update_server_met": false
-  },
-
-  // Sharing configuration
-  "sharing": {
-    "shared_dirs": [],
-    "shared_files_json": null,
-    "shareddir_dat": null,
-    "incoming_dir": "incoming",
-    "temp_dir": "temp",
-    "max_upload_slots": 3,
-    "upload_queue_size": 50,
-    "upload_speed_limit": 0,
-    "download_speed_limit": 0
-  },
-
-  // File paths
-  "paths": {
-    "config_dir": "config",
-    "db_dir": "db",
-    "logs_dir": "logs",
-    "tmp_dir": "tmp",
-    "incoming_dir": "incoming",
-    "temp_dir": "temp",
-    "shared_dir": "shared",
-    "db_file": "db/amuled.db"
-  },
-
-  // IP filter
-  "ipfilter": {
-    "ipfilter_dat": "assets/v1/ipfilter.dat",
-    "ipfilter_static_dat": "assets/v1/ipfilter_static.dat",
-    "auto_update": false
-  },
-
-  // Security
-  "security": {
-    "enable_obfuscation": true,
-    "enable_secure_ident": false,
-    "cryptkey_file": null
-  },
-
-  // Search
-  "search": {
-    "default_search_type": "kad",
-    "max_results": 500,
-    "result_ttl": 300
-  },
-
-  // Download
-  "download": {
-    "chunk_size": 9728000,
-    "block_size": 184320,
-    "disk_space_reserve_mb": 100,
-    "auto_retry_failed": true,
-    "max_retries": 3
-  },
-
-  // NAT / UPnP
-  "nat": {
-    "enable_upnp": true,
-    "enable_natpmp": true,
-    "external_port_override": null
-  },
-
-  // GeoIP
-  "geoip": {
-    "geoip_dat": "assets/v1/GeoIP.dat",
-    "enabled": false
-  }
+function Copy-DefaultConfig {
+    # Seed config\amuled.jsonc from the tracked sanitized prototype
+    # (config\amuled.example.jsonc). Nothing here: the runtime creates the
+    # config from its built-in defaults on first launch instead.
+    if (Test-Path $ConfigExample) {
+        Copy-Item -LiteralPath $ConfigExample -Destination $ConfigFile -Force:$false
+        return $true
+    }
+    return $false
 }
-'@
-}
-
 # === Main Install Process ===
 Write-Step "Preparing portable installer" 0 6
 Write-Status "Project root : $ProjectRoot" "CYAN"
@@ -394,12 +300,13 @@ foreach ($dir in $RuntimeDirs) {
 Write-Status "All runtime directories are ready" "SUCCESS"
 
 # Stage 3: config
-Write-Step "Creating default JSONC configuration" 3 6
+Write-Step "Seeding JSONC configuration from the prototype" 3 6
 if (-not (Test-Path $ConfigFile)) {
-    $defaultConfig = Get-DefaultConfig
-    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-    [System.IO.File]::WriteAllText($ConfigFile, $defaultConfig, $utf8NoBom)
-    Write-Status "Created default config: $ConfigFile" "SUCCESS"
+    if (Copy-DefaultConfig) {
+        Write-Status "Created config from prototype: $ConfigFile" "SUCCESS"
+    } else {
+        Write-Status "Prototype $ConfigExample not found - the runtime will create the config from built-in defaults on first launch" "INFO"
+    }
 } else {
     Write-Status "Config already exists, leaving untouched: $ConfigFile" "INFO"
 }

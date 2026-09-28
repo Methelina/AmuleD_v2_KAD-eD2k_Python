@@ -1179,3 +1179,284 @@ tmp/recon/emuleai-buddy-udp.recon.md, emuleai-kad-ipv6-tags.recon.md.
 
 Suite: 342 passed, 3 skipped; compileall 0. Commit+push on user command.
 
+### 11o addendum: buddy CUSTOMER side [DONE — loopback]
+
+1. **BuddyCustomer [DONE]**: core/kad/buddy_customer.py 0.1.1 — 0x51 REQ
+   builder (XOR-form ID), 0x5A RES parser (identity proof via the XOR
+   echo), TCP registration HELLO with CT_EMULE_SERVINGBUDDYID 0xBF +
+   SERVINGBUDDYIP 0xFC + SERVINGBUDDYUDP 0xFD tags, OP_CALLBACK (0x99)
+   relay consumer dialing the requester over plain TCP.
+2. **Agent code, orchestrator-verified** (new workflow: coding agents
+   implement, orchestrator reviews and runs the tests): the coding
+   agent's _read_frame had the opcode at hdr[4] (len high byte) instead
+   of byte 6 — HELLOANSWER detection could never fire; the OP_CALLBACK
+   port offset was 34 instead of 36 (read IP high bytes as the port);
+   the requester IP decoded little-endian ("1.0.0.127").  All three
+   fixed in review (0.1.1).
+3. **Spider integration [DONE]**: spider.py 0.3.0 — BuddyCustomer wired
+   into run() (buddy_tcp_port/buddy_userhash ctor params, 0x5A handler,
+   run_registration task, periodic 0x51 to up to 3 alive nodes every
+   300 s, _buddy_dial_back keeps the requester connection open);
+   kernel passes both params (wiring of own userhash TODO next session).
+4. **Test [DONE]**: tests/test_kad_buddy_customer.py — payload
+   roundtrips + full loopback: fake buddy (UDP 0x5A + TCP HELLO
+   acceptor) serves BuddyCustomer, 0x52-relay simulated as OP_CALLBACK
+   write, customer dials the requester stand-in.  Instrumented with a
+   per-task watchdog; hang diagnosed to Proactor Server.wait_closed
+   blocking past handler completion — bounded in the test (cleanup
+   only, not the fact under test).
+
+Suite: 344 passed, 3 skipped; compileall 0. Commit+push on user command.
+
+### 11o addendum 2: IPv6 KAD source tags + keepalive verdict [DONE]
+
+1. **IPv6 source tags [DONE]**: source_search.py 0.2.0 — TAG_IPV6
+   ("ip6") and TAG_SERVINGBUDDYIPV6 ("bi6") captured as ipv6/buddy_ipv6
+   (canonical compressed strings; malformed hex degrades to None, never
+   raises); KadFileSource + to_dict + both KadFileSource call sites.
+   Kernel now passes buddy_tcp_port + real buddy_userhash into
+   SpiderEngine — the buddy customer is live in prod runs.
+   Loopback: tests/test_kad_ipv6_tags.py (unit + fixture entry with
+   ip6/bi6 tags, malformed-hex degradation).
+2. **Buddy keepalive verdict [CLOSED — not needed for eMuleAI]**:
+   OP_BUDDYPING (0x9F) does NOT exist in eMuleAI — the fork replaced the
+   stock ping/pong with the eServer Buddy protocol where validity = TCP
+   socket state (BaseClient.cpp:7713, :3749; no ping timeout).  Both our
+   sides already track exactly that.  Stock-eMule 0x9F interop is
+   irrelevant for the primary live target.  The eServer Buddy protocol
+   (OP_ESERVER_BUDDY_REQUEST/RELAY_REQUEST/UDP_PROBE, OP_
+   SERVINGBUDDYPULL_REQ) is a separate eMuleAI-specific layer — recorded
+   as optional future work, not required for standard eMule interop.
+
+Suite: 346 passed, 3 skipped; compileall 0. Commit+push on user command.
+
+### 11o addendum 3: IPv6 rendezvous runner path [DONE]
+
+1. **Persistence [DONE]**: state.py migration 11 — file_sources gains
+   ipv6/buddy_ipv6 (saved per-source, returned by list_file_sources);
+   FoundSource carries both (server_client.py); cli populates them from
+   KAD records.
+2. **Runner [DONE]**: runner.py 0.5.1 — resolve_sources carries
+   ipv6/buddy_ipv6; an ipv6 target starts the dual-stack NAT-T session
+   (start6) and drives the rendezvous direct-punch variant (no endpoint
+   hint, ClientUDPSocket.cpp:1276).
+3. Loopback: tests/test_natt_rendezvous.py::test_natt_rendezvous_runner_
+   ipv6_direct_punch — full runner path over ::1 (kad3 row with ipv6 →
+   uTP → MD4-verified download); test_kad_ipv6_tags.py gains the
+   file_sources ipv6 roundtrip.
+
+Suite: 348 passed, 3 skipped; compileall 0. Commit+push on user command.
+
+### 11o addendum 4: LIVE verdict, buddy liveness [MEASURED]
+
+1. **Buddy liveness measured [DONE]**: tmp\kad_ping.py sends
+   KADEMLIA2_HELLO_REQ to the record buddies (87.227.245.64:60509,
+   79.117.119.134:4672, 79.112.136.166:65023, 58.38.13.178:54188) — ALL
+   FOUR reply (obfuscated KAD; our decoder unwraps them to valid
+   0xE4 HELLO_RES).  Buddies are ALIVE and accept plain requests.
+2. **Rendezvous silence root cause [CONFIRMED]**: the drop happens at the
+   buddy's FindServedBuddyByKadID gate (ClientUDPSocket.cpp:1164) — the
+   buddy does not serve the record's target KadID.  The kad3 records'
+   buddy↔target pairs are stale/incoherent (network data quality), not a
+   wire fault: our 0x94 is oracle-exact (11n wire-diff), the transports
+   are loopback-verified, and the buddies answer KAD pings.
+3. Self-record filter: one kad3 record carried OUR OWN Hamachi IPv6 as
+   the target's ipv6 (self-publication / NAT reflection) — the runner
+   must skip self-referential endpoints (todo: add the filter to
+   resolve_sources).
+4. Live rendezvous success therefore needs a fresh coherent record —
+   the same constraint eMuleAI operates under (its log shows working
+   rendezvous on fresh pairs).
+
+### 11o addendum 5: stalled-stripe reassignment [DONE]
+
+1. **Rounds [DONE]**: runner.py 0.6.0 — run() races up to 3 rounds;
+   round 1 stripes the whole file, later rounds re-stripe the CURRENT
+   gap list (queue.gap_ranges(), queue.py 0.2.0) so a dead peer's bytes
+   are reassigned to survivors (_regions_from_gaps splits the gap space
+   evenly; a region may span a filled sub-range — bounded duplication,
+   correct by construction).
+2. **Dead-peer pruning [DONE]**: a peer that delivered zero bytes in a
+   round is dropped from later rounds (previously the dead peer kept
+   half the gap space every round — measured: 225000/300000 covered in
+   3 rounds before the fix).
+3. Test: tests/test_download_stripe.py::test_stripe_reassignment_dead_
+   peer — dead direct endpoint + one kad6 source; the survivor covers
+   the hole in round 2, MD4-verified completion.
+
+Suite: 349 passed, 3 skipped; compileall 0. Commit+push on user command.
+
+### 11o addendum 6: corrupt-part salvage [DONE — v1, part-MD4]
+
+1. **Part verification [DONE]**: runner.py 0.7.0 — after a FULL-file
+   region transfer, every PART's MD4 on disk is verified against the
+   peer's hashset (chunk_hashes[0] = file hash, rest = part hashes;
+   single-part files use the file hash as the part hash — the eMuleAI
+   inverted form confirmed live 2026-09-26).
+2. **Gap punch [DONE]**: PartFile.punch (the AddGap reverse;
+   PartFile.cpp FlushBuffer:5795) + queue.punch_gaps with a DB status
+   downgrade to DOWNLOADING — without it the rounds loop saw "complete"
+   and finalized into a gapped file (caught by the e2e test).
+3. Rounds loop refetches punched parts automatically; finalize only
+   runs when the gap list is empty, so the MD4 gate stays intact.
+4. e2e: tests/test_download_stripe.py::test_corrupt_part_salvage — a
+   poisoned first block (record_block wrapper flips one byte) is
+   detected, punched and refetched; file completes MD4-verified.
+5. **Oracle note**: eMule's AICH layer narrows salvage to 180 KB blocks
+   within a corrupt part (AICHRecoveryDataAvailable, PartFile.cpp
+   :7108-7221) — our v1 salvages at part granularity; AICH block-level
+   refinement is future work on top of the existing AICH requester.
+6. Oracle location note: UpDownClient.cpp does not exist in the eMuleAI
+   tree (only the UpdownClient.h header with declarations) — the
+   zero-master gate lives in SHAHashSet.cpp (already extracted:
+   AICH_TRUSTED needs 10 IPs / 92%).
+
+### 11o addendum 7: self-record filter [DONE]
+
+1. **resolve_sources filter [DONE]**: runner.py 0.7.1 — records whose
+   ipv6 is one of OUR local addresses (getaddrinfo of hostname +
+   loopback) or whose userhash equals ours are dropped with a debug
+   line (NAT reflection / self-publication; measured live: a record
+   carried our own Hamachi IPv6 as the target's address).
+2. `self_record_filter` flag for loopback tests (their fake source
+   legitimately sits on ::1).
+3. Test: test_resolve_sources_self_record_filter — two self-variants
+   (userhash match, ipv6 match) dropped, foreign record kept.
+
+Suite: 351 passed, 3 skipped; compileall 0. Commit+push on user command.
+
+### 11o addendum 8: AICH block-level salvage [DONE]
+
+1. **Verified-block extraction [DONE]**: hashes/aich.py 0.2.1 —
+   aich_part_path_ident / aich_subtree_leaf_idents / aich_verified_part_
+   blocks: the peer's recovery blob is parsed, the part's block hashes
+   extracted by ident and AUTHENTICATED by rebuilding the trusted master
+   (SHA1 chain over the part subtree + sibling path); a blob that does
+   not rebuild the master is rejected.  Ident convention note: entering
+   a node shifts in the NODE's own is_left bit (single-part leaves are
+   0x7/0x6 from ident 1, not 0x3/0x2 — caught by the e2e).
+2. **Narrowed punch [DONE]**: runner.py 0.7.2 (_aich_narrow_corrupt) —
+   with a trusted master stored, a corrupt part's recovery data narrows
+   the punch to the corrupt 180 KB blocks; without a stored master the
+   whole part is punched (v1 fallback).
+3. **AICH in the engine loop [DONE]**: upload/engine.py —
+   UploadSession.aich_handler hook; OP_AICHREQUEST (0x9B) inside the
+   engine loop is served (previously silently ignored); listener wires
+   IncomingPeerSession._handle_aich_request; _PreambleTransport.send
+   gained protocol-parity (caught: TypeError killed the session
+   mid-answer).
+4. e2e: test_aich_block_narrowing_salvage — pass 1 clean (master
+   stored), pass 2 poisoned first block -> punch exactly [(0, 184320)],
+   round 2 refetches exactly that range (winner bytes_received=184320),
+   MD4-verified completion.  Mirrors PartFile.cpp
+   AICHRecoveryDataAvailable:7108-7221 (good blocks kept, corrupt
+   refetched).
+
+Suite: 352 passed, 3 skipped; compileall 0. Commit+push on user command.
+
+### 11p. ICS / block-selection recon [DONE — implementation next]
+
+1. Full ICS algorithm extracted from PartFile.cpp:7367-7521 (modes
+   RELEASE/SPREAD/SHARE with min_src 10/25, c_pref packing, sticky
+   m_lastPartAsked, GetNextEmptyBlockInPart block derivation, duplicate
+   guards IsAlreadyRequested/ShrinkToAvoidAlreadyRequested, frequency
+   maintenance :3644-3677). NO endgame mode exists in eMuleAI.
+2. Recon file: tmp/recon/ics-endgame.recon.md (porting notes included:
+   FILESTATUS parse already exists in codec:654; transfer() needs
+   gap-aware selection + a runner-level requested-range registry).
+3. A4AF (SwapToAnotherFile) lives in PartFile.cpp/DownloadQueue.cpp —
+   separate recon if implemented. UpDownClient.cpp absent from the
+   eMuleAI tree (FILESTATUS parsing recon impossible there).
+
+Implementation deferred to the next session (fresh start; the change
+spans transfer() + runner + client).
+
+
+
+## CURRENT POINTER (2026-09-27 late-3)
+
+Canonical resume state: docs/continuation-prompt.md, section
+"SESSION STATE (2026-09-27 late-3)" at the end of the file. ICS recon:
+tmp/recon/ics-endgame.recon.md. Suite: 352 passed / 3 skipped.
+Uncommitted: docs only (private). Next task: ICS implementation per the
+recon, then UDP obfuscation (roadmap 8.8.2).
+
+
+## Addendum 9 (2026-09-28 night): LIVE-вердикты, бан-политика eMuleAI, NIC-egress
+
+Полный LIVE download с реального eMuleAI 1.6.0: 46.7 MB / 5 частей / 255
+блоков, MD4-verified (loopback). ICS/A4AF стек live-proven. Реализовано и
+закоммичено: ICS (core/download/ics.py, 11p DONE), A4AF/NNS runner-гейт,
+UDP-обфускация (8.4.2), стабильная HELLO-identity, приём данных на
+EMULE-протоколе 0xC5 (данные приходят не только на EDONKEY 0xE3!), один
+STARTUPLOADREQ на сессию (aggressive-ban: 12 страйков/10 мин,
+UploadQueue.cpp:74-81), fork multi-part hashset [hash][count][parts],
+терминация сплиттера регионов (1 gap × N пиров = вечный цикл), shield-
+compliance guard (shield.conf: modstring/теги/никнеймы/дегенеративный
+userhash), свип фолбэк-логирования (21 сайт), IPC sources.save (CLI не
+может писать DuckDB при живом кернеле), NIC-egress bind (network.bind_ip
+мимо VPN TUN — иначе пиры видят туннельный IP и callback-путь мёртв),
+faulthandler watchdog, zombie cleanup лаунчера v2.2.0.
+
+Бан-политика eMuleAI (реконы emuleai-uploadqueue-aggressive,
+emuleai-preferences-bantime, emuleai-shield-conf в tmp/recon): бан 48
+ЧАСОВ, персистентен в clients.met; TrackedClientsList (clienthistory.met)
+ловит «Userhash changed» per-IP. Рестарты eMuleAI баны не снимают —
+чистить clients.met + clienthistory.met при остановленном eMuleAI.
+
+LIVE internet остаётся открытым: kad1 — obf-диал игнорируется
+(published-hash quality), plain-фолбэк добавлен, требуется перепрогон;
+kad3 — протухшие buddy-пары; NIC-egress реализован, проверить callback-
+путь на свежих записях. Реконы сессии: ics-filestatus-request/-client,
+ics-downloadclient, a4af-partfile/-downloadqueue/-clientlist/-
+downloadclient, udp-obfuscation-amule, emuleai-shield-conf,
+emuleai-uploadqueue-aggressive, emuleai-preferences-bantime.
+
+Suite: 395 passed / 3 skipped (до финальных правок ночи — пересчитать).
+Коммиты локальные, пуш по явной команде. Стиль таблиц статуса: markdown
+#|Задача|Состояние, маркеры ✅ (с коммит-хэшем) / 🚧 текущий шаг / ➡️
+очередь после N / ❌ (с причиной), после каждого полного прогона suite.
+
+### 11q. Session 15 (2026-09-28 day): LIVE rerun, loopback NIC-bind regression, 8.4.6 + endian verdicts
+
+1. **Suite regression fixed (9 tests)**: NIC-egress bind (0dd8081) pinned
+   loopback-bound UDP sockets to the physical NIC — Proactor sock_sendto to
+   127.0.0.1 from a NIC-bound socket fails with WinError 1214. Fix:
+   core/net/bind_ip.py 0.1.1 `resolve_bind_ip_for(host)` — loopback
+   destinations keep 0.0.0.0; direct_callback.py 0.2.1 socket_udp(host);
+   runner.py 0.9.4 loopback-aware NATT session start. Suite **395 passed /
+   3 skipped**, compileall 0.
+2. **LIVE internet rerun (kernel path)**: kad search → kad sources → IPC
+   sources.save (saved=6, 4 kad1 + 9 kad3 + 1 kad6 rows after SX merges).
+   Full mechanics verified live: obf-dial fallback fires on all kad1
+   ("DOWNLOAD obf dial fallback"), plain retry dials (peers close plain —
+   require-crypt/stale published hash, network quality, not a wire fault);
+   kad3 buddy-callback 0x52 → rendezvous with NATT sessions bound to
+   192.168.3.111 (NIC-egress live) → buddies silent (stale buddy↔target
+   pairs, FindServedBuddyByKadID drop — known quality condition). File
+   FEB84F29C858363B5E5FB81F85054559 (124 MB, multi-part) — incomplete,
+   zero bytes; all 14 endpoints network-blocked.
+3. **client.py 0.7.2**: constructor accepts plain_dial_ok (the runner
+   fallback retry crashed with "unexpected keyword argument" — live catch).
+4. **Roadmap 8.4.6 crypto_key persistence — CLOSED (no code)**: oracle
+   recon (EncryptedStreamSocket.cpp:470 DH ephemeral per handshake,
+   zeroized :637; no key files; only persisted input = userhash) — our
+   stack already parity (identity + SUI cryptkey.dat). Recon:
+   tmp/recon/crypto-key-and-udp-endian.recon.md.
+5. **UDP endian-swap decision — NO swap**: oracle EncryptedDatagramSocket.cpp
+   has no ENDIAN_SWAP anywhere (verify keys and magic host-LE on the wire,
+   :396-397/:298-299); our no-swap implementation is byte-exact eMuleAI and
+   live-consistent. aMule divergence documented, not followed.
+6. Ops traps recorded: uv venv trampoline (.venv\Scripts\python.exe ->
+   bin\uv-python interpreter) — killing the "shim" PID kills the kernel;
+   only kill leaf interpreter PIDs. Kernel launched via background_process
+   dies with the wrapper — keep the bgp session alive for the kernel's
+   lifetime.
+
+## CURRENT POINTER (2026-09-28 day)
+
+Canonical resume state: docs/continuation-prompt.md, конец файла, секция
+«SESSION STATE (2026-09-28 day)». Suite 395 passed / 3 skipped; uncommitted
+src fixes (bind_ip 0.1.1, direct_callback 0.2.1, runner 0.9.4, client 0.7.2,
+cli 0.6.2/kernel 0.4.0 IPC sources.save) + private docs. Next: eServer Buddy
+(optional); live kad3 needs fresh coherent buddy pairs (network condition).
