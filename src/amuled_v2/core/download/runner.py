@@ -8,9 +8,15 @@ part file via ``record_block`` and completion is finalized only when a
 peer delivers the whole file.
 
 src/amuled_v2/core/download/runner.py
-Version:     0.9.2
-Author:      Soror L'.L'.
+Version:     0.9.3
+Author:      Soror L.'.L.'.
 Updated:     2026-09-28
+
+Patch Notes v0.9.3 (Soror L'.L'.):
+  [+] _regions_from_gaps(): terminate when gap space is exhausted - with
+      peers > number of gap regions the old loop span forever on
+      zero-width takes (live 2026-09-28: 1 gap x 50 peers froze the
+      kernel event loop, found via faulthandler stack dump).
 
 Patch Notes v0.9.2 (Soror L'.L'.):
   [!] All silent `except Exception: pass` sites now log a tagged "runner
@@ -183,17 +189,32 @@ def _regions_from_gaps(
     idx = 0
     pos = gaps[0][0]
     for _ in range(peers):
+        # Termination guard (live 2026-09-28: 1 gap x 50 peers spun
+        # forever once the last gap was exhausted - take stayed 0 for
+        # every "surplus" peer).  No gap space left -> stop; surplus
+        # peers simply get no region.
+        if idx >= len(gaps):
+            break
         budget = per
         start = pos
         while budget > 0 and idx < len(gaps):
             gap_start, gap_end = gaps[idx]
             take = min(gap_end - pos, budget)
+            if take <= 0:
+                if idx + 1 < len(gaps):
+                    idx += 1
+                    pos = gaps[idx][0]
+                    continue
+                break
             pos += take
             budget -= take
             if pos >= gap_end and idx + 1 < len(gaps):
                 idx += 1
                 pos = gaps[idx][0]
-        regions.append((start, pos))
+        if pos > start:
+            regions.append((start, pos))
+        else:
+            break
     return regions
 
 

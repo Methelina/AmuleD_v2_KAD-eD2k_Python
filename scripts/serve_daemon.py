@@ -24,6 +24,7 @@ Patch Notes v0.3.0 (Soror L'.L'.):
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import sys
 
 from amuled_v2.core.kernel import run_kernel
@@ -60,6 +61,10 @@ def main() -> int:
         action="store_true",
         help="Disable the in-process KAD spider maturation loop.",
     )
+    # Watchdog (policy 2026-09-28): the kernel must never freeze silently.
+    # If the event loop stops progressing for 30 s, dump every thread's
+    # stack to stderr so the blocking frame is directly visible.
+    faulthandler.dump_traceback_later(30, repeat=True)
     return run_kernel(parser.parse_args())
 
 
