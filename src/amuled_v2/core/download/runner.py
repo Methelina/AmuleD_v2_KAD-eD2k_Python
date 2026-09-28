@@ -8,9 +8,15 @@ part file via ``record_block`` and completion is finalized only when a
 peer delivers the whole file.
 
 src/amuled_v2/core/download/runner.py
-Version:     0.9.3
+Version:     0.9.4
 Author:      Soror L.'.L.'.
 Updated:     2026-09-28
+
+Patch Notes v0.9.4 (Soror L'.L'.):
+  [+] _connect_via_rendezvous: loopback buddies start the NAT-T session on
+      127.0.0.1 (0.0.0.0 would take the NIC-egress pin, and a NIC-pinned
+      socket cannot send to 127.0.0.1 - WinError 1214; live 2026-09-28
+      suite regression).
 
 Patch Notes v0.9.3 (Soror L'.L'.):
   [+] _regions_from_gaps(): terminate when gap space is exhausted - with
@@ -135,7 +141,7 @@ from amuled_v2.logging_setup import LogTags, get_tagged_logger
 
 if TYPE_CHECKING:
     from amuled_v2.core.download.queue import DownloadQueue
-    from amuled_v2.core.peer.client import DownloadOutcome
+    from amuled_v2.core.peer.client import DownloadOutcome, PeerSessionError
 
 log = get_tagged_logger(LogTags.DOWNLOAD, "core.download.runner")
 
@@ -537,11 +543,22 @@ class DownloadRunner:
         port = int(endpoint["port"])
         user_hash = endpoint.get("user_hash")
         source_type = str(endpoint.get("source_type") or "")
+        log.info(
+            "DOWNLOAD peer attempt start: endpoint=%s:%d, source_type=%s, "
+            "has_userhash=%s",
+            host,
+            port,
+            source_type or "direct",
+            user_hash is not None,
+        )
         outcome: "DownloadOutcome | None" = None
         client = None
         closers: list[Callable[[], Any]] = []
         try:
-            from amuled_v2.core.peer.client import PeerClient
+            from amuled_v2.core.peer.client import (
+                PeerClient,
+                PeerSessionError,
+            )
 
             if source_type == "kad6":
                 client = await self._connect_via_direct_callback(endpoint)
@@ -594,7 +611,54 @@ class DownloadRunner:
                         else None
                     ),
                 )
-                await client.connect()
+                from amuled_v2.core.peer.client import PeerSessionError
+
+                try:
+                    await client.connect()
+                except PeerSessionError as exc:
+                    # Obfuscated dial fallback (eMule DownloadQueue.cpp
+                    # behaviour: obfuscate only when the key is known,
+                    # else dial plain - a KAD-published userhash does not
+                    # always match the peer's real GetUserHash, and such
+                    # peers silently ignore wrong magic; live 2026-09-28:
+                    # fresh kad1 sources all timed out at the BASIC
+                    # handshake while accepting TCP).
+                    if (
+                        user_hash is None
+                        or "BASIC handshake" not in str(exc)
+                        or not self.plain_dial_ok
+                    ):
+                        raise
+                    log.warning(
+                        "DOWNLOAD obf dial fallback: peer=%s:%d ignored the "
+                        "obfuscated handshake, retrying plain (peer likely "
+                        "accepts unobfuscated): error=%s",
+                        host,
+                        port,
+                        exc,
+                    )
+                    client = PeerClient(
+                        host,
+                        port,
+                        local_client_id=self.local_client_id,
+                        local_port=self.local_port,
+                        nickname=self.nickname,
+                        connect_timeout=self.peer_connect_timeout,
+                        response_timeout=self.peer_response_timeout,
+                        queue_wait_timeout=self.queue_wait_timeout,
+                        traffic_sink=self.traffic_sink,
+                        target_userhash=None,
+                        secure_ident=self.secure_ident,
+                        plain_dial_ok=True,
+                        local_userhash=(
+                            _coerce_userhash(
+                                self.callback_identity.get("user_hash")
+                            )
+                            if self.callback_identity
+                            else None
+                        ),
+                    )
+                    await client.connect()
             await client.handshake()
             hashset = await client.request_file(file_hash_bytes)
             try:
@@ -1182,7 +1246,16 @@ class DownloadRunner:
         ipv6_target = endpoint.get("ipv6")
         kad_udp_port = int(endpoint.get("kad_udp_port") or 0)
         session = NattUdpSession(bytes(ident["user_hash"]))
-        await session.start()
+        # Loopback buddy (loopback tests): keep the 0.0.0.0 bind - the
+        # NIC-egress pin cannot send to 127.0.0.1 (WinError 1214; live
+        # 2026-09-28 suite regression).
+        import ipaddress
+
+        try:
+            _loopback_buddy = ipaddress.ip_address(buddy_ip).is_loopback
+        except ValueError:
+            _loopback_buddy = False
+        await session.start(host="127.0.0.1" if _loopback_buddy else "0.0.0.0")
         if ipv6_target:
             # IPv6 target (eMuleAI "ip6" tag): dual-stack session and the
             # direct-punch rendezvous variant — endpoint hints are

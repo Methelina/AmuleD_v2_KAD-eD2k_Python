@@ -14,9 +14,18 @@ Implements the eMule-compatible download flow against one remote client:
    or the peer sends ``OP_END_OF_DOWNLOAD``.
 
 src/amuled_v2/core/peer/client.py
-Version:     0.7.1
+Version:     0.7.2
 Author:      Soror L.'.L.'.
 Updated:     2026-09-28
+
+Patch Notes v0.7.2 (Soror L'.L'.):
+  [+] Constructor accepts plain_dial_ok (default False) - the runner's
+      obf-dial fallback (runner.py 0.9.x) retries with
+      PeerClient(target_userhash=None, plain_dial_ok=True) when the peer
+      ignores the BASIC handshake; without the kwarg the fallback died with
+      "unexpected keyword argument" (live 2026-09-28).  Plain dial already
+      happens whenever target_userhash is None; the flag is accepted for
+      API parity and future gating.
 
 Patch Notes v0.7.1 (Soror L'.L'.):
   [+] transfer(): per-packet idle window inside data rounds widened to
@@ -278,6 +287,7 @@ class PeerClient:
         target_userhash: Optional[bytes] = None,
         local_userhash: Optional[bytes] = None,
         secure_ident: Optional[Any] = None,
+        plain_dial_ok: bool = False,
     ) -> None:
         self.host = host
         self.port = port
@@ -291,6 +301,7 @@ class PeerClient:
         # set, connect() performs the encrypted handshake and every frame
         # afterwards travels over the session's persistent RC4 streams.
         self.target_userhash = bytes(target_userhash) if target_userhash else None
+        self.plain_dial_ok = bool(plain_dial_ok)
         self._obf: Optional[BasicObfuscationSession] = None
         # Already-decrypted bytes that arrived together with the handshake
         # response; consumed exactly once by _read_exact().

@@ -15,9 +15,16 @@ public IP and the UPnP-forwarded port completes the callback path. This
 mirrors how a stock eMule operates on the same machine.
 
 src/amuled_v2/core/net/bind_ip.py
-Version:     0.1.0
+Version:     0.1.1
 Author:      Soror L.'.L.'.
 Updated:     2026-09-28
+
+Patch Notes v0.1.1 (Soror L'.L'.):
+  [+] resolve_bind_ip_for(host): loopback/link-local destinations keep the
+      0.0.0.0 bind - a socket pinned to a physical-NIC IP cannot send to
+      127.0.0.1 at all (Proactor sock_sendto fails with WinError 1214,
+      plain sendto with 10049; caught live 2026-09-28 when the NIC-egress
+      bind broke every loopback callback/rendezvous test).
 
 Patch Notes v0.1.0 (Soror L'.L'.):
   [+] resolve_bind_ip(): read ``network.bind_ip`` from config; validate it
@@ -27,6 +34,7 @@ Patch Notes v0.1.0 (Soror L'.L'.):
 
 from __future__ import annotations
 
+import ipaddress
 import socket
 
 from amuled_v2.config import load_config
@@ -34,7 +42,7 @@ from amuled_v2.logging_setup import LogTags, get_tagged_logger
 
 log = get_tagged_logger(LogTags.NAT, "core.net.bind_ip")
 
-__all__ = ["resolve_bind_ip"]
+__all__ = ["resolve_bind_ip", "resolve_bind_ip_for"]
 
 
 def _local_ipv4_set() -> set[str]:
@@ -77,3 +85,16 @@ def resolve_bind_ip() -> str | None:
         )
         return None
     return raw
+
+
+def resolve_bind_ip_for(host: str | None) -> str | None:
+    """Egress bind for traffic to ``host``: loopback destinations must NOT
+    be pinned to the physical NIC (see module note); everything else follows
+    ``resolve_bind_ip``."""
+    if host:
+        try:
+            if ipaddress.ip_address(host).is_loopback:
+                return None
+        except ValueError:
+            pass  # hostname, not a literal - keep the NIC bind
+    return resolve_bind_ip()

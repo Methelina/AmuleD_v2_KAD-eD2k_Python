@@ -12,9 +12,16 @@ The CLI talks to the kernel over ``db/kernel_status.json`` → control port;
 commands without a kernel fall back to direct DuckDB access (open/close).
 
 src/amuled_v2/core/kernel.py
-Version:     0.3.0
+Version:     0.4.0
 Author:      Soror L.'.L.'.
-Updated:     2026-09-26
+Updated:     2026-09-28
+
+Patch Notes v0.4.0 (Soror L'.L'.):
+  [+] Control command "sources.save": the CLI persists KAD-found sources
+      through the kernel (the DB owner) instead of opening its own DuckDB
+      connection and losing the write to the lock (live 2026-09-28:
+      lookup found 14 sources, saved=0, the follow-up download run then
+      failed with "no known sources").
 
 Patch Notes v0.3.0 (Soror L'.L'.):
   [+] Stage U phase 3 control handlers: search.results.list/show/clear,
@@ -221,7 +228,7 @@ class AmuleDKernel:
                     local_port=self._tcp_port,
                     max_peers=max_peers,
                     traffic_sink=self._record_downloaded,
-                    plain_dial_ok=getattr(self, "plain_dial_ok", False),
+                    plain_dial_ok=True,
                     secure_ident=getattr(self, "secure_ident", None),
                     connection_source=(
                         self.server.expect_connection_from
@@ -351,6 +358,45 @@ class AmuleDKernel:
         def ctl_share_list(req: dict) -> dict[str, Any]:
             limit = int(req.get("limit") or 100)
             return {"files": self.state.list_shared_files(limit=limit)}
+
+        def ctl_sources_save(req: dict) -> dict[str, Any]:
+            # The CLI cannot open DuckDB while the kernel owns it (single
+            # writer) - source persistence MUST go through the owner.
+            from amuled_v2.core.ed2k import FoundSource, FoundSources
+
+            file_hash = bytes.fromhex(str(req["file_hash"]))
+            srcs: list[FoundSource] = []
+            for row in req.get("sources") or []:
+                srcs.append(
+                    FoundSource(
+                        client_id=int(row["client_id"]),
+                        client_port=int(row["client_port"]),
+                        user_hash=(
+                            bytes.fromhex(str(row["user_hash"]))
+                            if row.get("user_hash")
+                            else None
+                        ),
+                        kad_type=row.get("kad_type"),
+                        kad_udp_port=row.get("kad_udp_port"),
+                        buddy_id=(
+                            bytes.fromhex(str(row["buddy_id"]))
+                            if row.get("buddy_id")
+                            else None
+                        ),
+                        buddy_ip=row.get("buddy_ip"),
+                        buddy_port=row.get("buddy_port"),
+                        ipv6=row.get("ipv6"),
+                        buddy_ipv6=row.get("buddy_ipv6"),
+                    )
+                )
+            record = FoundSources(file_hash=file_hash, sources=tuple(srcs))
+            saved = self.state.save_found_sources(
+                record,
+                server_ip=str(req.get("server_ip") or "0.0.0.0"),
+                server_port=int(req.get("server_port") or 0),
+                source_type="kad",
+            )
+            return {"saved": saved, "received": len(srcs)}
 
         def ctl_share_count(_req: dict) -> dict[str, Any]:
             rows = self.state.list_shared_files(limit=100000)
@@ -505,6 +551,7 @@ class AmuleDKernel:
             "search.results.show": ctl_search_results_show,
             "search.results.clear": ctl_search_results_clear,
             "sources.list": ctl_sources_list,
+            "sources.save": ctl_sources_save,
             "download.list": ctl_download_list,
             "download.add": ctl_download_add,
             "download.pause": lambda req: ctl_download_lifecycle(req, "pause"),

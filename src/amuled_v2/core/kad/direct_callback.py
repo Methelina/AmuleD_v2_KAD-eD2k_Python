@@ -8,9 +8,15 @@ the firewalled source then makes an OUTBOUND TCP connection to us, which
 the download side accepts on our advertised port.
 
 src/amuled_v2/core/kad/direct_callback.py
-Version:     0.2.0
+Version:     0.2.1
 Author:      Soror L.'.L.'.
-Updated:     2026-09-27
+Updated:     2026-09-28
+
+Patch Notes v0.2.1 (Soror L'.L'.):
+  [+] socket_udp(host): loopback destinations keep the 0.0.0.0 bind - the
+      NIC-egress pin (network.bind_ip) made Proactor sock_sendto to
+      127.0.0.1 fail with WinError 1214, breaking every loopback
+      callback/rendezvous path (live 2026-09-28 suite regression).
 
 Patch Notes v0.2.0 (Soror L'.L'.):
   [+] Rendezvous payload wire-diff fixes (BaseClient.cpp:3147-3196):
@@ -102,7 +108,7 @@ async def send_direct_callback_req(
         + bytes((DIRECT_CALLBACK_OPCODE,))
         + payload
     )
-    sock = socket_udp()
+    sock = socket_udp(host)
     try:
         for attempt in range(1, attempts + 1):
             await loop.sock_sendto(sock, wire, (host, kad_udp_port))
@@ -117,20 +123,22 @@ async def send_direct_callback_req(
         sock.close()
 
 
-def socket_udp():
+def socket_udp(host: str | None = None):
     """Fresh non-blocking UDP socket for the callback request.
 
     Binds to ``network.bind_ip`` (physical NIC) when configured: the peer
     answers a callback by connecting to this datagram's SOURCE address, so
     the egress interface decides reachability (VPN TUN default routes make
-    0.0.0.0 egress unreachable for callbacks; live 2026-09-28).
+    0.0.0.0 egress unreachable for callbacks; live 2026-09-28).  Loopback
+    destinations keep the 0.0.0.0 bind - a NIC-pinned socket cannot send to
+    127.0.0.1 at all (WinError 1214/10049; caught live 2026-09-28).
     """
     import socket
 
-    from amuled_v2.core.net.bind_ip import resolve_bind_ip
+    from amuled_v2.core.net.bind_ip import resolve_bind_ip_for
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    bind_ip = resolve_bind_ip()
+    bind_ip = resolve_bind_ip_for(host)
     if bind_ip:
         try:
             sock.bind((bind_ip, 0))
@@ -206,7 +214,7 @@ async def send_kad_callback_req(
         + bytes((KAD_CALLBACK_REQ_OPCODE,))
         + payload
     )
-    sock = socket_udp()
+    sock = socket_udp(host)
     try:
         for attempt in range(1, attempts + 1):
             await loop.sock_sendto(sock, wire, (host, buddy_udp_port))
@@ -302,7 +310,7 @@ async def send_rendezvous_req(
         + bytes((REASK_CALLBACK_UDP_OPCODE,))
         + payload
     )
-    sock = socket_udp()
+    sock = socket_udp(host)
     try:
         for attempt in range(1, attempts + 1):
             await loop.sock_sendto(sock, wire, (host, buddy_udp_port))

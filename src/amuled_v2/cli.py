@@ -17,15 +17,19 @@ Dependencies (duckdb, rich) are optional at runtime; ``--help`` works without
 them installed.  Network protocol sessions are not started by share commands.
 
 src/amuled_v2/cli.py
-Version:     0.6.1
+Version:     0.6.2
 Author:      Soror L.'.L.'.
-Updated:     2026-09-27
+Updated:     2026-09-28
+
+Patch Notes v0.6.2 (Soror L'.L'.):
+  [+] kad sources: persist found sources through the kernel control
+      socket ("sources.save") - the CLI cannot open DuckDB while the
+      kernel owns the writer lock, the direct write lost that race
+      silently (live 2026-09-28: sources=14, saved=0, the follow-up
+      download run failed with "no known sources").  Direct write stays
+      as a logged fallback for kernel-down sessions.
 
 Patch Notes v0.6.1 (Soror L'.L'.):
-  [+] kad sources: populate per-source FoundSource.buddy_ip/buddy_port
-      so every KAD type-3/5 row keeps its own serving buddy on save.
-
-Patch Notes v0.6.0 (Soror L.'.L'.):
   [+] Stage U phase 3: search results/sources/download list+add/servers
       failures/ipfilter status route over kernel IPC first, falling back to
       direct DuckDB when the kernel is down.
@@ -1338,20 +1342,75 @@ async def _run_kad_sources(args: argparse.Namespace) -> dict:
         record = FoundSources(
             file_hash=file_hash, sources=tuple(found_sources)
         )
-        try:
-            state = get_state()
-            state.connect()
-            saved = state.save_found_sources(
-                record,
-                server_ip=first_buddy.buddy_ip if first_buddy else "0.0.0.0",
-                server_port=first_buddy.buddy_port or 0 if first_buddy else 0,
-                source_type="kad",
-            )
-        except Exception as exc:
-            # Persistence must never eat live source results (e.g. DuckDB
-            # held open by the kad spider process).
-            save_error = f"{type(exc).__name__}: {exc}"
-            log.warning(f"KAD source persistence failed: {save_error}")
+        # Persistence routing (live 2026-09-28): the kernel owns the DuckDB
+        # writer lock - a direct CLI write loses the race silently
+        # ("sources=14, saved=0" -> the next download run fails with
+        # "no known sources").  Route through the kernel control socket
+        # first; fall back to a direct write only when the kernel is down.
+        ipc_sources = [
+            {
+                "client_id": s.client_id,
+                "client_port": s.client_port,
+                "user_hash": s.user_hash.hex() if s.user_hash else None,
+                "kad_type": s.kad_type,
+                "kad_udp_port": s.kad_udp_port,
+                "buddy_id": s.buddy_id.hex() if s.buddy_id else None,
+                "buddy_ip": s.buddy_ip,
+                "buddy_port": s.buddy_port,
+                "ipv6": s.ipv6,
+                "buddy_ipv6": s.buddy_ipv6,
+            }
+            for s in found_sources
+        ]
+        # _run_kad_sources runs inside asyncio.run() - use the async
+        # control_request; the sync wrapper would raise
+        # "asyncio.run() cannot be called from a running event loop".
+        from amuled_v2.core.kernel_control import (
+            control_request as _async_control_request,
+            read_kernel_status as _read_kernel_status,
+        )
+
+        ipc_response = None
+        _status = _read_kernel_status()
+        if _status is not None:
+            try:
+                ipc_response = await _async_control_request(
+                    int(_status["control_port"]),
+                    {
+                        "command": "sources.save",
+                        "file_hash": file_hash.hex(),
+                        "sources": ipc_sources,
+                        "server_ip": (
+                            first_buddy.buddy_ip if first_buddy else "0.0.0.0"
+                        ),
+                        "server_port": (
+                            first_buddy.buddy_port or 0 if first_buddy else 0
+                        ),
+                    },
+                )
+            except (OSError, ConnectionError, TimeoutError, ValueError) as exc:
+                # FALLBACK (policy: every fallback is logged).
+                log.warning(
+                    "KAD source save via kernel fallback: kernel control "
+                    "unreachable, writing directly: error=%r",
+                    exc,
+                )
+        if ipc_response is not None and "saved" in ipc_response:
+            saved = int(ipc_response["saved"])
+        else:
+            try:
+                state = get_state()
+                state.connect()
+                saved = state.save_found_sources(
+                    record,
+                    server_ip=first_buddy.buddy_ip if first_buddy else "0.0.0.0",
+                    server_port=first_buddy.buddy_port or 0 if first_buddy else 0,
+                    source_type="kad",
+                )
+            except Exception as exc:
+                # FALLBACK (policy: every fallback is logged).
+                save_error = f"{type(exc).__name__}: {exc}"
+                log.warning(f"KAD source persistence failed: {save_error}")
     result = {
         "status": "ok",
         "hash": args.hash.upper(),
