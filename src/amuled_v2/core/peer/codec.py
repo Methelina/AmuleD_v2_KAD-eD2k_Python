@@ -29,9 +29,15 @@ Opcodes covered by this module:
     OP_COMPRESSEDPART_I64 0xA1  compressed sending part (u64 start/end)
 
 src/amuled_v2/core/peer/codec.py
-Version:     0.3.0
-Author:      Soror L.'.L'.
-Updated:     2026-09-27
+Version:     0.3.1
+Author:      Soror L.'.L.'.
+Updated:     2026-09-28
+
+Patch Notes v0.3.1 (Soror L'.L'.):
+  [+] parse_hashset_answer: eMuleAI fork MULTI-part layout
+      [file_hash 16][count u16][count x part_hash] accepted (verified
+      live 2026-09-28: 98-byte answer for a 5-part file from a real
+      eMuleAI 1.6.0 peer); canonical and single-part fork forms unchanged.
 
 Patch Notes v0.3.0 (Soror L'.L'.):
   [+] HELLO extra_tags: build_hello_payload/_write_hello_body accept additional tags; _write_hello_tag writes bytes values as TAGTYPE_HASH (0x01) - needed for CT_EMULE_SERVINGBUDDYID (0xBF) served-buddy registration.
@@ -622,6 +628,28 @@ def parse_hashset_answer(payload: bytes) -> HashSetAnswer:
             "HASHSETANSWER: eMuleAI fork layout detected "
             "(hash first, trailing counter)"
         )
+    if hashes is None and len(payload) > _HASH16_SIZE + 2:
+        # eMuleAI fork MULTI-part form (verified live 2026-09-28: a
+        # 98-byte answer for a 5-part file):
+        #   [file hash 16][count u16 LE][count x part hash 16]
+        # i.e. the same inverted layout as the single-part fork form,
+        # with the part hashes following the counter.
+        fork_count = (len(payload) - _HASH16_SIZE - 2) // _HASH16_SIZE
+        if (
+            fork_count >= 1
+            and len(payload) == _HASH16_SIZE + 2 + fork_count * _HASH16_SIZE
+            and struct.unpack_from("<H", payload, _HASH16_SIZE)[0] == fork_count
+        ):
+            hashes = [payload[:_HASH16_SIZE]] + [
+                payload[_HASH16_SIZE + 2 + i * _HASH16_SIZE:
+                        _HASH16_SIZE + 2 + (i + 1) * _HASH16_SIZE]
+                for i in range(fork_count)
+            ]
+            log.debug(
+                "HASHSETANSWER: eMuleAI fork multi-part layout detected "
+                "(hash first, count, %d part hashes)",
+                fork_count,
+            )
     if not hashes:
         raise PeerCodecError(
             f"malformed OP_HASHSETANSWER: length {len(payload)} fits no known layout"

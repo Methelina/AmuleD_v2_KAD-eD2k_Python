@@ -14,9 +14,16 @@ Implements the eMule-compatible download flow against one remote client:
    or the peer sends ``OP_END_OF_DOWNLOAD``.
 
 src/amuled_v2/core/peer/client.py
-Version:     0.7.0
+Version:     0.7.1
 Author:      Soror L.'.L.'.
 Updated:     2026-09-28
+
+Patch Notes v0.7.1 (Soror L'.L'.):
+  [+] transfer(): per-packet idle window inside data rounds widened to
+      response_timeout * 3 - a throttled uploader can need >20 s for the
+      first SENDINGPART after the slot grant (live evidence 2026-09-28:
+      eMuleAI pushed 398 KB over 20 s while the 20 s idle timeout cut the
+      session at received=0).  Control-phase timeouts unchanged.
 
 Patch Notes v0.7.0 (Soror L'.L'.):
   [+] ICS: part-status capture — OP_FILESTATUS (0x50) parsed at every
@@ -1201,8 +1208,15 @@ class PeerClient:
                     e - s for s, e in zip(starts, ends) if s < e
                 )
                 while expected_bytes > 0:
+                    # Data rounds get a wider per-packet idle window than the
+                    # control phase: a throttled uploader can take >20 s to
+                    # push the first SENDINGPART after the slot grant (live
+                    # evidence 2026-09-28: eMuleAI 1.6.0 sent 398 KB over
+                    # 20 s while a 20 s idle timeout cut the session at
+                    # received=0 — the kill raced the first data frame).
                     packet = await self._receive(
-                        timeout=self.response_timeout, close_on_timeout=False
+                        timeout=self.response_timeout * 3,
+                        close_on_timeout=False,
                     )
                     if packet is None:
                         self._maybe_credit_downloaded(received)

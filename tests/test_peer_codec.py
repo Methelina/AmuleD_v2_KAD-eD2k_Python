@@ -130,6 +130,23 @@ def test_hashset_answer_round_trip() -> None:
         parse_hashset_answer(truncated)
 
 
+def test_hashset_answer_emuleai_fork_multi_part() -> None:
+    """eMuleAI 1.6.0 sends multi-part hashsets inverted:
+    [file hash 16][count u16][count x part hash] (verified live
+    2026-09-28: 98-byte answer for a 5-part file)."""
+    part_hashes = [bytes([i] * 16) for i in range(1, 6)]
+    writer = BinaryWriter()
+    writer.write_hash16(_HASH16_A)
+    writer.write_u16(len(part_hashes))
+    for ch in part_hashes:
+        writer.write_hash16(ch)
+    payload = writer.to_bytes()
+    assert len(payload) == 98  # the exact live shape
+    answer = parse_hashset_answer(payload)
+    assert answer.file_hash == _HASH16_A
+    assert tuple(answer.chunk_hashes) == tuple(part_hashes)
+
+
 def test_file_status_round_trip() -> None:
     chunk_count = 9
     bit_array = bytearray((chunk_count + 7) // 8)

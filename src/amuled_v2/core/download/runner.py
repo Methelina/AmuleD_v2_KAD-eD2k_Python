@@ -8,9 +8,17 @@ part file via ``record_block`` and completion is finalized only when a
 peer delivers the whole file.
 
 src/amuled_v2/core/download/runner.py
-Version:     0.9.0
-Author:      Soror L.'.L'.
+Version:     0.9.1
+Author:      Soror L.'.L.'.
 Updated:     2026-09-28
+
+Patch Notes v0.9.1 (Soror L'.L'.):
+  [+] Stable HELLO identity: PeerClient now receives local_userhash from
+      callback_identity (persistent KAD identity).  Live evidence
+      2026-09-28: eMuleAI 1.6.0 bans "Userhash changed"
+      (TrackedClientsList / <Ban> [Bad user hash]) when a peer presents
+      os.urandom(16) per connection - repeated dials were FINned at the
+      BASIC handshake.
 
 Patch Notes v0.9.0 (Soror L'.L'.):
   [+] Runner-level A4AF/NNS gate (stateless-session equivalent of eMule's
@@ -140,6 +148,16 @@ def _row_is_kad_callback(row: dict) -> bool:
 def _row_not_directly_dialable(row: dict) -> bool:
     """True when a row may not be used for a DIRECT (SX answer) endpoint."""
     return str(row.get("source_type") or "").lower() in _KAD_UNDIALABLE_TYPES
+
+
+def _coerce_userhash(value) -> bytes | None:
+    """callback_identity user_hash arrives as bytes or a hex string."""
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    text = str(value)
+    return bytes.fromhex(text) if text else None
 
 
 def _regions_from_gaps(
@@ -537,19 +555,19 @@ class DownloadRunner:
                     traffic_sink=self.traffic_sink,
                     target_userhash=user_hash,
                     secure_ident=self.secure_ident,
+                    # Stable HELLO identity (live evidence 2026-09-28:
+                    # eMuleAI bans "Userhash changed" via TrackedClientsList
+                    # when a peer presents a different userhash per
+                    # connection — os.urandom(16) per PeerClient is a ban).
+                    # The runner's callback_identity carries the same
+                    # persistent identity the KAD spider publishes.
+                    local_userhash=(
+                        _coerce_userhash(self.callback_identity.get("user_hash"))
+                        if self.callback_identity
+                        else None
+                    ),
                 )
                 await client.connect()
-            await client.handshake()
-            hashset = await client.request_file(file_hash_bytes)
-            try:
-                # Stage X source exchange: ask the peer for additional
-                # sources; answers are collected asynchronously and
-                # persisted in the finally block below.
-                await client.request_sources(file_hash_bytes)
-            except Exception as exc:
-                log.debug(
-                    "DOWNLOAD source exchange request failed: error=%s", exc
-                )
             await client.handshake()
             hashset = await client.request_file(file_hash_bytes)
             try:
