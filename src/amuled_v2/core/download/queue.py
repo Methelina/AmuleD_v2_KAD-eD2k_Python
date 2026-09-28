@@ -9,13 +9,13 @@ Version:     0.2.1
 Author:      Soror L.'.L.'.
 Updated:     2026-09-28
 
-Patch Notes v0.2.1 (Soror L'.L'.):
+Patch Notes v0.2.1 (Soror L.'.L'.):
   [+] _file_hash(): verify with the eD2K root hash (MD4 of concatenated
       part-MD4s for multi-part files) instead of a bare whole-file MD4.
       For single-part files both coincide, which is why finalize(verify)
       silently passed on < 9.7 MB files and failed on multi-part ones.
 
-Patch Notes v0.2.0 (Soror L'.L'.):
+Patch Notes v0.2.0 (Soror L.'.L'.):
   [+] gap_ranges(): remaining hole ranges of the part file - input for
       the runner's stalled-stripe reassignment rounds.
 
@@ -68,6 +68,9 @@ class DownloadQueue:
     state: "StateBackend"
     temp_dir: Path
     incoming_dir: Path
+    # Sparse part files: skip the full-size preallocation (eMule
+    # SparsePartFiles analog; config download.sparse_part_files).
+    sparse_part_files: bool = False
 
     def _normalize_hash(self, file_hash: str) -> str:
         normalized = file_hash.strip().lower()
@@ -101,7 +104,10 @@ class DownloadQueue:
         from amuled_v2.core.download.partfile import PartFile
 
         part_path = self.temp_dir / f"{normalized}.part"
-        part = PartFile(part_path, size, normalized, name)
+        part = PartFile(
+            part_path, size, normalized, name,
+            sparse=self.sparse_part_files,
+        )
         part.open_new()
         part.close()
         self.state.add_download(

@@ -12,22 +12,43 @@ The CLI talks to the kernel over ``db/kernel_status.json`` → control port;
 commands without a kernel fall back to direct DuckDB access (open/close).
 
 src/amuled_v2/core/kernel.py
-Version:     0.4.0
+Version:     0.4.2
 Author:      Soror L.'.L.'.
 Updated:     2026-09-28
 
-Patch Notes v0.4.0 (Soror L'.L'.):
+Patch Notes v0.4.2 (Soror L.'.L'.):
+  [+] eMule periodic source re-ask + re-dial (roadmap 11r P3 №9): a
+      kernel loop (kademlia.reask_interval_s, default 300s) refreshes KAD
+      sources for every queued/download entry via the ephemeral-runtime
+      lookup (same path as the CLI, executor-driven) and re-launches a
+      race for entries whose previous race finished incomplete.  A thin
+      source pool (<3 rows) now also triggers an automatic KAD refresh
+      BEFORE the first dial - the "run with zero sources" failure mode is
+      gone without any manual source injection.
+
+Patch Notes v0.4.1 (Soror L.'.L'.):
+  [+] Config parity wiring (roadmap 11r): the listener receives
+      network.max_conn_per_5s (connection rate limit) and the download
+      queue receives download.sparse_part_files; both resolved from the
+      live config with logged fallbacks to the documented defaults.
+  [+] ipfilter auto-update loop: when ipfilter.auto_update and
+      ipfilter.update_url are configured, the kernel refreshes the filter
+      list every update_period_days (last-update stamp in
+      db\\ipfilter_update.json; refresh failures keep the existing list,
+      logged per the fallback policy).
+
+Patch Notes v0.4.0 (Soror L.'.L'.):
   [+] Control command "sources.save": the CLI persists KAD-found sources
       through the kernel (the DB owner) instead of opening its own DuckDB
       connection and losing the write to the lock (live 2026-09-28:
       lookup found 14 sources, saved=0, the follow-up download run then
       failed with "no known sources").
 
-Patch Notes v0.3.0 (Soror L'.L'.):
+Patch Notes v0.3.0 (Soror L.'.L'.):
   [+] Stage U phase 3 control handlers: search.results.list/show/clear,
       sources.list, download.list/add, servers.failures, ipfilter.status —
       read-only CLI now works under a live kernel (no DuckDB lock fight).
-Patch Notes v0.2.0 (Soror L'.L'.):
+Patch Notes v0.2.0 (Soror L.'.L'.):
   [+] AmuleDKernel: owned StateBackend (permanent connection), SpiderEngine
       task, listener traffic recorder on the owned backend, republish loop,
       control handlers (status/spider.status/credits.*/share.list/stop).
@@ -197,8 +218,26 @@ class AmuleDKernel:
         """DownloadQueue on the OWNED state connection (no re-open)."""
         from amuled_v2.core.download.queue import DownloadQueue
 
+        # download.sparse_part_files (roadmap 11r): resolved per call so a
+        # config edit is picked up without a kernel restart; on failure the
+        # documented default (preallocate) applies via the empty dict.
+        try:
+            from amuled_v2.config import load_config
+
+            _dl_cfg = (load_config().get("download") or {})
+        except Exception as exc:
+            log.warning(
+                "kernel fallback: config load failed for download knobs, "
+                "using defaults: error=%r",
+                exc,
+            )
+            _dl_cfg = {}
+
         return DownloadQueue(
-            state=self.state, temp_dir=TEMP_DIR, incoming_dir=INCOMING_DIR
+            state=self.state,
+            temp_dir=TEMP_DIR,
+            incoming_dir=INCOMING_DIR,
+            sparse_part_files=bool(_dl_cfg.get("sparse_part_files")),
         )
 
     def _start_download_task(self, file_hash: str, max_peers: int) -> dict[str, Any]:
@@ -222,6 +261,47 @@ class AmuleDKernel:
             from amuled_v2.core.download.runner import DownloadRunner
 
             try:
+                # eMule auto-source-refresh (roadmap 11r P3 №9): a thin
+                # source pool triggers an immediate KAD lookup BEFORE the
+                # first dial - the "run with zero sources" failure dies here.
+                try:
+                    known = len(
+                        self.state.list_file_sources(file_hash, limit=1000)
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "kernel fallback: source count failed, skipping "
+                        "thin-pool refresh: hash=%s, error=%r",
+                        file_hash,
+                        exc,
+                    )
+                    known = 99
+                if known < 3:
+                    log.info(
+                        "DOWNLOAD thin source pool: hash=%s, known=%d - "
+                        "refreshing from KAD before racing",
+                        file_hash,
+                        known,
+                    )
+                    try:
+                        found, saved = await self._refresh_sources_async(
+                            file_hash, int(entry["size"])
+                        )
+                        log.info(
+                            "DOWNLOAD thin-pool refresh done: hash=%s, "
+                            "found=%d, saved=%d",
+                            file_hash,
+                            found,
+                            saved,
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "kernel fallback: thin-pool KAD refresh failed, "
+                            "racing with the current pool: hash=%s, "
+                            "error=%r",
+                            file_hash,
+                            exc,
+                        )
                 queue = self._download_queue()
                 runner = DownloadRunner(
                     queue,
@@ -259,6 +339,118 @@ class AmuleDKernel:
         task.add_done_callback(self._download_tasks.discard)
         log.info("download task started: hash=%s, max_peers=%d", file_hash, max_peers)
         return {"started": True, "hash": file_hash}
+
+    async def _refresh_sources_async(self, file_hash: str, size: int) -> tuple[int, int]:
+        """One live KAD source lookup + persist.  Architecture invariant
+        (AGENTS.md 2026-09-28): lookups run IN-KERNEL over the spider's
+        mature pool routing - the ephemeral-runtime CLI path (bootstrap +
+        41-contact tree) starved lookups and is no longer used here."""
+        from amuled_v2.core.ed2k import FoundSource, FoundSources
+        from amuled_v2.core.kad.source_search import kad_file_source_search
+
+        if self.spider is None:
+            raise RuntimeError("spider disabled - source refresh unavailable")
+        report = await kad_file_source_search(
+            bytes.fromhex(file_hash),
+            file_size=size,
+            routing=self.spider.pool_routing(),
+            own_id=self.spider.own,
+            own_tcp_port=self._tcp_port,
+            timeout=30,
+            max_sources=200,
+            local_port=0,
+        )
+        record = FoundSources(
+            file_hash=bytes.fromhex(file_hash),
+            sources=tuple(
+                FoundSource(
+                    client_id=s.client_id,
+                    client_port=s.tcp_port,
+                    user_hash=None,
+                    kad_type=s.source_type or None,
+                    kad_udp_port=s.udp_port,
+                    buddy_id=None,
+                    buddy_ip=s.buddy_ip,
+                    buddy_port=s.buddy_port,
+                )
+                for s in report.sources
+            ),
+        )
+        saved = self.state.save_found_sources(
+            record, server_ip="0.0.0.0", server_port=0, source_type="kad"
+        )
+        return len(report.sources), saved
+
+    async def _source_refresh_loop(self) -> None:
+        """eMule periodic source re-ask + re-dial (roadmap 11r P3 №9,
+        eMule ReAskTime analog): every interval, refresh KAD sources for
+        every queued/download entry and re-launch a race for entries whose
+        previous race finished incomplete."""
+        try:
+            from amuled_v2.config import load_config
+
+            interval = float(
+                (load_config().get("kademlia") or {}).get("reask_interval_s")
+                or 300
+            )
+        except Exception as exc:
+            log.warning(
+                "kernel fallback: config load failed for reask interval, "
+                "using 300s: error=%r",
+                exc,
+            )
+            interval = 300.0
+        interval = max(60.0, interval)
+        log.info("DOWNLOAD source re-ask loop: interval=%.0fs", interval)
+        while not self.stop.is_set():
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+            if self.stop.is_set():
+                return
+            queue = self._download_queue()
+            try:
+                entries = queue.list(limit=200)
+            except Exception as exc:
+                log.warning("kernel fallback: download list failed: error=%r", exc)
+                continue
+            for entry in entries:
+                if self.stop.is_set():
+                    return
+                status = str(entry.get("status"))
+                fhash = str(entry.get("file_hash"))
+                if status not in ("queued", "downloading"):
+                    continue
+                try:
+                    found, saved = await self._refresh_sources_async(
+                        fhash, int(entry["size"])
+                    )
+                    log.info(
+                        "DOWNLOAD source re-ask: hash=%s, found=%d, saved=%d",
+                        fhash,
+                        found,
+                        saved,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "DOWNLOAD re-ask fallback: KAD lookup failed, "
+                        "skipping this cycle: hash=%s, error=%r",
+                        fhash,
+                        exc,
+                    )
+                    continue
+                box = self.download_box.get(fhash)
+                if saved > 0 and (box is None or box.get("done")):
+                    # Re-dial: the previous race finished incomplete; new
+                    # sources (or simply time passed) warrant another pass.
+                    log.info(
+                        "DOWNLOAD re-dial: hash=%s (race idle, fresh "
+                        "sources=%d)",
+                        fhash,
+                        saved,
+                    )
+                    self._start_download_task(fhash, 50)
 
     async def _publish_sources_once(self) -> dict[str, Any]:
         """KAD source-publish pass advertising our bound TCP port."""
@@ -397,6 +589,94 @@ class AmuleDKernel:
                 source_type="kad",
             )
             return {"saved": saved, "received": len(srcs)}
+
+        async def ctl_kad_search(req: dict) -> dict[str, Any]:
+            """In-kernel keyword search over the spider's live pool (the
+            ephemeral-runtime CLI path queries 6-9 stale contacts and often
+            starves; the pool routing walks 1000+ maturing nodes)."""
+            from amuled_v2.core.kad.search import kad_keyword_search
+
+            if self.spider is None:
+                return {"status": "error", "reason": "spider disabled"}
+            query = str(req.get("query") or "").strip()
+            timeout = float(req.get("timeout") or 45)
+            if not query:
+                return {"status": "error", "reason": "query is empty"}
+
+            report = await kad_keyword_search(
+                query,
+                routing=self.spider.pool_routing(),
+                own_id=self.spider.own,
+                own_tcp_port=self._tcp_port,
+                timeout=timeout,
+            )
+            return {
+                "status": "ok",
+                "query": query,
+                "queried_nodes": report.queried_nodes,
+                "responded_nodes": report.responded_nodes,
+                "results": [
+                    {
+                        "hash": r.file_hash.hex().upper(),
+                        "name": r.name,
+                        "size": int(r.size),
+                        "sources": int(r.sources),
+                    }
+                    for r in report.results
+                ],
+            }
+
+        async def ctl_kad_sources(req: dict) -> dict[str, Any]:
+            """In-kernel KAD source lookup over the spider's live pool;
+            rows are persisted directly (the kernel owns the state)."""
+            from amuled_v2.core.ed2k import FoundSource, FoundSources
+            from amuled_v2.core.kad.source_search import kad_file_source_search
+
+            if self.spider is None:
+                return {"status": "error", "reason": "spider disabled"}
+            file_hash = str(req.get("file_hash") or "").upper()
+            if len(file_hash) != 32:
+                return {"status": "error", "reason": "bad file hash"}
+            size = int(req.get("size") or 0)
+            timeout = float(req.get("timeout") or 40)
+
+            report = await kad_file_source_search(
+                bytes.fromhex(file_hash),
+                file_size=size or None,
+                routing=self.spider.pool_routing(),
+                own_id=self.spider.own,
+                own_tcp_port=self._tcp_port,
+                timeout=timeout,
+                max_sources=200,
+                local_port=0,
+            )
+            record = FoundSources(
+                file_hash=bytes.fromhex(file_hash),
+                sources=tuple(
+                    FoundSource(
+                        client_id=s.client_id,
+                        client_port=s.tcp_port,
+                        user_hash=None,
+                        kad_type=s.source_type or None,
+                        kad_udp_port=s.udp_port,
+                        buddy_id=None,
+                        buddy_ip=s.buddy_ip,
+                        buddy_port=s.buddy_port,
+                    )
+                    for s in report.sources
+                ),
+            )
+            saved = self.state.save_found_sources(
+                record, server_ip="0.0.0.0", server_port=0,
+                source_type="kad",
+            )
+            return {
+                "status": "ok",
+                "hash": file_hash,
+                "source_count": len(report.sources),
+                "saved_sources": int(saved),
+                "sources": [s.to_dict() for s in report.sources],
+            }
 
         def ctl_share_count(_req: dict) -> dict[str, Any]:
             rows = self.state.list_shared_files(limit=100000)
@@ -552,6 +832,8 @@ class AmuleDKernel:
             "search.results.clear": ctl_search_results_clear,
             "sources.list": ctl_sources_list,
             "sources.save": ctl_sources_save,
+            "kad.search": ctl_kad_search,
+            "kad.sources": ctl_kad_sources,
             "download.list": ctl_download_list,
             "download.add": ctl_download_add,
             "download.pause": lambda req: ctl_download_lifecycle(req, "pause"),
@@ -584,6 +866,23 @@ class AmuleDKernel:
             self.state.db_path, self.state.backend,
         )
 
+        # Config parity (roadmap 11r): connection rate limit and sparse part
+        # files come from network.max_conn_per_5s / download.sparse_part_files;
+        # a config problem degrades to the documented defaults (logged).
+        try:
+            from amuled_v2.config import load_config
+
+            _cfg = load_config()
+        except Exception as exc:
+            log.warning(
+                "kernel fallback: config load failed, using defaults for "
+                "listener/queue knobs: error=%r",
+                exc,
+            )
+            _cfg = {}
+        _net_cfg = _cfg.get("network") or {}
+        _dl_cfg = _cfg.get("download") or {}
+
         self.server = IncomingPeerServer(
             identity=identity.to_local_identity(),
             resolver=StateSharedFileResolver(lambda: self.state),
@@ -592,6 +891,7 @@ class AmuleDKernel:
             port=tcp_port,
             throttle=throttle,
             max_connections=self.max_sessions,
+            max_conn_per_5s=int(_net_cfg.get("max_conn_per_5s") or 0),
             traffic_recorder=self._record_uploaded,
             secure_ident=getattr(self, "secure_ident", None),
             source_provider=self._source_provider,
@@ -658,6 +958,11 @@ class AmuleDKernel:
 
             rotation_task = asyncio.create_task(_rotate(), name="slot-rotation")
 
+        # eMule periodic source re-ask + re-dial (roadmap 11r P3 №9).
+        reask_task = asyncio.create_task(
+            self._source_refresh_loop(), name="source-reask"
+        )
+
         nat_task: asyncio.Task | None = None
         if self.nat_enabled:
             async def _nat() -> None:
@@ -672,6 +977,85 @@ class AmuleDKernel:
                     )
 
             nat_task = asyncio.create_task(_nat(), name="nat-map")
+
+        # Config parity (roadmap 11r): periodic ipfilter refresh from
+        # ipfilter.update_url when ipfilter.auto_update is on (eMule
+        # AutoIPFilterUpdate analog). The last-update stamp lives in
+        # db\ipfilter_update.json so restarts do not re-download early.
+        ipfilter_task: asyncio.Task | None = None
+
+        async def _ipfilter_autoupdate() -> None:
+            import json as _json
+            from datetime import datetime, timedelta
+            from pathlib import Path
+
+            from amuled_v2.core.ipfilter import update_ipfilter_from_url
+
+            try:
+                from amuled_v2.config import load_config
+
+                cfg_ip = (load_config().get("ipfilter") or {})
+            except Exception as exc:
+                log.warning(
+                    "kernel fallback: config load failed, ipfilter "
+                    "auto-update disabled: error=%r",
+                    exc,
+                )
+                return
+            url = cfg_ip.get("update_url")
+            if not (cfg_ip.get("auto_update") and url):
+                return
+            period_days = float(cfg_ip.get("update_period_days") or 7)
+            stamp_path = Path(ROOT) / "db" / "ipfilter_update.json"
+            dest = Path(ROOT) / str(
+                cfg_ip.get("ipfilter_dat") or "assets/v1/ipfilter.dat"
+            )
+
+            def _due() -> bool:
+                try:
+                    stamp = _json.loads(stamp_path.read_text(encoding="utf-8"))
+                    last = datetime.fromisoformat(stamp["last_update"])
+                    return datetime.now() - last >= timedelta(days=period_days)
+                except Exception:
+                    return True  # missing/corrupt stamp -> refresh now
+
+            while not self.stop.is_set():
+                if _due():
+                    try:
+                        loop = asyncio.get_running_loop()
+                        stats = await loop.run_in_executor(
+                            None, update_ipfilter_from_url, url, str(dest), 60.0
+                        )
+                        stamp_path.parent.mkdir(parents=True, exist_ok=True)
+                        _write_json_atomic(
+                            stamp_path,
+                            {
+                                "last_update": datetime.now().isoformat(),
+                                "url": url,
+                                "bytes": stats.get("bytes"),
+                            },
+                        )
+                        log.info(
+                            "IPFILTER auto-update: url=%s, bytes=%s",
+                            url,
+                            stats.get("bytes"),
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "ipfilter auto-update fallback: refresh failed, "
+                            "keeping the existing list: error=%r",
+                            exc,
+                        )
+                try:
+                    await asyncio.wait_for(
+                        self.stop.wait(), timeout=3600.0
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+        ipfilter_task = asyncio.create_task(
+            _ipfilter_autoupdate(), name="ipfilter-autoupdate"
+        )
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -717,7 +1101,9 @@ class AmuleDKernel:
         finally:
             self.stop.set()
             extra_tasks = tuple(
-                t for t in (nat_task, rotation_task) if t is not None
+                t
+                for t in (nat_task, rotation_task, ipfilter_task, reask_task)
+                if t is not None
             )
             for task in (status_task, spider_task, republish_task, *extra_tasks):
                 task.cancel()

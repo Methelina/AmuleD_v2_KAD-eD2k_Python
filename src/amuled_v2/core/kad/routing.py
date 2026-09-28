@@ -7,19 +7,50 @@ a leaf splits into two child zones when its bin overflows and the split
 preconditions derived from ``CRoutingZone::CanSplit`` hold.
 
 Source files (authoritative for constants and semantics):
-  - srchybrid/kademlia/kademlia/Defines.h    -- K, KBASE, KK
+  - srchybrid/kademlia/kademlia/Defines.h    -- K, KBASE, KK (Defines.h:45-47)
   - srchybrid/kademlia/routing/RoutingBin.h   -- bucket operations
-  - srchybrid/kademlia/routing/RoutingBin.cpp -- AddContact, SetAlive, CanSplit, GetClosestTo
+  - srchybrid/kademlia/routing/RoutingBin.cpp -- AddContact, SetAlive, GetClosestTo
   - srchybrid/kademlia/routing/RoutingZone.h   -- zone tree API
-  - srchybrid/kademlia/routing/RoutingZone.cpp -- Add, Split, CanSplit, GetClosestTo, Consolidate
+  - srchybrid/kademlia/routing/RoutingZone.cpp -- Add, Split, CanSplit, GetClosestTo, Consolidate (CanSplit:468-481, Add:520-616, Split:700-718)
+  - srchybrid/kademlia/utils/UInt128.cpp      -- GetBitNumber (UInt128.cpp:103-110)
   - srchybrid/kademlia/routing/Contact.h/.cpp -- Contact type lifecycle
 
-Author: Soror L.'.L'.
+srchybrid/kademlia/kademlia/Defines.h:
+  #define K         10u   // Defines.h:45
+  #define KBASE      4    // Defines.h:46
+  #define KK         5    // Defines.h:47
+
+srchybrid/kademlia/routing/RoutingZone.cpp CanSplit (468-481):
+  #ifdef _BOOTSTRAPNODESDAT
+      if (Kademlia::CKademlia::GetRoutingZone()->GetNumContacts() < 2000)
+          return true;
+  #endif
+      if (m_uLevel >= 127)
+          return false;
+      return ((m_uZoneIndex < KK || m_uLevel < KBASE) && m_pBin->GetSize() == K);
+
+The _BOOTSTRAPNODESDAT path permits every full bin to split while the table
+is still below 2000 contacts; this is what lets the tree grow deep and hold
+hundreds-to-thousands of contacts during bootstrap.  Once the threshold is
+reached the normal zone-index / level gating resumes.
 
 src/amuled_v2/core/kad/routing.py
-Version:     0.1.0
-Author:      Soror L.'.L'.
-Updated:     2026-09-23
+Version:     0.2.0
+Author:      Soror L.'L'.
+Updated:     2026-09-28
+
+Patch Notes v0.2.0 (Soror L'.L'.):
+  [+] CanSplit now mirrors the _BOOTSTRAPNODESDAT variant from
+      RoutingZone.cpp:468-481: full bins split unconditionally while the
+      total contact count is below BOOTSTRAP_NODE_COUNT (2000), matching
+      eMule's ability to grow a deep tree during bootstrap.
+  [+] add() and _split() now normalise kad_id that may arrive as either
+      bytes (KadNodeInfo) or KadUInt128 (test harness) before XOR-distance
+      computation, fixing AttributeError on KadUInt128 lacking .hex().
+  [+] Added _kad_id_hex() and _to_kad_uint128() helpers for type-agnostic
+      kad_id handling in logging and distance computation.
+  [+] Preserved unfiltered-refusal semantics: bins at level cap 127 that
+      are full still reject new contacts.
 """
 
 from __future__ import annotations
@@ -38,27 +69,56 @@ __all__ = [
     "KBASE",
     "KK",
     "MAX_ZONE_LEVEL",
+    "BOOTSTRAP_NODE_COUNT",
     "RoutingTableError",
     "RoutingContact",
     "RoutingBin",
     "RoutingZone",
 ]
 
+# --- Constants — verbatim from Defines.h (srchybrid/kademlia/kademlia/Defines.h) ---
+# Defines.h:45  #define K         10u
 K = 10
+# Defines.h:46  #define KBASE      4
 KBASE = 4
+# Defines.h:47  #define KK         5
 KK = 5
+# RoutingZone.cpp:476  -- level cap (m_uLevel >= 127)
 MAX_ZONE_LEVEL = 127
+# RoutingZone.cpp:471  -- _BOOTSTRAPNODESDAT threshold
+# if (GetNumContacts() < 2000) return true;
+BOOTSTRAP_NODE_COUNT = 2000
 
 
 def _bit_at_level(value: KadUInt128, level: int) -> int:
     """Return bit *level* of *value* (0 = most-significant bit).
 
-    Mirrors ``CUInt128::GetBitNumber`` (UInt128.cpp:144-151): bit 0 is the
+    Mirrors ``CUInt128::GetBitNumber`` (UInt128.cpp:103-110): bit 0 is the
     most-significant of the 128-bit value, so we index from the high end.
     """
     if level >= 128:
         return 0
     return (value.to_int() >> (127 - level)) & 1
+
+
+def _to_kad_uint128(kad_id: bytes | KadUInt128) -> KadUInt128:
+    """Normalise *kad_id* to :class:`KadUInt128`.
+
+    Accepts both ``bytes`` (16-byte wire IDs from :class:`KadNodeInfo`) and
+    pre-built ``KadUInt128`` instances (used by test harnesses), so that
+    XOR-distance computation works regardless of the caller's representation.
+    """
+    if isinstance(kad_id, KadUInt128):
+        return kad_id
+    return KadUInt128(kad_id)
+
+
+def _kad_id_hex(kad_id: bytes | KadUInt128) -> str:
+    """Return a hex-string representation of *kad_id* supporting both
+    ``bytes`` and :class:`KadUInt128` (which lacks ``.hex()``)."""
+    if isinstance(kad_id, KadUInt128):
+        return kad_id.to_bytes().hex()
+    return kad_id.hex()
 
 
 class RoutingTableError(Exception):
@@ -158,21 +218,21 @@ class RoutingBin:
                 self.push_to_bottom(existing)
                 log.debug(
                     "add: refreshed contact id=%s ip=%s",
-                    contact.node.kad_id.hex(),
+                    _kad_id_hex(contact.node.kad_id),
                     contact.node.ip,
                 )
                 return True
         if len(self._contacts) >= K:
             log.debug(
                 "add: bin full id=%s ip=%s",
-                contact.node.kad_id.hex(),
+                _kad_id_hex(contact.node.kad_id),
                 contact.node.ip,
             )
             return False
         self._contacts.append(contact)
         log.debug(
             "add: inserted contact id=%s ip=%s size=%d",
-            contact.node.kad_id.hex(),
+            _kad_id_hex(contact.node.kad_id),
             contact.node.ip,
             len(self._contacts),
         )
@@ -193,7 +253,7 @@ class RoutingBin:
                 self.push_to_bottom(rc)
                 log.debug(
                     "mark_alive: contact id=%s key=%s type=%d",
-                    rc.node.kad_id.hex(),
+                    _kad_id_hex(rc.node.kad_id),
                     key,
                     rc.type,
                 )
@@ -229,7 +289,7 @@ class RoutingBin:
                 if should_evict:
                     log.debug(
                         "mark_failed: evict contact id=%s key=%s type=%d fails=%d",
-                        rc.node.kad_id.hex(),
+                        _kad_id_hex(rc.node.kad_id),
                         key,
                         rc.type,
                         rc.fails,
@@ -237,7 +297,7 @@ class RoutingBin:
                     return True
                 log.debug(
                     "mark_failed: escalated contact id=%s type=%d fails=%d",
-                    rc.node.kad_id.hex(),
+                    _kad_id_hex(rc.node.kad_id),
                     rc.type,
                     rc.fails,
                 )
@@ -255,7 +315,7 @@ class RoutingBin:
             return
         self._contacts.append(contact)
 
-    def get_contact_by_id(self, kad_id: bytes) -> RoutingContact | None:
+    def get_contact_by_id(self, kad_id: bytes | KadUInt128) -> RoutingContact | None:
         """Find a contact by its 16-byte KadID."""
         for rc in self._contacts:
             if rc.node.kad_id == kad_id:
@@ -300,9 +360,11 @@ class RoutingZone:
     the address range.  Leaf zones hold a :class:`RoutingBin`; internal nodes
     hold two child :class:`RoutingZone` objects.
 
-    Splitting follows ``CRoutingZone::CanSplit`` (RoutingZone.cpp:459-469):
-      ``(m_uZoneIndex < KK OR m_uLevel < KBASE) AND bin is full AND
-      m_uLevel < MAX_ZONE_LEVEL``
+    Splitting follows ``CRoutingZone::CanSplit`` (RoutingZone.cpp:468-481):
+      ``((zone_index < KK OR level < KBASE) AND bin is full AND
+       level < MAX_ZONE_LEVEL)``
+    plus the ``_BOOTSTRAPNODESDAT`` path (RoutingZone.cpp:470-473) that
+    allows every full bin to split while total contacts < 2000.
 
     ``GetClosestTo`` (RoutingZone.cpp:658-674) recurses into the subzone that
     is closer to the target first, then into the other if results are still
@@ -320,19 +382,48 @@ class RoutingZone:
     def _is_leaf(self) -> bool:
         return self._bin is not None
 
+    def _total_contacts(self) -> int:
+        """Return the total contact count across the whole tree.
+
+        Mirrors ``CRoutingZone::GetNumContacts()`` (RoutingZone.cpp:902-907)
+        invoked on the root, which is what the
+        ``_BOOTSTRAPNODESDAT`` CanSplit path queries via
+        ``Kademlia::CKademlia::GetRoutingZone()->GetNumContacts()``
+        (RoutingZone.cpp:471).
+        """
+        root = self
+        while root._super_zone is not None:
+            root = root._super_zone
+        return len(root)
+
     def _can_split(self) -> bool:
-        """Mirrors ``CRoutingZone::CanSplit`` (RoutingZone.cpp:459-469)."""
+        """Mirrors ``CRoutingZone::CanSplit`` (RoutingZone.cpp:468-481).
+
+        The ``_BOOTSTRAPNODESDAT`` variant (RoutingZone.cpp:470-473) allows
+        every full bin to split while the routing table holds fewer than
+        ``BOOTSTRAP_NODE_COUNT`` (2000) contacts, so the tree can grow deep
+        during initial bootstrap.  Once the threshold is reached the normal
+        zone-index / level gating resumes:
+        ``(zone_index < KK OR level < KBASE) AND bin_full`` with the
+        ``level >= 127`` cap (RoutingZone.cpp:476).
+        """
         if self._level >= MAX_ZONE_LEVEL:
             return False
         if not self._is_leaf():
             return False
         bin_full = len(self._bin) == K
+        if not bin_full:
+            return False
+        # _BOOTSTRAPNODESDAT path — allow all full bins to split early.
+        if self._total_contacts() < BOOTSTRAP_NODE_COUNT:
+            return True
+        # Normal path — only near-root zones may split.
         index_ok = self._zone_index < KK
         level_ok = self._level < KBASE
-        return bin_full and (index_ok or level_ok)
+        return index_ok or level_ok
 
     def _gen_sub_zone(self, i_side: int) -> RoutingZone:
-        """Mirrors ``CRoutingZone::GenSubZone`` (RoutingZone.cpp:785-792)."""
+        """Mirrors ``CRoutingZone::GenSubZone`` (RoutingZone.cpp:762-768)."""
         new_index = self._zone_index << 1
         if i_side != 0:
             new_index |= 1
@@ -343,19 +434,19 @@ class RoutingZone:
         return child
 
     def _split(self) -> None:
-        """Mirrors ``CRoutingZone::Split`` (RoutingZone.cpp:715-734)."""
+        """Mirrors ``CRoutingZone::Split`` (RoutingZone.cpp:700-718)."""
         self._sub_zones[0] = self._gen_sub_zone(0)
         self._sub_zones[1] = self._gen_sub_zone(1)
         old_bin = self._bin
         self._bin = None
         old_contacts = old_bin.contacts() if old_bin is not None else []
         for rc in old_contacts:
-            dist = self._own_id.xor(KadUInt128(rc.node.kad_id))
+            dist = self._own_id.xor(_to_kad_uint128(rc.node.kad_id))
             i_side = _bit_at_level(dist, self._level)
             if not self._sub_zones[i_side]._bin.add(rc):
                 log.debug(
                     "split: contact dropped during migration id=%s",
-                    rc.node.kad_id.hex(),
+                    _kad_id_hex(rc.node.kad_id),
                 )
         log.debug(
             "split: level=%d zone_index=%d migrated=%d",
@@ -367,7 +458,7 @@ class RoutingZone:
     def add(self, node: KadNodeInfo) -> bool:
         """Insert *node* into the zone tree by XOR-distance bit path.
 
-        Mirrors ``CRoutingZone::Add`` (RoutingZone.cpp:512-623):
+        Mirrors ``CRoutingZone::Add`` (RoutingZone.cpp:520-616):
           - Recurse into the subzone whose side bit matches the contact's XOR
             distance at the current level.
           - At a leaf, if the bin has the contact already it is refreshed;
@@ -377,7 +468,7 @@ class RoutingZone:
             permitted.
         """
         if not self._is_leaf():
-            dist = self._own_id.xor(KadUInt128(node.kad_id))
+            dist = self._own_id.xor(_to_kad_uint128(node.kad_id))
             i_side = _bit_at_level(dist, self._level)
             return self._sub_zones[i_side].add(node)
         rc = RoutingContact(node=node)
@@ -385,12 +476,12 @@ class RoutingZone:
             return True
         if self._can_split():
             self._split()
-            dist = self._own_id.xor(KadUInt128(node.kad_id))
+            dist = self._own_id.xor(_to_kad_uint128(node.kad_id))
             i_side = _bit_at_level(dist, self._level)
             return self._sub_zones[i_side].add(node)
         log.debug(
             "add: bin full, no split id=%s level=%d",
-            node.kad_id.hex(),
+            _kad_id_hex(node.kad_id),
             self._level,
         )
         return False
@@ -433,7 +524,7 @@ class RoutingZone:
                 self._bin.remove_contact(rc)
                 log.debug(
                     "remove: evicted id=%s ip=%s",
-                    rc.node.kad_id.hex(),
+                    _kad_id_hex(rc.node.kad_id),
                     ip,
                 )
                 return True
@@ -467,7 +558,7 @@ class RoutingZone:
         if self._is_leaf():
             ordered = sorted(
                 self._bin.contacts(),
-                key=lambda rc: target.xor(KadUInt128(rc.node.kad_id)).to_int(),
+                key=lambda rc: target.xor(_to_kad_uint128(rc.node.kad_id)).to_int(),
             )
             room = count - len(results)
             for rc in ordered[:room]:

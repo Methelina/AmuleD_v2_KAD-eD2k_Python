@@ -2,18 +2,26 @@
 
 Implements the eMule-compatible incomplete-download file layout:
 
-- the data file is preallocated to the full final size;
+- by default the data file is preallocated to the full final size; when the
+  ``sparse`` option is set the file is created at zero length and grows on
+  demand as blocks arrive, with only a minimal free-space check performed;
 - a gap list (ordered, non-overlapping ``[start, end)`` intervals) records
   the missing byte ranges;
 - the file is divided into 9,728,400-byte (9.28 MiB) chunks, the ED2K hash
   granularity, and a bitmap tracks which chunks contain no gaps;
-- a ``.amuled.json`` sidecar persists the gap list, the chunk bitmap, and the
-  expected hash so a resumed client can continue exactly where it stopped.
+- a ``.amuled.json`` sidecar persists the gap list, the chunk bitmap, the
+  expected hash, and the sparse flag so a resumed client can continue exactly
+  where it stopped.
 
 src/amuled_v2/core/download/partfile.py
-Version:     0.1.0
-Author:      Soror L.'.L.'.
-Updated:     2026-09-23
+Version:     0.1.1
+Author:      Soror L.'.L'.
+Updated:     2026-09-28
+
+Patch Notes v0.1.1 (Soror L.'.L'.):
+  [+] Added sparse part-file option: open_new() skips full preallocation and
+      the full-size free-space check when sparse=True, creating a zero-length
+      file with only a minimal 1 MiB space reservation and a tagged log line.
 
 Patch Notes v0.1.0 (Soror L.'.L'.):
   [+] Added preallocated part files with persisted gap lists.
@@ -87,13 +95,14 @@ def _normalize_gaps(gaps: list[Gap], total_size: int) -> list[Gap]:
 class PartFile:
     """One incomplete download on disk with its metadata sidecar."""
 
-    def __init__(self, path: str | Path, total_size: int, file_hash: str, name: str) -> None:
+    def __init__(self, path: str | Path, total_size: int, file_hash: str, name: str, sparse: bool = False) -> None:
         if total_size <= 0:
             raise PartFileError(f"download size must be positive: {total_size}")
         self.path = Path(path)
         self.total_size = total_size
         self.file_hash = file_hash.upper()
         self.name = name
+        self.sparse = bool(sparse)
         self.gaps: list[Gap] = [Gap(0, total_size)]
         self._handle = None
 
@@ -110,18 +119,31 @@ class PartFile:
         else:
             directory = self.path.parent
             directory.mkdir(parents=True, exist_ok=True)
-            if not check_free_space(directory, self.total_size):
-                raise PartFileError(
-                    f"insufficient disk space for {self.total_size} bytes "
-                    f"in {directory}"
+            if self.sparse:
+                if not check_free_space(directory, min(1 << 20, self.total_size)):
+                    raise PartFileError(
+                        f"insufficient disk space for sparse part file "
+                        f"({self.total_size} bytes expected) in {directory}"
+                    )
+                open(self.path, "wb").close()
+                log.info(
+                    "DOWNLOAD part file created (sparse): path=%s, size=%d",
+                    str(self.path),
+                    self.total_size,
                 )
-            with open(self.path, "wb") as handle:
-                handle.truncate(self.total_size)
-            log.info(
-                "DOWNLOAD part file created: path=%s, size=%d",
-                str(self.path),
-                self.total_size,
-            )
+            else:
+                if not check_free_space(directory, self.total_size):
+                    raise PartFileError(
+                        f"insufficient disk space for {self.total_size} bytes "
+                        f"in {directory}"
+                    )
+                with open(self.path, "wb") as handle:
+                    handle.truncate(self.total_size)
+                log.info(
+                    "DOWNLOAD part file created: path=%s, size=%d",
+                    str(self.path),
+                    self.total_size,
+                )
         self._open_handle()
         self.save()
 
@@ -133,7 +155,21 @@ class PartFile:
             raise PartFileError(f"part sidecar is missing: {sidecar}")
         with open(sidecar, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-        part = cls(path, int(data["total_size"]), str(data["file_hash"]), str(data["name"]))
+        if "sparse" in data:
+            sparse = bool(data["sparse"])
+        else:
+            try:
+                on_disk = Path(path).stat().st_size
+            except OSError:
+                on_disk = int(data["total_size"])
+            sparse = on_disk != int(data["total_size"])
+        part = cls(
+            path,
+            int(data["total_size"]),
+            str(data["file_hash"]),
+            str(data["name"]),
+            sparse=sparse,
+        )
         part.gaps = _normalize_gaps(
             [Gap(int(g["start"]), int(g["end"])) for g in data.get("gaps", [])],
             part.total_size,
@@ -242,6 +278,7 @@ class PartFile:
             "file_hash": self.file_hash,
             "name": self.name,
             "total_size": self.total_size,
+            "sparse": self.sparse,
             "gaps": [
                 {"start": gap.start, "end": gap.end} for gap in self.gaps
             ],

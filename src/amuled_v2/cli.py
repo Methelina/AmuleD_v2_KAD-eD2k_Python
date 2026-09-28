@@ -17,11 +17,16 @@ Dependencies (duckdb, rich) are optional at runtime; ``--help`` works without
 them installed.  Network protocol sessions are not started by share commands.
 
 src/amuled_v2/cli.py
-Version:     0.6.2
+Version:     0.6.3
 Author:      Soror L.'.L.'.
 Updated:     2026-09-28
 
-Patch Notes v0.6.2 (Soror L'.L'.):
+Patch Notes v0.6.3 (Soror L.'.L'.):
+  [+] ipfilter update [--url --dest]: download and atomically replace the
+      filter list (gzip supported; defaults from ipfilter.update_url /
+      assets/v1/ipfilter.dat) - eMule AutoIPFilterUpdate analog (roadmap 11r).
+
+Patch Notes v0.6.2 (Soror L.'.L'.):
   [+] kad sources: persist found sources through the kernel control
       socket ("sources.save") - the CLI cannot open DuckDB while the
       kernel owns the writer lock, the direct write lost that race
@@ -29,7 +34,7 @@ Patch Notes v0.6.2 (Soror L'.L'.):
       download run failed with "no known sources").  Direct write stays
       as a logged fallback for kernel-down sessions.
 
-Patch Notes v0.6.1 (Soror L'.L'.):
+Patch Notes v0.6.1 (Soror L.'.L'.):
   [+] Stage U phase 3: search results/sources/download list+add/servers
       failures/ipfilter status route over kernel IPC first, falling back to
       direct DuckDB when the kernel is down.
@@ -1909,6 +1914,55 @@ def _cmd_ipfilter_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_ipfilter_update(args: argparse.Namespace) -> int:
+    from amuled_v2.config import load_config
+    from amuled_v2.core.ipfilter import update_ipfilter_from_url
+
+    url = args.url
+    dest = Path(args.dest) if args.dest else _IPFILTER_PATH
+    if not url:
+        try:
+            url = (load_config().get("ipfilter") or {}).get("update_url")
+        except Exception as exc:
+            log.warning(f"IPFILTER update fallback: config load failed: {exc!r}")
+            url = None
+    if not url:
+        result = {
+            "status": "error",
+            "error": "no --url given and ipfilter.update_url is not configured",
+        }
+        if args.json:
+            _print_json(result)
+        else:
+            _print_text("IP filter update", [result["error"]])
+        return 2
+    try:
+        stats = update_ipfilter_from_url(url, dest, 60.0)
+        # Refresh stats from the replaced file.
+        ip_filter = load_ipfilter_file(dest)
+        stats = {**stats, **ip_filter.statistics()}
+        result = {"status": "ok", "url": url, "path": str(dest), **stats}
+        log.info(f"IP filter updated: url={url}, bytes={result.get('bytes')}")
+    except Exception as exc:
+        log.warning(f"IPFILTER update failed: {exc!r}")
+        result = {"status": "error", "url": url, "error": repr(exc)}
+        if args.json:
+            _print_json(result)
+        else:
+            _print_text("IP filter update", [result["error"]])
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        _print_text("IP filter update", [
+            f"url      : {url}",
+            f"path     : {result['path']}",
+            f"ranges   : {result['range_count']}",
+            f"max_level: {result['max_level']}",
+        ])
+    return 0
+
+
 def _cmd_ipfilter_test(args: argparse.Namespace) -> int:
     ip_filter = _load_ipfilter()
     matched = ip_filter.match(args.ip)
@@ -3370,6 +3424,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ipfilter_test.add_argument("ip", help="IPv4 address to test.")
     p_ipfilter_test.set_defaults(func=_cmd_ipfilter_test)
+
+    p_ipfilter_update = ipfilter_sub.add_parser(
+        "update",
+        help="Download and replace ipfilter.dat from a URL (gzip supported).",
+        parents=parents,
+    )
+    p_ipfilter_update.add_argument(
+        "--url",
+        default=None,
+        help="List URL; defaults to ipfilter.update_url from the config.",
+    )
+    p_ipfilter_update.add_argument(
+        "--dest",
+        default=None,
+        help="Destination path; defaults to assets/v1/ipfilter.dat.",
+    )
+    p_ipfilter_update.set_defaults(func=_cmd_ipfilter_update)
 
     # --- geoip ---
     p_geoip = sub.add_parser(

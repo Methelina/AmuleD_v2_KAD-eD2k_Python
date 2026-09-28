@@ -29,7 +29,20 @@
     "client_udp_port": 8089,
     "enable_ed2k": true,
     "enable_kad": true,
-    "bind_ip": null
+    "bind_ip": null,
+    "max_connections": 250,
+    "max_half_connections": 50,
+    "max_conn_per_5s": 60,
+    "max_download_bytes_per_sec": 0,
+    "crypt_layer_required": false
+  },
+
+  // Downloads. max_sources_per_file mirrors eMule; sparse_part_files skips
+  // the full-size preallocation of .part files (sidecar gap list stays the
+  // completion source of truth).
+  "download": {
+    "max_sources_per_file": 400,
+    "sparse_part_files": false
   },
 
   // Runtime paths. null = portable project-local defaults
@@ -40,10 +53,15 @@
     "shared": null
   },
 
-  // Kademlia bootstrap (bundled public assets).
+  // Kademlia bootstrap (bundled public assets). udp_key stays null — a
+  // random uint32 is generated and persisted on first use (eMule
+  // preferencesKad.dat analog). reask_interval_s drives the kernel's
+  // periodic source re-ask + re-dial loop for the download queue.
   "kademlia": {
     "nodes_dat": "assets/v1/nodes.dat",
-    "bootstrap_nodes": []
+    "bootstrap_nodes": [],
+    "udp_key": null,
+    "reask_interval_s": 300
   },
 
   // ED2K server list (bundled public assets).
@@ -59,10 +77,16 @@
     "shareddir_dat": null
   },
 
-  // IP filter (bundled public assets).
+  // IP filter (bundled public assets). level = eMule FilterLevel threshold;
+  // auto_update refreshes ipfilter.dat from update_url every
+  // update_period_days (checked by the kernel).
   "ipfilter": {
     "ipfilter_dat": "assets/v1/ipfilter.dat",
-    "ipfilter_static_dat": "assets/v1/ipfilter_static.dat"
+    "ipfilter_static_dat": "assets/v1/ipfilter_static.dat",
+    "level": 127,
+    "auto_update": false,
+    "update_url": null,
+    "update_period_days": 7
   },
 
   // GeoIP (bundled legacy dat; MMDB also supported when geoip.enabled).

@@ -8,29 +8,41 @@ part file via ``record_block`` and completion is finalized only when a
 peer delivers the whole file.
 
 src/amuled_v2/core/download/runner.py
-Version:     0.9.4
+Version:     0.9.5
 Author:      Soror L.'.L.'.
 Updated:     2026-09-28
 
-Patch Notes v0.9.4 (Soror L'.L'.):
+Patch Notes v0.9.5 (Soror L.'.L'.):
+  [+] __init__ gains max_sources_per_file / download_bytes_per_sec /
+      crypt_layer_required kwargs; resolved lazily via load_config() when None,
+      with a tagged "runner fallback:" warning on config failure.
+  [+] resolve_sources signature default changed to limit: int | None = None;
+      falls back to self.max_sources_per_file when unset (400 default).
+  [+] Download throttle: async _throttle_gate(nbytes) token-bucket gate wraps
+      the single record_block write path; unlimited (<=0) is a no-op.
+  [+] Crypt-layer-required gate in _attempt_peer: the obf-dial plain fallback
+      is suppressed when crypt_layer_required, and a plain-dial success now
+      logs "DOWNLOAD crypt layer required but peer dialed plain" warning.
+
+Patch Notes v0.9.4 (Soror L.'.L'.):
   [+] _connect_via_rendezvous: loopback buddies start the NAT-T session on
       127.0.0.1 (0.0.0.0 would take the NIC-egress pin, and a NIC-pinned
       socket cannot send to 127.0.0.1 - WinError 1214; live 2026-09-28
       suite regression).
 
-Patch Notes v0.9.3 (Soror L'.L'.):
+Patch Notes v0.9.3 (Soror L.'.L'.):
   [+] _regions_from_gaps(): terminate when gap space is exhausted - with
       peers > number of gap regions the old loop span forever on
       zero-width takes (live 2026-09-28: 1 gap x 50 peers froze the
       kernel event loop, found via faulthandler stack dump).
 
-Patch Notes v0.9.2 (Soror L'.L'.):
+Patch Notes v0.9.2 (Soror L.'.L'.):
   [!] All silent `except Exception: pass` sites now log a tagged "runner
       fallback:" line (log.debug for best-effort teardown noise, log.warning
       for result-affecting degradations) per project policy.  Bare
       `except Exception:` changed to `except Exception as exc:`.
 
-Patch Notes v0.9.1 (Soror L'.L'.):
+Patch Notes v0.9.1 (Soror L.'.L'.):
   [+] Stable HELLO identity: PeerClient now receives local_userhash from
       callback_identity (persistent KAD identity).  Live evidence
       2026-09-28: eMuleAI 1.6.0 bans "Userhash changed"
@@ -38,7 +50,7 @@ Patch Notes v0.9.1 (Soror L'.L'.):
       os.urandom(16) per connection - repeated dials were FINned at the
       BASIC handshake.
 
-Patch Notes v0.9.0 (Soror L'.L'.):
+Patch Notes v0.9.0 (Soror L.'.L'.):
   [+] Runner-level A4AF/NNS gate (stateless-session equivalent of eMule's
       SwapToAnotherFile, DownloadClient.cpp:2171 / PartFile.cpp:3353-3370).
       _attempt_peer consults _a4af_needed_parts after wait_upload_slot:
@@ -53,7 +65,7 @@ Patch Notes v0.9.0 (Soror L'.L'.):
       intersects them with client.part_status / complete_sources.
   [+] _a4af_verdict: single-read helper used by both gate points.
 
-Patch Notes v0.8.0 (Soror L'.L'.):
+Patch Notes v0.8.0 (Soror L.'.L'.):
   [+] ICS (Intelligent Chunk Selection): runner-level requested-ranges registry
       (_requested_ranges) as the IsAlreadyRequested equivalent (PartFile.cpp:2674-2696);
       per-peer block_selector built on amuled_v2.core.download.ics.select_blocks;
@@ -68,33 +80,33 @@ Patch Notes v0.8.0 (Soror L'.L'.):
       sources (unknown -> assume available, per ics-filestatus-client.recon.md
       Mode A: chunk_count == 0 means the peer has every part).
 
-Patch Notes v0.7.1 (Soror L'.L'.):
+Patch Notes v0.7.1 (Soror L.'.L'.):
   [+] Self-record filter (roadmap 11o addendum 4): resolve_sources
       drops KAD records whose ipv6 is one of OUR local addresses (NAT
       reflection / self-publication) or whose userhash equals ours;
       self_record_filter flag for loopback tests.
 
-Patch Notes v0.7.0 (Soror L'.L'.):
+Patch Notes v0.7.0 (Soror L.'.L'.):
   [+] Corrupt-part salvage (stage X; PartFile.cpp HashSinglePart
       :4399-4474 + FlushBuffer:5793-5804): after a full-file transfer,
       every PART's MD4 is verified against the peer's hashset; corrupt
       parts are punched as gaps (queue.punch_gaps -> PartFile.punch)
       and the rounds loop refetches them before finalize.
 
-Patch Notes v0.6.0 (Soror L'.L'.):
+Patch Notes v0.6.0 (Soror L.'.L'.):
   [+] Stalled-stripe reassignment: run() races up to 3 rounds; later
       rounds re-stripe the CURRENT gap list (queue.gap_ranges), and
       peers that delivered zero bytes in a round are pruned from later
       rounds (their slice goes to the survivors).
 
-Patch Notes v0.5.1 (Soror L'.L'.):
+Patch Notes v0.5.1 (Soror L.'.L'.):
   [+] IPv6 rendezvous: endpoint rows may carry ipv6/buddy_ipv6 (eMuleAI
       "ip6"/"bi6"); an ipv6 target starts the dual-stack NAT-T session
       (start6) and drives the direct-punch variant (endpoint hints are
       IPv4-only).
   [+] resolve_sources carries ipv6/buddy_ipv6 through to endpoints.
 
-Patch Notes v0.5.0 (Soror L'.L'.):
+Patch Notes v0.5.0 (Soror L.'.L'.):
   [+] Stripe scheduling: racing peers get disjoint file regions
       (region = ceil(size/peers)); peer i downloads [i*region,
       min(size, (i+1)*region)).  Queue gap list decides completion; the
@@ -104,18 +116,18 @@ Patch Notes v0.5.0 (Soror L'.L'.):
       BEFORE the UDP callback request — dial-backs race the wait and
       previously fell through to normal sessions when unclaimed.
 
-Patch Notes v0.4.0 (Soror L'.L'.):
+Patch Notes v0.4.0 (Soror L.'.L'.):
   [+] AICH requester audit (stage X): after a complete transfer the
       runner cross-checks the AICH master with the peer (recovery walk)
       and stores the verified master in state (aich_masters, migration
       10) — seed for corrupt-part salvage; aich_audit flag.
 
-Patch Notes v0.3.0 (Soror L'.L'.):
+Patch Notes v0.3.0 (Soror L.'.L'.):
   [+] kad3/kad5: after the 12 s buddy-callback timeout fall through to
       the NAT-T rendezvous path (uTP stream adopted as a downloader
       PeerClient; session kept alive via a closer callback).
 
-Patch Notes v0.2.0 (Soror L'.L'.):
+Patch Notes v0.2.0 (Soror L.'.L'.):
   [+] Parallel peer attempts (race semantics): up to max_peers peers run
       concurrently; the first peer delivering a complete file wins and the
       losers are cancelled.  Part-file writes stay sequential on the event
@@ -123,7 +135,7 @@ Patch Notes v0.2.0 (Soror L'.L'.):
   [+] Optional source_provider: sources may come from the kernel over IPC
       instead of the runner's own state connection.
 
-Patch Notes v0.1.0 (Soror L'.L'.):
+Patch Notes v0.1.0 (Soror L.'.L'.):
   [+] Added DownloadRunner coordinating sequential peer download attempts.
   [+] Added source resolution converting high-id client rows to endpoints.
   [+] Added single-file run() and bulk run_all() entry points.
@@ -271,6 +283,9 @@ class DownloadRunner:
         callback_identity: "dict[str, Any] | None" = None,
         aich_audit: bool = True,
         self_record_filter: bool = True,
+        max_sources_per_file: int | None = None,
+        download_bytes_per_sec: int | None = None,
+        crypt_layer_required: bool | None = None,
     ) -> None:
         self.queue = queue
         self.local_client_id = local_client_id
@@ -307,6 +322,44 @@ class DownloadRunner:
         # local addresses (NAT reflection / self-publication).  Loopback
         # tests disable it — their fake source legitimately sits on ::1.
         self.self_record_filter = self_record_filter
+        # Config-derived network/download knobs (roadmap 11r).  Each is
+        # resolved lazily from amuled_v2.config.load_config() when the caller
+        # did not pass it explicitly; on any config failure we fall back to
+        # the documented defaults (project fallback-logging policy).
+        cfg = None
+        try:
+            from amuled_v2.config import load_config
+
+            cfg = load_config()
+        except Exception as exc:
+            log.warning(
+                "DOWNLOAD runner fallback: config load failed, using "
+                "defaults for unresolved knobs: error=%s", exc,
+            )
+        net = (cfg.get("network", {}) if cfg else {})
+        dl = (cfg.get("download", {}) if cfg else {})
+        if max_sources_per_file is None:
+            max_sources_per_file = int(dl.get("max_sources_per_file", 400))
+        if download_bytes_per_sec is None:
+            download_bytes_per_sec = int(net.get("max_download_bytes_per_sec", 0))
+        if crypt_layer_required is None:
+            crypt_layer_required = bool(net.get("crypt_layer_required", False))
+        # Normalize: 0/negative download_bytes_per_sec means unlimited.
+        self.max_sources_per_file = int(max_sources_per_file) if max_sources_per_file else 400
+        self.download_bytes_per_sec = (
+            int(download_bytes_per_sec) if download_bytes_per_sec else 0
+        )
+        self.crypt_layer_required = bool(crypt_layer_required)
+        # Token-bucket throttle state (download_bytes_per_sec > 0 enables;
+        # <= 0 / unlimited is a no-op in _throttle_gate).  Bucket capacity
+        # = max(rate, 64 KiB) so a tiny cap still absorbs a full block write.
+        self._throttle_tokens: float = float(
+            max(self.download_bytes_per_sec, 64 * 1024)
+        )
+        self._throttle_ts: float = 0.0
+        # Serializes block writes through the token-bucket gate so concurrent
+        # ensure_future-throttled writes drain sequentially.
+        self._throttle_lock: asyncio.Lock | None = None
         # ICS requested-ranges registry (PartFile.cpp requestedblocks_list,
         # recon ics-endgame.recon.md section 6): file_hash bytes -> set of
         # inclusive (start, end) byte ranges currently in flight across all
@@ -382,6 +435,67 @@ class DownloadRunner:
         if not bucket:
             self._requested_ranges.pop(file_hash, None)
 
+    # ---------------------------------------------------------------------------
+    # Download throttle (token bucket).  When download_bytes_per_sec <= 0 the
+    # gate is a no-op — there is a single fast attribute check, no awaitable
+    # overhead.  Capacity = max(rate, 64 KiB); each allowed byte consumes a
+    # token, refilled at the configured rate since the last gate call.
+    # (eMule DownloadThrottle / CKademilaSocket::DownloadLimit analog.)
+    # ---------------------------------------------------------------------------
+    async def _throttle_gate(self, nbytes: int) -> None:
+        """Gate a write of ``nbytes`` through the token bucket."""
+        rate = self.download_bytes_per_sec
+        if rate <= 0:
+            return
+        if self._throttle_lock is None:
+            self._throttle_lock = asyncio.Lock()
+        async with self._throttle_lock:
+            now = asyncio.get_event_loop().time()
+            elapsed = now - self._throttle_ts
+            self._throttle_ts = now
+            capacity = float(max(rate, 64 * 1024))
+            self._throttle_tokens = min(
+                capacity, self._throttle_tokens + rate * elapsed
+            )
+            if self._throttle_tokens < nbytes:
+                deficit = nbytes - self._throttle_tokens
+                self._throttle_tokens = 0.0
+                await asyncio.sleep(deficit / rate)
+            else:
+                self._throttle_tokens -= nbytes
+
+    def _persist_block(
+        self, file_hash: str, start: int, data: bytes, _unused: bytes
+    ) -> None:
+        """Sync write_block callback: throttle-gate the block when a rate
+        limit is configured, then persist it to the queue part file.
+
+        client.transfer invokes write_block synchronously (no await), so the
+        throttle gate is scheduled via ``asyncio.ensure_future`` when throttling
+        is active.  When the limit is unlimited (<= 0) this is a straight
+        delegation — no coroutine, no awaitable overhead."""
+        if self.download_bytes_per_sec <= 0:
+            self.queue.record_block(file_hash, start, data)
+            return
+        try:
+            asyncio.ensure_future(self._write_block_throttled(file_hash, start, data))
+        except RuntimeError:
+            # No running loop is fatal — fall back to an unthrottled write
+            # so the block is never lost (project fallback-logging policy).
+            log.warning(
+                "DOWNLOAD runner fallback: no running loop for throttle "
+                "gate, writing block unthrottled: hash=%s",
+                file_hash,
+            )
+            self.queue.record_block(file_hash, start, data)
+
+    async def _write_block_throttled(
+        self, file_hash: str, start: int, data: bytes
+    ) -> None:
+        """Await the throttle gate, then persist the block."""
+        await self._throttle_gate(len(data))
+        self.queue.record_block(file_hash, start, data)
+
     def _part_frequencies(
         self, file_hash: bytes, clients: Sequence, total_size: int
     ) -> list[int]:
@@ -417,7 +531,7 @@ class DownloadRunner:
         return frequencies
 
     def resolve_sources(
-        self, file_hash: str, *, limit: int = 20
+        self, file_hash: str, *, limit: int | None = None
     ) -> list[dict[str, Any]]:
         """Dialable endpoints for a hash.
 
@@ -426,6 +540,8 @@ class DownloadRunner:
         3/5 are skipped (need a serving-buddy callback); type 6 is returned
         with ``source_type='kad6'`` for the direct-callback flow.
         """
+        if limit is None:
+            limit = self.max_sources_per_file
         if self.source_provider is not None:
             rows = self.source_provider(file_hash, limit)
         else:
@@ -627,6 +743,7 @@ class DownloadRunner:
                         user_hash is None
                         or "BASIC handshake" not in str(exc)
                         or not self.plain_dial_ok
+                        or self.crypt_layer_required
                     ):
                         raise
                     log.warning(
@@ -659,6 +776,12 @@ class DownloadRunner:
                         ),
                     )
                     await client.connect()
+                    if self.crypt_layer_required:
+                        log.warning(
+                            "DOWNLOAD crypt layer required but peer dialed "
+                            "plain: peer=%s:%d",
+                            host, port,
+                        )
             await client.handshake()
             hashset = await client.request_file(file_hash_bytes)
             try:
@@ -840,8 +963,8 @@ class DownloadRunner:
             outcome = await client.transfer(
                 file_hash_bytes,
                 size,
-                write_block=lambda start, data: self.queue.record_block(
-                    file_hash, start, data
+                write_block=lambda start, data: self._persist_block(
+                    file_hash, start, data, file_hash_bytes
                 ),
                 progress_callback=progress_callback,
                 start_offset=transfer_start,

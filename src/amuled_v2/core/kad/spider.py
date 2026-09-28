@@ -11,9 +11,22 @@ save behavior; the kernel injects its permanent connection and never closes
 it mid-run.
 
 src/amuled_v2/core/kad/spider.py
-Version:     0.4.0
+Version:     0.4.2
 Author:      Soror L.'.L'.
 Updated:     2026-09-28
+
+Patch Notes v0.4.2 (Soror L'.L'.):
+  [+] PoolRouting carries the experimental-selection knowledge into
+      lookups: a weight_fn (kadabra.weight) bonus sorts rewarded nodes
+      ahead of same-warmth peers, so the bandit/vivaldi strategies that
+      drive maturation now also shape search-candidate order.
+
+Patch Notes v0.4.1 (Soror L'.L'.):
+  [+] PoolRouting.closest: warm-first ranking - HELLO-verified contacts
+      (hellos>0, last_seen < 24 h) rank ahead of cold cache entries at any
+      distance.  A mature spider (running for hours) therefore feeds
+      lookups only proven-live nodes, mirroring eMule whose routing zone
+      contains verified contacts only; cold entries are the fallback.
 
 Patch Notes v0.4.0 (Soror L'.L'.):
   [+] Replaced six silent `except Exception: continue/pass` sites in the
@@ -42,7 +55,7 @@ import socket
 import time
 import zlib
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from amuled_v2.logging_setup import LogTags, get_tagged_logger
 
@@ -146,6 +159,75 @@ def build_pool(root: Path, cache: Dict[str, Any]) -> Dict[Tuple[str, int], Dict[
     return nodes
 
 
+class PoolRouting:
+    """Flat closest-shim over the spider's live node pool (2026-09-28).
+
+    The tree RoutingZone caps at ~41 contacts (bucket/split rules), which
+    starves iterative lookups run from a fresh process (queried=6..9,
+    responded=0).  In-kernel lookups instead walk the spider's whole live
+    pool (1000+ maturing nodes) through this shim: ``closest`` ranks the
+    pool by XOR distance to the target, ``mark_alive``/``add`` are harmless
+    no-ops (the spider's own cycles do the bookkeeping).
+    """
+
+    def __init__(
+        self,
+        nodes: Dict[Tuple[str, int], Dict[str, Any]],
+        weight_fn: Optional[Callable[[Tuple[str, int]], float]] = None,
+    ) -> None:
+        self._nodes = nodes
+        self._weight_fn = weight_fn
+
+    def closest(self, target, count: int = 120) -> list:
+        from types import SimpleNamespace
+
+        from amuled_v2.core.kad.packets import KadUInt128
+
+        now = time.time()
+        scored = []
+        for key, rec in self._nodes.items():
+            kid = rec.get("kad_id", "")
+            if len(kid) != 32:
+                continue
+            try:
+                nid = KadUInt128(bytes.fromhex(kid))
+            except ValueError:
+                continue
+            # Warm-first (eMule mature-routing analog): contacts the spider
+            # has actually HELLO-verified rank ahead of cold cache entries,
+            # regardless of distance - a lookup burns its first rounds on
+            # them, so every dead cold node is a wasted request.
+            hellos = int(rec.get("hellos", 0))
+            age = now - float(rec.get("last_seen", 0))
+            warm = 0 if (hellos > 0 and age < 86400) else 1
+            # Experimental-selection bonus (kadabra bandit + vivaldi RTT):
+            # nodes the selection strategies keep rewarding sort ahead of
+            # same-warmth peers.  weight_fn -> kadabra.weight (higher=better).
+            bonus = 0.0
+            if self._weight_fn is not None:
+                bonus = float(self._weight_fn(key))
+            scored.append((warm, -bonus, nid ^ target, key, rec))
+        scored.sort(key=lambda t: (t[0], t[1], t[2]))
+        out = []
+        for _, _, _, key, rec in scored[: max(1, count)]:
+            ip, udp = key
+            out.append(
+                SimpleNamespace(
+                    kad_id=KadUInt128(bytes.fromhex(rec["kad_id"])),
+                    ip=ip,
+                    udp_port=udp,
+                    tcp_port=int(rec.get("tcp", 4662)),
+                    contact_version=int(rec.get("ver", 0)),
+                )
+            )
+        return out
+
+    def mark_alive(self, key) -> bool:
+        return False
+
+    def add(self, node) -> bool:
+        return False
+
 def prune_pool(nodes: Dict[Tuple[str, int], Dict[str, Any]]) -> int:
     """Rotate stale nodes out; returns pruned count (spider doctrine rule)."""
     now = time.time()
@@ -230,6 +312,17 @@ class SpiderEngine:
         }
 
     # -- persistence ------------------------------------------------------
+
+    def pool_routing(self) -> "PoolRouting":
+        """A flat closest-shim over the live pool for in-kernel lookups
+        (keyword search / source search via IPC; the tree RoutingZone caps
+        too small for a cold-process lookup).  Candidate ranking carries the
+        experimental-selection knowledge: kadabra weights (+ vivaldi RTT via
+        the strategies' core selection) bonus rewarded nodes."""
+        return PoolRouting(
+            self.nodes,
+            weight_fn=lambda key: self.kadabra.weight(key),
+        )
 
     def _persist_own_id(
         self, cache_file: Path, own_id: KadUInt128, existing_nodes: dict[str, Any]

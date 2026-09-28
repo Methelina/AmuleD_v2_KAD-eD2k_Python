@@ -1,11 +1,21 @@
 # ==========================================================
 # AmuleD v0.6.0 Portable Runtime (PowerShell Version)
 # ==========================================================
-# Version: 2.2.0
+# Version: 2.2.1
 # Author:  Soror L.'.L.'.
 # Updated: 2026-09-28
 #
 # Patchnote v2.2.0 (By Soror L.'.L.'.):
+#   v2.2.1 (2026-09-28):
+#   [!] serve mode: the daemon runs as a monitored child; liveness = the
+#       db\kernel_status.json heartbeat (stale > 120 s -> kill + report).
+#       Root cause fixed: faulthandler.dump_traceback_later() inside the
+#       daemon crashed the process (0xc0000005 in _Py_DumpTraceback,
+#       python312.dll+0x2877d0) during active downloads (x3 on 2026-09-28);
+#       the in-process stack watchdog is removed (scripts\serve_daemon.py
+#       v0.3.2), faulthandler.enable() stays for real fatal faults.
+#
+#   v2.2.0 (2026-09-28):
 #   [+] `serve` mode: zombie cleanup before start - any leftover
 #       serve_daemon.py python process (previous launcher session) is
 #       killed with the whole shim/child family, every kill is reported
@@ -349,12 +359,60 @@ if ($Mode -eq "serve") {
         Write-Host "[RUNNER] [INFO] Zombie cleanup done; starting a fresh serve daemon." -ForegroundColor Cyan
     }
     Write-Host "[RUNNER] [INFO] Starting serve daemon (Ctrl+C to stop)..." -ForegroundColor Green
+    # v2.2.1: the daemon runs as a monitored child.  Liveness = heartbeat
+    # mtime of db\kernel_status.json (written every 10 s by the kernel's
+    # status loop).  A stale heartbeat (> 120 s) means a frozen event loop:
+    # the launcher kills the child and reports.  In-process stack dumping
+    # was removed - faulthandler.dump_traceback_later() crashed the process
+    # (0xc0000005 in _Py_DumpTraceback, 2026-09-28 x3).
+    $HeartbeatFile = Join-Path $DbDir "kernel_status.json"
+    $StaleLimitSec = 120
+    $daemon = Start-Process -FilePath $VenvPython `
+        -ArgumentList @('-s', '-W', 'ignore::FutureWarning', $ServeScript) @ClientArgs `
+        -NoNewWindow -PassThru
+    $exitCode = $null
+    $launchedAt = Get-Date
+    $graceUntil = $launchedAt.AddSeconds(60)
     try {
-        & $VenvPython -s -W ignore::FutureWarning $ServeScript @ClientArgs
-        $exitCode = $LASTEXITCODE
+        while (-not $daemon.HasExited) {
+            Start-Sleep -Seconds 15
+            if ($daemon.HasExited) { break }
+            if ((Get-Date) -lt $graceUntil) { continue }
+            $stale = $true
+            if (Test-Path $HeartbeatFile) {
+                $hbTime = (Get-Item $HeartbeatFile).LastWriteTime
+                # Enforce only once the fresh daemon has written at least
+                # one heartbeat (mtime newer than launch).
+                if ($hbTime -gt $launchedAt) {
+                    $age = ((Get-Date) - $hbTime).TotalSeconds
+                    $stale = $age -gt $StaleLimitSec
+                } else {
+                    $stale = $false
+                }
+            }
+            if ($stale) {
+                Write-Host "[RUNNER] [ERROR] Kernel heartbeat stale (> $StaleLimitSec s) - killing frozen daemon: pid=$($daemon.Id)" -ForegroundColor Red
+                Stop-Process -Id $daemon.Id -Force -ErrorAction SilentlyContinue
+                # Kill the whole family (uv shim chain), if any.
+                Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                    Where-Object { $_.ParentProcessId -eq $daemon.Id } |
+                    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                $exitCode = 3
+                break
+            }
+        }
     } catch {
-        Write-Host "[RUNNER] [ERROR] Serve launcher exception: $($_.Exception.Message)" -ForegroundColor Red
-        $exitCode = 1
+        Write-Host "[RUNNER] [ERROR] Serve monitor exception: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    if (-not $daemon.HasExited) {
+        # Ctrl+C / console close: the child shares this console and exits
+        # with it; give it a moment, then force.
+        if (-not $daemon.WaitForExit(10000)) {
+            Stop-Process -Id $daemon.Id -Force -ErrorAction SilentlyContinue
+        }
+        $exitCode = $daemon.ExitCode
+    } elseif ($exitCode -eq $null) {
+        $exitCode = $daemon.ExitCode
     }
     if ($exitCode -ne 0) {
         Write-Host "[RUNNER] [ERROR] Serve daemon exited with code $exitCode" -ForegroundColor Red

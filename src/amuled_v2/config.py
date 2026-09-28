@@ -7,9 +7,22 @@ normalizes null paths to portable runtime directories, and CLI helpers
 inference.
 
 src/amuled_v2/config.py
-Version:     0.4.2
+Version:     0.4.4
 Author:      Soror L.'.L.'.
-Updated:     2026-09-22
+Updated:     2026-09-28
+
+Patch Notes v0.4.4 (Soror L.'.L.'.):
+  [+] kademlia.reask_interval_s (300) - periodic KAD source re-ask and
+      re-dial interval for the kernel's download queue (eMule ReAskTime
+      analog, roadmap 11r P3 №9).
+
+Patch Notes v0.4.3 (Soror L.'.L'.):
+  [+] Config parity with eMuleAI preferences.ini (roadmap 11r,
+      tmp/recon/emuleai-preferences-ini.recon.md): network.max_connections /
+      max_half_connections / max_conn_per_5s, network.max_download_bytes_per_sec,
+      network.crypt_layer_required, download.max_sources_per_file,
+      download.sparse_part_files, kademlia.udp_key (persisted KAD UDP verify
+      key), ipfilter.level / auto_update / update_url / update_period_days.
 
 Patch Notes v0.4.2 (Soror L.'.L'.):
   [+] Changed the public application name to `AmuleD`.
@@ -65,6 +78,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enable_kad": True,
         # Physical-NIC egress for KAD/peer UDP (VPN TUN bypass); None = 0.0.0.0.
         "bind_ip": None,
+        # Connection limits (eMule MaxConnections / MaxHalfConnections /
+        # MaxConnectionsPerFiveSeconds analogs).
+        "max_connections": 250,
+        "max_half_connections": 50,
+        "max_conn_per_5s": 60,
+        # Global download throttle, bytes/sec (0 = unlimited; upload throttle
+        # lives in serve.throttle_bytes_per_sec).
+        "max_download_bytes_per_sec": 0,
+        # Refuse plain (unobfuscated) peer dials when True (eMule
+        # CryptLayerRequired analog); False keeps the plain fallback.
+        "crypt_layer_required": False,
+    },
+    "download": {
+        # eMule MaxSourcesPerFile analog.
+        "max_sources_per_file": 400,
+        # Sparse part files: do not preallocate the full final size on disk
+        # (eMule SparsePartFiles analog; the sidecar gap list is the source
+        # of truth either way).
+        "sparse_part_files": False,
     },
     "paths": {
         "incoming": None,
@@ -74,6 +106,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "kademlia": {
         "nodes_dat": "assets/v1/nodes.dat",
         "bootstrap_nodes": [],
+        # Our KAD UDP verify key (uint32). None = generated and persisted on
+        # first use (eMule preferencesKad.dat / KadUDPKey analog) so peers
+        # can keep encrypting to us across restarts.
+        "udp_key": None,
+        # Periodic source re-ask + re-dial for queued/download entries
+        # (eMule ReAskTime analog; the kernel's source-refresh loop).
+        "reask_interval_s": 300,
     },
     "servers": {
         "server_met": "assets/v1/server.met",
@@ -86,6 +125,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ipfilter": {
         "ipfilter_dat": "assets/v1/ipfilter.dat",
         "ipfilter_static_dat": "assets/v1/ipfilter_static.dat",
+        # Level threshold (eMule FilterLevel analog).
+        "level": 127,
+        # Automatic ipfilter.dat refresh (eMule AutoIPFilterUpdate analog).
+        "auto_update": False,
+        "update_url": None,
+        "update_period_days": 7,
     },
     "geoip": {
         "geoip_dat": "assets/v1/GeoIP.dat",

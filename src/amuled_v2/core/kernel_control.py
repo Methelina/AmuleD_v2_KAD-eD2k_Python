@@ -14,6 +14,7 @@ Patch Notes v0.2.0 (Soror L'.L'.):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from pathlib import Path
 from typing import Any, Callable
@@ -120,7 +121,16 @@ class KernelControlServer:
                             "reason": f"unknown command: {name!r}",
                         }
                     else:
-                        response = {"status": "ok", **handler(request)}
+                        # Async handlers (long lookups: kad.search /
+                        # kad.sources) run on the loop and the connection
+                        # stays open until they finish; callers set a
+                        # matching control_request timeout.
+                        result = handler(request)
+                        if inspect.iscoroutine(result) or isinstance(
+                            result, asyncio.Future
+                        ):
+                            result = await result
+                        response = {"status": "ok", **result}
                 except Exception as exc:
                     response = {"status": "error", "reason": repr(exc)}
                 writer.write((json.dumps(response) + "\n").encode("utf-8"))

@@ -28,15 +28,21 @@ Protocol flow (see ``_expect_first_packet``):
        HASHSETREQUEST, REQUESTPARTS/REQUESTPARTS_I64, and END_OF_DOWNLOAD.
 
 src/amuled_v2/core/peer/listener.py
-Version:     0.4.0
-Author:      Soror L'.L'.
+Version:     0.4.1
+Author:      Soror L.'.L.'.
 Updated:     2026-09-28
 
-Patch Notes v0.4.0 (Soror L'.L'.):
+Patch Notes v0.4.1 (Soror L.'.L'.):
+  [+] Incoming connection rate limiter: max_conn_per_5s (eMule
+      MaxConnectionsPerFiveSeconds analog) caps accepts per 5-second
+      window in IncomingPeerServer.__init__; new connections exceeding
+      the limit are refused before any session is created.
+
+Patch Notes v0.4.0 (Soror L.'.L'.):
   [!] Log listener fallback sites (close failures, format-peer failures,
       upload-session close failures) instead of silently swallowing them.
 
-Patch Notes v0.3.1 (Soror L'.L'.):
+Patch Notes v0.3.1 (Soror L.'.L'.):
   [+] Direct-callback waiters are a FIFO queue per IP (fixes two racing
       peers sharing one reader — "readexactly() called while another
       coroutine is already waiting"); expect_connection_from must be
@@ -46,13 +52,13 @@ Patch Notes v0.3.1 (Soror L'.L'.):
       the TCP channel open (_hold_buddy_session) for OP_CALLBACK relays;
       the upload engine is not started for such sessions.
 
-Patch Notes v0.3.0 (Soror L'.L'.):
+Patch Notes v0.3.0 (Soror L.'.L'.):
   [+] Post-transfer drain: the session keeps serving AICH requests after
       the upload completes (eMule parity — the DOWNLOADER owns the
       connection lifetime); AICH handler extracted to
       _handle_aich_request, reused by _drain_post_transfer.
 
-Patch Notes v0.2.0 (Soror L'.L'.):
+Patch Notes v0.2.0 (Soror L.'.L'.):
   [+] Incoming obfuscation accept (stage X): non-protocol first byte now
       starts the BASIC obfuscation accept from our own userhash with a
       server-role DH fallback (accept_obfuscated_client); StreamTransport
@@ -78,6 +84,7 @@ import asyncio
 import os
 import struct
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -1352,6 +1359,7 @@ class IncomingPeerServer:
         allow_compression: bool = True,
         idle_timeout: float | None = 300.0,
         max_connections: int = 64,
+        max_conn_per_5s: int = 0,
         traffic_recorder: Callable[[str, int], None] | None = None,
         queue_rank_period: float = 60.0,
         secure_ident: Any | None = None,
@@ -1374,6 +1382,8 @@ class IncomingPeerServer:
         if max_connections < 1:
             raise ListenerError(f"max_connections must be >= 1, got {max_connections}")
         self._max_connections = max_connections
+        self._max_conn_per_5s = max_conn_per_5s
+        self._conn_timestamps: deque[float] = deque()
         self._server: asyncio.AbstractServer | None = None
         self._connections: set[IncomingPeerSession] = set()
         # Stage X direct-callback: callers (DownloadRunner) reserve inbound
@@ -1453,6 +1463,21 @@ class IncomingPeerServer:
         writer: asyncio.StreamWriter,
     ) -> None:
         peer_name = _format_peer(writer)
+        if self._max_conn_per_5s > 0:
+            now = time.monotonic()
+            cutoff = now - 5.0
+            while self._conn_timestamps and self._conn_timestamps[0] < cutoff:
+                self._conn_timestamps.popleft()
+            if len(self._conn_timestamps) >= self._max_conn_per_5s:
+                log.warning(
+                    "PEER connection rate limit: refused peer=%s, "
+                    "limit=%d/5s",
+                    peer_name,
+                    self._max_conn_per_5s,
+                )
+                writer.close()
+                return
+            self._conn_timestamps.append(now)
         if len(self._connections) >= self._max_connections:
             log.warning(
                 "Incoming C2C connection rejected: peer=%s, active=%d, max=%d",
