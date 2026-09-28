@@ -991,7 +991,17 @@ class PeerClient:
         *,
         rank_callback: Optional[Callable[[int], None]] = None,
     ) -> None:
-        """Wait until the peer grants an upload slot for this file."""
+        """Wait until the peer grants an upload slot for this file.
+
+        OP_STARTUPLOADREQ is sent ONCE by ``request_file()`` immediately
+        before this wait (eMule sends it once and waits; a re-send on
+        every response timeout counts as aggressive behaviour - live
+        evidence 2026-09-28: eMuleAI logs ``aggressive check counter``
+        per request and bans ``[Aggressive behaviour]`` after a handful,
+        putting the client into ``None/Banned`` state).  Wait timeouts
+        simply keep waiting for the overall deadline; the peer updates
+        the queue position with OP_QUEUERANK on its own schedule.
+        """
         deadline = time.monotonic() + self.queue_wait_timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -1004,9 +1014,6 @@ class PeerClient:
                 timeout=min(remaining, self.response_timeout), close_on_timeout=False
             )
             if packet is None:
-                await self._send(
-                    EDONKEY, C2CTCP.STARTUPLOADREQ, build_request_filename_payload(file_hash)
-                )
                 continue
             protocol, opcode, payload = packet
             if protocol != EDONKEY:
@@ -1254,7 +1261,31 @@ class PeerClient:
                         )
                         return outcome
                     protocol, opcode, payload = packet
-                    if protocol != EDONKEY:
+                    # TEMP DIAGNOSTIC (framing desync hunt 2026-09-28):
+                    # every frame in the transfer loop is traced so a
+                    # mid-stream desync (silent `protocol != EDONKEY`
+                    # skips) becomes visible.
+                    log.debug(
+                        "PEER frame: host=%s:%d, proto=0x%02X, "
+                        "opcode=0x%02X, size=%d, received=%d",
+                        self.host,
+                        self.port,
+                        protocol,
+                        opcode,
+                        len(payload),
+                        received,
+                    )
+                    if protocol not in (EDONKEY, EMULE_PROTOCOL):
+                        # Unknown transport protocol byte: not data.  NOTE:
+                        # data packets (SENDINGPART/COMPRESSEDPART[_I64])
+                        # arrive on BOTH protocols - live evidence
+                        # 2026-09-28: eMuleAI 1.6.0 pushes COMPRESSEDPART
+                        # (0x40) on EMULE (0xC5); the old EDONKEY-only
+                        # check silently dropped every data frame.
+                        log.debug(
+                            "PEER frame skipped: unknown protocol 0x%02X",
+                            protocol,
+                        )
                         continue
                     part: Optional[SendingPart] = None
                     if opcode == C2CTCP.SENDINGPART:

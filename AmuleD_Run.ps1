@@ -1,9 +1,15 @@
 # ==========================================================
 # AmuleD v0.6.0 Portable Runtime (PowerShell Version)
 # ==========================================================
-# Version: 2.1.1
+# Version: 2.2.0
 # Author:  Soror L.'.L.'.
-# Updated: 2026-09-25
+# Updated: 2026-09-28
+#
+# Patchnote v2.2.0 (By Soror L.'.L.'.):
+#   [+] `serve` mode: zombie cleanup before start - any leftover
+#       serve_daemon.py python process (previous launcher session) is
+#       killed with the whole shim/child family, every kill is reported
+#       to the log ([RUNNER] [WARN] Zombie serve daemon killed).
 #
 # Patchnote v2.1.1 (By Soror L.'.L.'.):
 #   [!] `spider` mode marked DEPRECATED: the unified kernel (`serve`) includes
@@ -322,26 +328,25 @@ if ($Mode -eq "serve") {
         $ExistingServe = $ExistingServe | Where-Object { $matchedIds -notcontains $_.ParentProcessId }
     }
     if ($ExistingServe) {
+        # Zombie cleanup (policy 2026-09-28): any pre-existing serve_daemon
+        # python process is a leftover from a previous launcher session - it
+        # holds the DuckDB lock / stale code and silently overrides fixes
+        # while the new instance refuses to start.  Kill the whole family
+        # (shim parent + uv-managed child) and report each kill.
         foreach ($daemon in $ExistingServe) {
-            Write-Host "[RUNNER] [WARN] Serve daemon is already running: pid=$($daemon.ProcessId)" -ForegroundColor Yellow
-        }
-        if (Test-Path $ServeStatusFile) {
-            try {
-                $status = Get-Content $ServeStatusFile -Raw -Encoding UTF8 | ConvertFrom-Json
-                Write-Host "[RUNNER] [INFO] Last status: port=$($status.port) active=$($status.active_connections) uptime_s=$($status.uptime_s) running=$($status.running)" -ForegroundColor Cyan
-            } catch {
-                Write-Host "[RUNNER] [WARN] Status file unreadable: $($_.Exception.Message)" -ForegroundColor Yellow
+            $family = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                Where-Object {
+                    ($_.ProcessId -eq $daemon.ProcessId) -or
+                    ($_.ParentProcessId -eq $daemon.ProcessId) -or
+                    ($matchedIds -contains $_.ProcessId)
+                }
+            foreach ($proc in $family) {
+                Write-Host "[RUNNER] [WARN] Zombie serve daemon killed: pid=$($proc.ProcessId) name=$($proc.Name)" -ForegroundColor Yellow
+                Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
             }
         }
-        if (-not $Force) {
-            Write-Host "[RUNNER] [ERROR] Refusing to start a second serve daemon. Stop the running one or re-run with -Force." -ForegroundColor Red
-            if (-not $NoPause) {
-                Write-Host "Press any key to exit..." -ForegroundColor Gray
-                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-            }
-            exit 1
-        }
-        Write-Host "[RUNNER] [WARN] -Force passed: starting a second serve daemon anyway." -ForegroundColor Yellow
+        Start-Sleep -Seconds 2
+        Write-Host "[RUNNER] [INFO] Zombie cleanup done; starting a fresh serve daemon." -ForegroundColor Cyan
     }
     Write-Host "[RUNNER] [INFO] Starting serve daemon (Ctrl+C to stop)..." -ForegroundColor Green
     try {
