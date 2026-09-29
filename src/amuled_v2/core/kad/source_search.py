@@ -404,8 +404,16 @@ async def kad_file_source_search(
     FIND_VALUE_MORE = 11
     tval = target.to_int()
 
-    def _dist(kad_id: bytes) -> int:
-        return int.from_bytes(kad_id, "big") ^ tval
+    def _dist(kad_id) -> int:
+        # Contacts arrive from two routings: RoutingZone hands out raw
+        # 16-byte kad_id, the kernel PoolRouting hands out KadUInt128
+        # (caught live 2026-09-29: in-kernel lookups silently died and the
+        # clients fell back to the ephemeral runtime).
+        v = kad_id.to_int() if isinstance(kad_id, KadUInt128) else int.from_bytes(kad_id, "big")
+        return v ^ tval
+
+    def _as_kad_id(v) -> KadUInt128:
+        return v if isinstance(v, KadUInt128) else KadUInt128(v)
 
     tried: dict[int, Tuple[str, int]] = {}
     tried_entry: dict[int, Tuple[KadUInt128, str, int]] = {}
@@ -448,7 +456,7 @@ async def kad_file_source_search(
             if d in tried or d in possible:
                 continue
             possible[d] = (
-                KadUInt128(node.kad_id),
+                _as_kad_id(node.kad_id),
                 node.ip,
                 node.udp_port,
                 node.tcp_port,

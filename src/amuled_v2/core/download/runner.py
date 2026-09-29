@@ -8,9 +8,14 @@ part file via ``record_block`` and completion is finalized only when a
 peer delivers the whole file.
 
 src/amuled_v2/core/download/runner.py
-Version:     0.9.5
+Version:     0.9.6
 Author:      Soror L.'.L.'.
-Updated:     2026-09-28
+Updated:     2026-09-29
+
+Patch Notes v0.9.6 (Soror L.'.L'.):
+  [+] rank_sink kwarg: every OP_QUEUERANK seen in transfer() is reported as
+      {"host", "port", "rank", "at"} (live-test gate "dial + QUEUERANK",
+      roadmap 11s); callback exceptions are logged, never propagated.
 
 Patch Notes v0.9.5 (Soror L.'.L'.):
   [+] __init__ gains max_sources_per_file / download_bytes_per_sec /
@@ -146,6 +151,7 @@ from __future__ import annotations
 import asyncio
 import socket
 import struct
+import time
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from amuled_v2.core.download.ics import PART_SIZE as _ICS_PART_SIZE
@@ -286,6 +292,7 @@ class DownloadRunner:
         max_sources_per_file: int | None = None,
         download_bytes_per_sec: int | None = None,
         crypt_layer_required: bool | None = None,
+        rank_sink: "Callable[[dict[str, Any]], None] | None" = None,
     ) -> None:
         self.queue = queue
         self.local_client_id = local_client_id
@@ -350,6 +357,10 @@ class DownloadRunner:
             int(download_bytes_per_sec) if download_bytes_per_sec else 0
         )
         self.crypt_layer_required = bool(crypt_layer_required)
+        # Live-test gate (roadmap 11s): every OP_QUEUERANK seen during
+        # transfer() is reported here as {"host", "port", "rank", "at"} so
+        # the kernel download box can prove "dial + QUEUERANK" happened.
+        self.rank_sink = rank_sink
         # Token-bucket throttle state (download_bytes_per_sec > 0 enables;
         # <= 0 / unlimited is a no-op in _throttle_gate).  Bucket capacity
         # = max(rate, 64 KiB) so a tiny cap still absorbs a full block write.
@@ -375,6 +386,23 @@ class DownloadRunner:
         # verdict in resolve_sources prevents re-dialing the endpoint for
         # this file, though the source stays available for OTHER files.
         self._a4af_verdicts: dict[tuple[str, int], dict[str, str]] = {}
+
+    def _emit_rank(self, host: str, port: int, rank: int) -> None:
+        if self.rank_sink is None:
+            return
+        record = {
+            "host": host,
+            "port": int(port),
+            "rank": int(rank),
+            "at": time.time(),
+        }
+        try:
+            self.rank_sink(record)
+        except Exception as exc:
+            log.warning(
+                "DOWNLOAD rank_sink fallback: endpoint=%s:%d, error=%r",
+                host, port, exc,
+            )
 
     def _a4af_verdict(self, host: str, port: int, file_hash_hex: str) -> str | None:
         """Return the cached A4AF verdict for (host, port) + file, or None."""
@@ -971,6 +999,11 @@ class DownloadRunner:
                 end_offset=transfer_end,
                 block_selector=block_selector,
                 release_ranges=release_ranges,
+                rank_callback=(
+                    (lambda rank, _h=host, _p=port: self._emit_rank(_h, _p, rank))
+                    if self.rank_sink is not None
+                    else None
+                ),
             )
             if (
                 outcome.complete

@@ -356,8 +356,16 @@ async def _lookup_closest(
     start = time.monotonic()
     targ_int = target.to_int()
 
-    def _dist(kad_id: bytes) -> int:
-        return int.from_bytes(kad_id, "big") ^ targ_int
+    def _dist(kad_id) -> int:
+        # Contacts arrive from two routings: RoutingZone hands out raw
+        # 16-byte kad_id, the kernel PoolRouting hands out KadUInt128
+        # (caught live 2026-09-29: the pool-routing publish pass died with
+        # "cannot convert 'KadUInt128' object to bytes").
+        v = kad_id.to_int() if isinstance(kad_id, KadUInt128) else int.from_bytes(kad_id, "big")
+        return v ^ targ_int
+
+    def _as_kad_id(v) -> KadUInt128:
+        return v if isinstance(v, KadUInt128) else KadUInt128(v)
 
     ALPHA = 3
     FIND_VALUE = 2
@@ -402,7 +410,7 @@ async def _lookup_closest(
             if d in tried or d in possible:
                 continue
             possible[d] = (
-                KadUInt128(node.kad_id),
+                _as_kad_id(node.kad_id),
                 node.ip,
                 node.udp_port,
                 node.tcp_port,

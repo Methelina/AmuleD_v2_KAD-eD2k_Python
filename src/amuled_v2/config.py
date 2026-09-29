@@ -7,9 +7,13 @@ normalizes null paths to portable runtime directories, and CLI helpers
 inference.
 
 src/amuled_v2/config.py
-Version:     0.4.4
+Version:     0.4.5
 Author:      Soror L.'.L.'.
-Updated:     2026-09-28
+Updated:     2026-09-29
+
+Patch Notes v0.4.5 (Soror L.'.L.'.):
+  [+] servers.autoconnect/retry_interval_s/connect_timeout_s/keepalive_timeout_s
+      (eMule Autoconnect/Reconnect analogs) added to DEFAULT_CONFIG.
 
 Patch Notes v0.4.4 (Soror L.'.L.'.):
   [+] kademlia.reask_interval_s (300) - periodic KAD source re-ask and
@@ -117,6 +121,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "servers": {
         "server_met": "assets/v1/server.met",
         "static_servers": "assets/v1/staticservers.dat",
+        # eMule [eMule] Autoconnect (Preferences.cpp:4511, default false there;
+        # save at :3543); EmuleDlg.cpp:9105-9109 AutoConnectIfNeeded ->
+        # StartConnection(false) -> ConnectToAnyServer + CKademlia::Start();
+        # ServerConnect.cpp RetryConnectTimer (:429-445) rotates start position
+        # on failure. Documented deviation: headless daemon defaults TRUE — the
+        # KAD spider already autostarts unconditionally, so eD2K is made symmetric.
+        "autoconnect": True,
+        # eMule Reconnect analog, ServerConnect.cpp RetryConnectTimer
+        # (CS_RETRYCONNECTTIME) — seconds between auto-connect rounds.
+        "retry_interval_s": 300,
+        # TCP connect + login window per candidate server.
+        "connect_timeout_s": 10,
+        # Idle window waiting for one server-pushed packet (eMule servers push
+        # SERVERSTATUS/SERVERMESSAGE unsolicited; ServerConnect keeps reading
+        # the socket while connected).
+        "keepalive_timeout_s": 60,
     },
     "sharing": {
         "shared_files_json": None,

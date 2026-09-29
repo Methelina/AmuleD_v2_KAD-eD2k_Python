@@ -174,6 +174,14 @@ class KadUInt128:
     def xor(self, other: KadUInt128) -> KadUInt128:
         return KadUInt128(self._value ^ other._value)
 
+    def __xor__(self, other: KadUInt128) -> KadUInt128:
+        # Operator form of xor(): the spider's warm-first candidate ranking
+        # (spider.py closest-selection) sorts by `nid ^ target`; without
+        # this overload Python raises TypeError for KadUInt128^KadUInt128
+        # (caught live 2026-09-29 by the LIVE gate: in-kernel source
+        # refresh / publish died with "unsupported operand type(s) for ^").
+        return KadUInt128(self._value ^ other._value)
+
     def distance_bits(self) -> int:
         """Index of the highest differing bit (0 == MSB), i.e. the first
         bit position where the XOR result is set, counting from the most

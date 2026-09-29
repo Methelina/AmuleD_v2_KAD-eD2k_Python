@@ -6,16 +6,19 @@ server identity/status/message parsing, global search, and TCP source lookup.
 The client is loopback-testable and does not perform obfuscation yet.
 
 src/amuled_v2/core/ed2k/server_client.py
-Version:     0.4.0
-Author:      Soror L.'.L.'.
-Updated:     2026-09-27
+Version:     0.5.0
+Author:      Soror L.'.L'.
+Updated:     2026-09-29
 
-Patch Notes v0.4.0 (Soror L'.L'.):
+Patch Notes v0.5.0 (Soror L.'.L'.):
+  [+] next_push() keepalive read for kernel-held server sessions (eMule ServerConnect push-read analog).
+
+Patch Notes v0.4.0 (Soror L.'.L'.):
   [+] FoundSource carries per-source serving-buddy endpoint (buddy_ip/
       buddy_port) so KAD type-3/5 saves keep their own buddies instead of
       the shared record-level server_ip.
 
-Patch Notes v0.3.0 (Soror L'.L'.):
+Patch Notes v0.3.0 (Soror L.'.L'.):
   [+] Added SearchResultsBatch for persistence and session bookkeeping.
   [+] Search results now expose their full tag set instead of discarding it.
 
@@ -658,6 +661,20 @@ class Ed2kServerClient:
             )
             return True
         return False
+
+    async def next_push(self, *, timeout: float) -> bool:
+        """Wait for one server-pushed packet (eMule ServerConnect keeps
+        reading the socket; servers push STATUS/MESSAGE unsolicited).
+
+        Returns True when a packet arrived (consumed as auxiliary when
+        recognized), False on idle timeout. The session is KEPT on idle;
+        transport errors close the session and raise ServerSessionError.
+        """
+        packet = await self._receive_packet(timeout=timeout, close_on_timeout=False)
+        if packet is None:
+            return False
+        await self._consume_auxiliary_packet(packet)
+        return True
 
     async def login(self) -> LoginResult:
         """Send login and consume initial server responses until ID change."""

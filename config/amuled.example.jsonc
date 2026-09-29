@@ -67,7 +67,18 @@
   // ED2K server list (bundled public assets).
   "servers": {
     "server_met": "assets/v1/server.met",
-    "static_servers": "assets/v1/staticservers.dat"
+    "static_servers": "assets/v1/staticservers.dat",
+    // eMule [eMule] Autoconnect analog (Preferences.cpp:4511): the kernel
+    // holds one eD2K server session from boot. eMule GUI defaults false;
+    // headless daemon defaults true (KAD spider already autostarts).
+    "autoconnect": true,
+    // eMule Reconnect analog (ServerConnect.cpp RetryConnectTimer): seconds
+    // between auto-connect rounds.
+    "retry_interval_s": 300,
+    // TCP connect + login window per candidate server.
+    "connect_timeout_s": 10,
+    // Idle window waiting for one server-pushed packet.
+    "keepalive_timeout_s": 60
   },
 
   // Sharing. shared_files_json / shareddir_dat stay null unless you import

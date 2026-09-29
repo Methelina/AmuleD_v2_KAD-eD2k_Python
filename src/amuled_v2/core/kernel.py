@@ -1,5 +1,32 @@
 """AmuleD unified kernel (stage U): listener + spider + state in ONE process.
 
+src/amuled_v2/core/kernel.py
+Version:     0.5.0
+Author:      Soror L.'.L.'.
+Updated:     2026-09-29
+
+Patch Notes v0.5.0 (Soror L.'.L.'.):
+  [+] eD2K server autoconnect at boot via ServerSessionManager behind
+      servers.autoconnect (eMule Autoconnect/Reconnect parity; EmuleDlg.cpp:
+      9105 AutoConnectIfNeeded -> StartConnection; ServerConnect.cpp
+      RetryConnectTimer) + "server.session" control command reporting
+      snapshot of autoconnect/connected/server/last_error/attempts/logins.
+  [+] boot auto-resume of "downloading" entries: a manual download.run after
+      every kernel restart is no longer needed; the kernel re-races leftover
+      downloading transfers on startup (deduped inside _start_download_task).
+  [+] architecture invariant fix: _publish_sources_once no longer builds an
+      ephemeral kad runtime (bootstrap_runtime 41-contact tree); publish
+      walks the spider's mature pool routing like kad.search/kad.sources
+      (one KAD process = one routing, AGENTS.md 2026-09-28).
+  [+] control commands "share.add" (in-kernel ED2K hashing + registration,
+      path confined to incoming) and "publish.run" (on-demand KAD source
+      publish pass, usable by the live publish-visibility gate);
+      publish.run takes an optional "hash" to publish one file - a full
+      multi-file pass does not fit a 5-minute test box.
+  [+] download box now carries "queue_ranks" (last 200 OP_QUEUERANK
+      sightings via the runner rank_sink) - the live progress gate asserts
+      "dial + QUEUERANK within 10 minutes" instead of raw byte counts.
+
 Phase 2 of the unification: the kernel owns ONE permanent DuckDB connection
 and runs every subsystem as an asyncio task — the KAD spider maturation loop
 (``core.kad.spider.SpiderEngine``), the incoming peer listener (uploads),
@@ -11,12 +38,7 @@ by design; run the kernel instead).
 The CLI talks to the kernel over ``db/kernel_status.json`` → control port;
 commands without a kernel fall back to direct DuckDB access (open/close).
 
-src/amuled_v2/core/kernel.py
-Version:     0.4.2
-Author:      Soror L.'.L.'.
-Updated:     2026-09-28
-
-Patch Notes v0.4.2 (Soror L.'.L'.):
+Patch Notes v0.4.2 (Soror L.'.L.'.):
   [+] eMule periodic source re-ask + re-dial (roadmap 11r P3 №9): a
       kernel loop (kademlia.reask_interval_s, default 300s) refreshes KAD
       sources for every queued/download entry via the ephemeral-runtime
@@ -80,8 +102,6 @@ from amuled_v2.config import load_config
 from amuled_v2.core.identity import load_identity
 from amuled_v2.core.kad.publish import SourcePublisher
 from amuled_v2.core.kad.runtime import (
-    bootstrap_runtime,
-    load_kad_runtime,
     load_kadabra_state,
     save_kadabra_state,
 )
@@ -303,6 +323,17 @@ class AmuleDKernel:
                             exc,
                         )
                 queue = self._download_queue()
+                def _progress(received: int, total: int, blocks: int) -> None:
+                    box.update({"received": received, "total": total, "blocks": blocks})
+
+                def _rank_sink(rec: dict) -> None:
+                    # Live-test gate (roadmap 11s): keep the last 200
+                    # OP_QUEUERANK sightings so "dial + QUEUERANK within
+                    # 10 minutes" is provable from download.status.
+                    ranks = box.setdefault("queue_ranks", [])
+                    ranks.append(rec)
+                    del ranks[:-200]
+
                 runner = DownloadRunner(
                     queue,
                     local_port=self._tcp_port,
@@ -323,10 +354,8 @@ class AmuleDKernel:
                         if self.server is not None
                         else None
                     ),
+                    rank_sink=_rank_sink,
                 )
-
-                def _progress(received: int, total: int, blocks: int) -> None:
-                    box.update({"received": received, "total": total, "blocks": blocks})
 
                 result = await runner.run(file_hash, progress_callback=_progress)
                 box.update({"done": True, **result})
@@ -452,8 +481,14 @@ class AmuleDKernel:
                     )
                     self._start_download_task(fhash, 50)
 
-    async def _publish_sources_once(self) -> dict[str, Any]:
-        """KAD source-publish pass advertising our bound TCP port."""
+    async def _publish_sources_once(
+        self, file_hash: str | None = None
+    ) -> dict[str, Any]:
+        """KAD source-publish pass advertising our bound TCP port.
+
+        With ``file_hash`` set, only that shared file is published (the
+        live publish-visibility gate publishes its one target; a full
+        multi-file pass does not fit a 5-minute test box)."""
         from amuled_v2.core.kad.publish import PublishError
 
         rows = [
@@ -461,19 +496,30 @@ class AmuleDKernel:
             for r in self.state.list_shared_files(limit=100000)
             if r.get("path")
         ]
+        if file_hash:
+            rows = [
+                r for r in rows
+                if str(r.get("hash", "")).lower() == file_hash.lower()
+            ]
         limit = self.publish_limit if self.publish_limit > 0 else 100000
         rows = rows[:limit]
         if not rows:
             return {"status": "no_files", "published": 0, "accepts": 0}
 
-        rt = load_kad_runtime()
-        await bootstrap_runtime(rt, local_port=0)
+        if self.spider is None:
+            return {"status": "error", "reason": "spider disabled"}
+        # Architecture invariant (AGENTS.md 2026-09-28): publish walks the
+        # spider's mature pool routing like the searches above - the
+        # ephemeral bootstrap_runtime tree (41 contacts / 10 seeds) starved
+        # publishes exactly like it starved lookups.
+        routing = self.spider.pool_routing()
+        own_id = self.spider.own
         kadabra = load_kadabra_state()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("0.0.0.0", 0))
         pub = SourcePublisher(
-            own_id=rt.own_id,
+            own_id=own_id,
             own_tcp_port=self._tcp_port,
             user_hash=self.identity.user_hash,
         )
@@ -486,7 +532,7 @@ class AmuleDKernel:
                         bytes.fromhex(row["hash"]),
                         [(0, self._tcp_port, None)],
                         socket=sock,
-                        routing_table=rt.routing,
+                        routing_table=routing,
                         file_size=int(row["size"]),
                         timeout=self.args.publish_timeout,
                     )
@@ -656,7 +702,14 @@ class AmuleDKernel:
                     FoundSource(
                         client_id=s.client_id,
                         client_port=s.tcp_port,
-                        user_hash=None,
+                        # Pass the publisher's userhash through: the live
+                        # publish-visibility gate matches our own record by
+                        # it (our source entries carry our identity).
+                        user_hash=(
+                            bytes.fromhex(str(s.user_hash))
+                            if getattr(s, "user_hash", None)
+                            else None
+                        ),
                         kad_type=s.source_type or None,
                         kad_udp_port=s.udp_port,
                         buddy_id=None,
@@ -681,6 +734,88 @@ class AmuleDKernel:
         def ctl_share_count(_req: dict) -> dict[str, Any]:
             rows = self.state.list_shared_files(limit=100000)
             return {"count": len([r for r in rows if r.get("path")])}
+
+        async def ctl_share_add(req: dict) -> dict[str, Any]:
+            """Hash one file from a project share dir and register it as
+            shared (the kernel owns DuckDB; the CLI cannot write shares)."""
+            from amuled_v2.core.hashes.ed2k import ed2k_hash_file
+            from amuled_v2.core.sharing import SharedFile
+
+            rel = str(req.get("path") or "").strip()
+            if not rel:
+                return {"status": "error", "reason": "path is empty"}
+            base = Path(INCOMING_DIR).resolve()
+            target = (base / rel).resolve()
+            if not str(target).startswith(str(base)):
+                return {"status": "error", "reason": "path escapes incoming"}
+            if not target.is_file():
+                return {"status": "error", "reason": f"not a file: {rel}"}
+            size = target.stat().st_size
+            if size <= 0:
+                return {"status": "error", "reason": "empty file"}
+            started = time.time()
+            loop = asyncio.get_running_loop()
+            try:
+                # Hashing is CPU-bound MD4 over the whole file; run it in the
+                # executor so the control server stays responsive.
+                result = await loop.run_in_executor(
+                    None, ed2k_hash_file, str(target)
+                )
+            except Exception as exc:
+                log.warning(
+                    "kernel fallback: share.add hashing failed: path=%s, "
+                    "error=%r", rel, exc,
+                )
+                return {"status": "error", "reason": f"hash failed: {exc!r}"}
+            record = SharedFile(
+                file_hash=result.file_hash,
+                name=target.name,
+                size=size,
+                path=str(target),
+                hash_result=result,
+            )
+            saved = self.state.save_shared_files([record])
+            log.info(
+                "SHARE add: path=%s, hash=%s, size=%d, elapsed=%.1fs",
+                rel, record.hash_hex, size, time.time() - started,
+            )
+            return {
+                "status": "ok",
+                "saved": saved,
+                "hash": record.hash_hex,
+                "name": record.name,
+                "size": size,
+            }
+
+        async def ctl_publish_run(req: dict) -> dict[str, Any]:
+            """Trigger one KAD source-publish pass now (the republish loop
+            otherwise waits republish_hours; eMule publishes on connect and
+            the test gate needs an on-demand pass).  An optional "hash"
+            publishes just that shared file."""
+            if self.spider is None:
+                return {"status": "error", "reason": "spider disabled"}
+            if self.publish_box.get("status") == "running":
+                return {"status": "ok", "started": False, "reason": "already running"}
+            self.publish_box.update({"status": "running"})
+            target_hash = str(req.get("hash") or "") or None
+
+            async def _pass() -> None:
+                try:
+                    self.publish_box.update(
+                        await self._publish_sources_once(target_hash)
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "kernel fallback: publish.run pass failed: error=%r", exc
+                    )
+                    self.publish_box.update(
+                        {"status": "error", "reason": str(exc)}
+                    )
+
+            task = asyncio.create_task(_pass(), name="publish-run")
+            self._download_tasks.add(task)
+            task.add_done_callback(self._download_tasks.discard)
+            return {"status": "ok", "started": True}
 
         def ctl_stop(_req: dict) -> dict[str, Any]:
             self.stop.set()
@@ -827,6 +962,8 @@ class AmuleDKernel:
             "credits.get": ctl_credits_get,
             "share.list": ctl_share_list,
             "share.count": ctl_share_count,
+            "share.add": ctl_share_add,
+            "publish.run": ctl_publish_run,
             "search.results.list": ctl_search_results_list,
             "search.results.show": ctl_search_results_show,
             "search.results.clear": ctl_search_results_clear,
@@ -844,6 +981,13 @@ class AmuleDKernel:
             "download.status": ctl_download_status,
             "upload.status": ctl_upload_status,
             "servers.failures": ctl_servers_failures,
+            "server.session": lambda _req: (
+                self.server_session_mgr.snapshot()
+                if getattr(self, "server_session_mgr", None) is not None
+                else {"autoconnect": False, "connected": False, "server": None,
+                      "last_error": "server session manager not started",
+                      "attempts": 0, "logins": 0}
+            ),
             "ipfilter.status": ctl_ipfilter_status,
             "stop": ctl_stop,
         }
@@ -1057,6 +1201,29 @@ class AmuleDKernel:
             _ipfilter_autoupdate(), name="ipfilter-autoupdate"
         )
 
+        # eMule Autoconnect parity (roadmap 11r): hold one eD2K server session
+        # from boot when servers.autoconnect is on (EmuleDlg.cpp:9105
+        # AutoConnectIfNeeded -> StartConnection; ServerConnect.cpp
+        # RetryConnectTimer for the retry cadence). KAD (spider) already
+        # autostarts unconditionally; this makes eD2K symmetric.
+        from amuled_v2.core.ed2k.server_session import ServerSessionManager
+
+        def _load_cfg_for_session() -> dict:
+            from amuled_v2.config import load_config
+
+            return load_config()
+
+        self.server_session_mgr = ServerSessionManager(
+            state=self.state,
+            config_loader=_load_cfg_for_session,
+            tcp_port=self._tcp_port,
+            user_hash=bytes(self.identity.user_hash),
+            nickname=str(_cfg.get("app", {}).get("name", "AmuleD")),
+        )
+        server_session_task = asyncio.create_task(
+            self.server_session_mgr.run(self.stop), name="server-session"
+        )
+
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -1094,6 +1261,40 @@ class AmuleDKernel:
             self.republish_hours or "once",
         )
 
+        # eMule startup parity: downloads left in "downloading" status by a
+        # previous kernel run are re-raced automatically (a manual
+        # download.run after each restart is no longer needed).
+        async def _resume_active_downloads() -> None:
+            try:
+                entries = self._download_queue().list(limit=500)
+            except Exception as exc:
+                log.warning(
+                    "kernel fallback: download auto-resume listing failed, "
+                    "skipping: error=%r", exc,
+                )
+                return
+            resumed = 0
+            for entry in entries:
+                if str(entry.get("status", "")).lower() != "downloading":
+                    continue
+                fh = str(entry.get("hash") or entry.get("file_hash") or "").lower()
+                if len(fh) != 32:
+                    continue
+                try:
+                    result = self._start_download_task(fh, 8)
+                except Exception as exc:
+                    log.warning(
+                        "kernel fallback: download auto-resume failed for "
+                        "hash=%s: error=%r", fh, exc,
+                    )
+                    continue
+                if result.get("started"):
+                    resumed += 1
+            if resumed:
+                log.info("download auto-resume: restarted=%d", resumed)
+
+        asyncio.create_task(_resume_active_downloads(), name="download-autoresume")
+
         try:
             await self.stop.wait()
         except KeyboardInterrupt:
@@ -1102,7 +1303,10 @@ class AmuleDKernel:
             self.stop.set()
             extra_tasks = tuple(
                 t
-                for t in (nat_task, rotation_task, ipfilter_task, reask_task)
+                for t in (
+                    nat_task, rotation_task, ipfilter_task, reask_task,
+                    server_session_task,
+                )
                 if t is not None
             )
             for task in (status_task, spider_task, republish_task, *extra_tasks):

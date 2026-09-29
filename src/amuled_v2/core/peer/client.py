@@ -1096,6 +1096,7 @@ class PeerClient:
         end_offset: Optional[int] = None,
         block_selector: Optional[Callable[[int], list[tuple[int, int]]]] = None,
         release_ranges: Optional[Callable[[list[tuple[int, int]]], None]] = None,
+        rank_callback: Optional[Callable[[int], None]] = None,
     ) -> DownloadOutcome:
         """Run the request-parts / sending-part loop until completion.
 
@@ -1386,10 +1387,19 @@ class PeerClient:
                         expected_bytes = 0
                         break
                     elif opcode == C2CTCP.QUEUERANK:
+                        rank = parse_queue_rank(payload)
                         log.info(
-                            "PEER requeued during transfer: rank=%d",
-                            parse_queue_rank(payload),
+                            "PEER requeued during transfer: rank=%d", rank
                         )
+                        if rank_callback is not None:
+                            try:
+                                rank_callback(rank)
+                            except Exception as exc:
+                                log.warning(
+                                    "PEER transfer rank_callback fallback: "
+                                    "error=%r",
+                                    exc,
+                                )
                         self._maybe_credit_downloaded(received)
                         outcome = DownloadOutcome(
                             file_hash=file_hash.hex().upper(),

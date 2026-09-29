@@ -206,7 +206,7 @@ class PoolRouting:
             bonus = 0.0
             if self._weight_fn is not None:
                 bonus = float(self._weight_fn(key))
-            scored.append((warm, -bonus, nid ^ target, key, rec))
+            scored.append((warm, -bonus, (nid ^ target).to_int(), key, rec))
         scored.sort(key=lambda t: (t[0], t[1], t[2]))
         out = []
         for _, _, _, key, rec in scored[: max(1, count)]:
@@ -222,10 +222,17 @@ class PoolRouting:
             )
         return out
 
-    def mark_alive(self, key) -> bool:
+    def mark_alive(self, ip, port=None) -> bool:
+        # Read-only pool view: the search/publish walks reward responders
+        # through this hook (RoutingZone.mark_alive(ip, port) signature).
+        # The spider's own receive loop persists liveness, so this is a
+        # deliberate no-op - accept either mark_alive(ip, port) or the
+        # legacy mark_alive(key) form.
         return False
 
     def add(self, node) -> bool:
+        # Read-only pool view: fresh contacts stay in the walk's local
+        # candidate set; persistence belongs to the spider loop.
         return False
 
 def prune_pool(nodes: Dict[Tuple[str, int], Dict[str, Any]]) -> int:
